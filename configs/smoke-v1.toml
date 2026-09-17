@@ -1,0 +1,45 @@
+[experiment]
+name = "smoke-v1"
+
+[environment]
+backend = "mock"
+num_envs = 2
+blind_target = 18.0
+initial_hands = 2
+initial_discards = 1
+
+[processor]
+kind = "synthetic"
+duration_ms = 2.0
+microbatch_size = 1
+synthetic_reservoir_size = 24
+synthetic_output_size = 12
+synthetic_steps = 2
+
+[policy]
+hidden_size = 0
+
+[ppo]
+rollout_steps = 4
+update_epochs = 1
+minibatch_size = 4
+max_updates = 1
+checkpoint_every_updates = 1
+seed = 102
+
+[reward]
+shaping_beta = 1.0
+
+[curriculum]
+enabled = false
+
+[evaluation]
+stream = "validation"
+episodes = 2
+max_vector_steps = 20
+deterministic = true
+
+[runtime]
+device = "cpu"
+output_root = "runs"
+tensorboard = false

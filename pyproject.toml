@@ -1,0 +1,55 @@
+[build-system]
+requires = ["setuptools>=75"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "flylatro"
+version = "0.1.0"
+description = "A fixed-connectome reinforcement-learning experiment for Balatro"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+  "numpy>=1.26,<3",
+]
+
+[project.optional-dependencies]
+dev = [
+  "pytest>=8,<10",
+]
+training = [
+  "torch>=2.4,<3",
+  "tensorboard>=2.16,<3",
+]
+flywire = [
+  "pandas>=2.2,<4",
+  "pyarrow>=17,<24",
+]
+recording = [
+  "pyarrow>=17,<24",
+]
+benchmark = []
+balatro = [
+  "balatro-sim @ git+https://github.com/jahankazimi078/balatroagent.git@38ae214317009952db4d22a98dc0765cef79370a#subdirectory=sim/py",
+]
+
+[project.scripts]
+flylatro-smoke = "flylatro.cli:main"
+flylatro-train = "flylatro.training.cli:main"
+flylatro-evaluate = "flylatro.evaluation.cli:main"
+bench-balatro = "flylatro.benchmarks.cli:balatro_main"
+bench-fly = "flylatro.benchmarks.cli:fly_main"
+bench-policy = "flylatro.benchmarks.cli:policy_main"
+bench-end-to-end = "flylatro.benchmarks.cli:end_to_end_main"
+flylatro-replay = "flylatro.replay.cli:main"
+flylatro-visualize = "flylatro.visualization.cli:main"
+flylatro-baseline-evaluate = "flylatro.evaluation.baseline_cli:main"
+flylatro-package-showcase = "flylatro.replay.package:main"
+flylatro-video-command = "flylatro.visualization.video_cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+addopts = "-ra"
+pythonpath = ["src"]
+testpaths = ["tests"]

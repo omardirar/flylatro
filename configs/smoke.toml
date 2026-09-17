@@ -1,0 +1,23 @@
+# Smallest end-to-end check used by CI and development.
+[environment]
+num_envs = 2
+hand_size = 5
+blind_target = 20.0
+initial_hands = 2
+initial_discards = 1
+
+[fly]
+neuron_count = 96
+graph_seed = 1701
+edge_probability = 0.08
+duration_ms = 10.0
+microbatch_size = 2
+readout_count = 8
+
+[policy]
+seed = 2203
+deterministic = true
+
+[run]
+seed_start = 10
+max_decisions = 20

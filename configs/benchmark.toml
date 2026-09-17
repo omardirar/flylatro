@@ -1,0 +1,37 @@
+[experiment]
+name = "benchmark"
+
+[environment]
+backend = "mock"
+num_envs = 8
+
+[processor]
+kind = "synthetic"
+microbatch_size = 4
+synthetic_reservoir_size = 64
+synthetic_output_size = 32
+
+[policy]
+hidden_size = 0
+
+[ppo]
+rollout_steps = 8
+update_epochs = 1
+minibatch_size = 32
+max_updates = 1
+checkpoint_every_updates = 1
+
+[reward]
+shaping_beta = 1.0
+
+[curriculum]
+enabled = false
+
+[evaluation]
+episodes = 8
+max_vector_steps = 100
+
+[runtime]
+device = "cpu"
+output_root = "runs"
+tensorboard = false

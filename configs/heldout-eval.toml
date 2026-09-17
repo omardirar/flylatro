@@ -1,0 +1,45 @@
+[experiment]
+name = "heldout-real-fly-evaluation"
+
+[environment]
+backend = "balatro_sim"
+num_envs = 1024
+strict_actions = true
+
+[processor]
+kind = "real"
+artifact_path = "data/flywire/flywire_fafb_v783.npz"
+duration_ms = 50.0
+microbatch_size = 32
+population_width = 3
+max_rate_hz = 150.0
+readout_count = 1305
+
+[policy]
+hidden_size = 0
+
+[ppo]
+rollout_steps = 128
+update_epochs = 1
+minibatch_size = 1024
+max_updates = 1
+checkpoint_every_updates = 1
+seed = 1400
+
+[reward]
+shaping_beta = 0.0
+
+[curriculum]
+enabled = false
+
+[evaluation]
+stream = "validation"
+episodes = 4096
+seed_offset = 0
+max_vector_steps = 30000
+deterministic = true
+
+[runtime]
+device = "cuda"
+output_root = "evaluations"
+tensorboard = false

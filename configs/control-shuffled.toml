@@ -1,0 +1,47 @@
+[experiment]
+name = "control-shuffled-connectome"
+
+[environment]
+backend = "balatro_sim"
+num_envs = 256
+strict_actions = true
+
+[processor]
+kind = "shuffled"
+artifact_path = "data/flywire/flywire_fafb_v783.npz"
+duration_ms = 50.0
+microbatch_size = 16
+population_width = 3
+readout_count = 1305
+shuffle_seed = 1701
+
+[policy]
+hidden_size = 0
+
+[ppo]
+rollout_steps = 128
+update_epochs = 4
+minibatch_size = 2048
+max_updates = 100000
+checkpoint_every_updates = 250
+seed = 1501
+
+[reward]
+shaping_beta = 1.0
+
+[curriculum]
+enabled = true
+ladder = [1, 2, 3, 5, 8]
+promotion_win_rate = 0.70
+evaluation_frequency_updates = 250
+evaluation_episodes = 1024
+
+[evaluation]
+stream = "validation"
+episodes = 1024
+max_vector_steps = 30000
+
+[runtime]
+device = "cuda"
+output_root = "runs"
+tensorboard = true

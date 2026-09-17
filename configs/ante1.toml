@@ -1,0 +1,50 @@
+[experiment]
+name = "ante1-real-fly"
+
+[environment]
+backend = "balatro_sim"
+num_envs = 256
+strict_actions = true
+
+[processor]
+kind = "real"
+artifact_path = "data/flywire/flywire_fafb_v783.npz"
+duration_ms = 50.0
+microbatch_size = 16
+population_width = 3
+max_rate_hz = 150.0
+readout_count = 1305
+record_events = false
+
+[policy]
+hidden_size = 0
+
+[ppo]
+rollout_steps = 128
+update_epochs = 4
+minibatch_size = 2048
+learning_rate = 0.0003
+max_updates = 10000
+checkpoint_every_updates = 100
+seed = 1101
+
+[reward]
+shaping_beta = 1.0
+
+[curriculum]
+enabled = true
+ladder = [1, 8]
+promotion_win_rate = 0.70
+evaluation_frequency_updates = 100
+evaluation_episodes = 1024
+
+[evaluation]
+stream = "curriculum"
+episodes = 1024
+max_vector_steps = 10000
+deterministic = true
+
+[runtime]
+device = "cuda"
+output_root = "runs"
+tensorboard = true

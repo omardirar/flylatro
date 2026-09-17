@@ -1,0 +1,42 @@
+[experiment]
+name = "benchmark-gpu-real-fly"
+
+[environment]
+backend = "balatro_sim"
+num_envs = 32
+strict_actions = true
+
+[processor]
+kind = "real"
+artifact_path = "data/flywire/flywire_fafb_v783.npz"
+duration_ms = 50.0
+microbatch_size = 8
+population_width = 3
+readout_count = 1305
+
+[policy]
+hidden_size = 0
+
+[ppo]
+rollout_steps = 4
+update_epochs = 1
+minibatch_size = 128
+max_updates = 1
+checkpoint_every_updates = 1
+seed = 1701
+
+[reward]
+shaping_beta = 1.0
+
+[curriculum]
+enabled = false
+
+[evaluation]
+stream = "validation"
+episodes = 32
+max_vector_steps = 1000
+
+[runtime]
+device = "cuda"
+output_root = "runs"
+tensorboard = false

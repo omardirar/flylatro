@@ -1,0 +1,46 @@
+[experiment]
+name = "full-game-real-fly"
+
+[environment]
+backend = "balatro_sim"
+num_envs = 4096
+strict_actions = true
+
+[processor]
+kind = "real"
+artifact_path = "data/flywire/flywire_fafb_v783.npz"
+duration_ms = 50.0
+microbatch_size = 32
+population_width = 3
+max_rate_hz = 150.0
+readout_count = 1305
+record_events = false
+
+[policy]
+hidden_size = 0
+
+[ppo]
+rollout_steps = 128
+update_epochs = 4
+minibatch_size = 16384
+learning_rate = 0.0001
+max_updates = 250000
+checkpoint_every_updates = 500
+seed = 1301
+
+[reward]
+shaping_beta = 0.25
+
+[curriculum]
+enabled = false
+
+[evaluation]
+stream = "validation"
+episodes = 4096
+max_vector_steps = 30000
+deterministic = true
+
+[runtime]
+device = "cuda"
+output_root = "runs"
+tensorboard = true

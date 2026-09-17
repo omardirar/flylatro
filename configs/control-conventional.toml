@@ -1,0 +1,42 @@
+[experiment]
+name = "control-conventional"
+
+[environment]
+backend = "balatro_sim"
+num_envs = 1024
+strict_actions = true
+
+[processor]
+kind = "conventional"
+microbatch_size = 32
+
+[policy]
+hidden_size = 64
+
+[ppo]
+rollout_steps = 128
+update_epochs = 4
+minibatch_size = 8192
+max_updates = 100000
+checkpoint_every_updates = 250
+seed = 1601
+
+[reward]
+shaping_beta = 1.0
+
+[curriculum]
+enabled = true
+ladder = [1, 2, 3, 5, 8]
+promotion_win_rate = 0.70
+evaluation_frequency_updates = 250
+evaluation_episodes = 4096
+
+[evaluation]
+stream = "validation"
+episodes = 4096
+max_vector_steps = 30000
+
+[runtime]
+device = "cuda"
+output_root = "runs"
+tensorboard = true

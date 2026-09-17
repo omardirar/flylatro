@@ -1,0 +1,45 @@
+[experiment]
+name = "dev-v1"
+
+[environment]
+backend = "mock"
+num_envs = 4
+blind_target = 25.0
+initial_hands = 3
+initial_discards = 2
+
+[processor]
+kind = "synthetic"
+duration_ms = 5.0
+microbatch_size = 2
+synthetic_reservoir_size = 48
+synthetic_output_size = 24
+synthetic_steps = 2
+
+[policy]
+hidden_size = 0
+
+[ppo]
+rollout_steps = 8
+update_epochs = 2
+minibatch_size = 16
+max_updates = 2
+checkpoint_every_updates = 1
+seed = 101
+
+[reward]
+shaping_beta = 1.0
+
+[curriculum]
+enabled = false
+
+[evaluation]
+stream = "validation"
+episodes = 4
+max_vector_steps = 50
+deterministic = true
+
+[runtime]
+device = "cpu"
+output_root = "runs"
+tensorboard = false
