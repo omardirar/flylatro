@@ -7,7 +7,7 @@ from typing import Any
 
 from flylatro.env.balatro_sim import ArrayBalatroEnv, composite_actions_to_batch
 from flylatro.env.types import ActionType, CompositeAction
-from flylatro.evaluation.evaluator import hash_observation_row, terminal_hash
+from flylatro.evaluation.state_hash import hash_observation_row, terminal_hash
 from flylatro.replay.bundle import ReplayBundle
 
 

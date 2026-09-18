@@ -1,0 +1,47 @@
+[experiment]
+name = "plastic-smoke"
+
+[environment]
+backend = "mock"
+num_envs = 1
+blind_target = 18.0
+initial_hands = 2
+initial_discards = 1
+
+[fly]
+backend = "synthetic"
+mode = "mbon_direct"
+synthetic_seed = 1701
+synthetic_kenyon_count = 48
+
+[motor]
+deterministic_training = false
+exploration_epsilon = 0.10
+exploration_seed = 2203
+
+[plasticity]
+learning_rate = 0.02
+eligibility_decay = 0.90
+dopamine_decay = 0.0
+min_efficacy = 0.20
+max_efficacy = 2.0
+
+[reinforcement]
+progress_scale = 0.05
+blind_clear_pulse = 0.40
+ante_clear_pulse = 0.80
+run_failure_pulse = 0.60
+ante8_success_pulse = 1.50
+
+[training]
+max_environment_decisions = 16
+checkpoint_every_decisions = 8
+base_fly_seed = 2001
+plasticity_enabled = true
+
+[curriculum]
+enabled = false
+
+[runtime]
+output_root = "runs"
+tensorboard = false

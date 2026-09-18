@@ -33,6 +33,9 @@ class TimelineEntry:
     cursor_cue: str
     selected_action_probability: float | None
     action_type_probabilities: tuple[float, ...]
+    reward: float
+    dopamine_appetitive: float
+    dopamine_aversive: float
 
 
 @dataclass(frozen=True, slots=True)
@@ -63,6 +66,9 @@ class Timeline:
                     "cursor_cue": item.cursor_cue,
                     "selected_action_probability": item.selected_action_probability,
                     "action_type_probabilities": item.action_type_probabilities,
+                    "reward": item.reward,
+                    "dopamine_appetitive": item.dopamine_appetitive,
+                    "dopamine_aversive": item.dopamine_aversive,
                 }
                 for item in self.entries
             ],
@@ -98,6 +104,13 @@ def build_timeline(
                 action_type_probabilities=tuple(
                     float(value)
                     for value in decision.get("action_type_probabilities", ())
+                ),
+                reward=float(decision.get("reward", 0.0)),
+                dopamine_appetitive=float(
+                    decision.get("dopamine_appetitive", 0.0)
+                ),
+                dopamine_aversive=float(
+                    decision.get("dopamine_aversive", 0.0)
                 ),
             )
         )

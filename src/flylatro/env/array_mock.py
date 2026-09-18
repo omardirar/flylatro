@@ -124,6 +124,7 @@ class MockArrayBalatroEnv:
             if dones[index]:
                 infos.append(
                     {
+                        "ante_cleared": bool(won),
                         "episode": {
                             "r": state.episode_return,
                             "l": state.length,

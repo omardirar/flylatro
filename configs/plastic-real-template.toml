@@ -1,0 +1,57 @@
+[experiment]
+name = "plastic-real-template"
+
+[environment]
+backend = "balatro_sim"
+num_envs = 1
+strict_actions = true
+
+[fly]
+backend = "flywire"
+mode = "mbon_direct"
+artifact_path = "data/flywire/flywire_fafb_v783.npz"
+device = "cuda"
+duration_ms = 50.0
+reset_fast_state_each_decision = true
+sensory_mapping_seed = 0
+sensory_population_width = 3
+max_rate_hz = 150.0
+motor_pool_width = 1
+
+[motor]
+deterministic_training = false
+exploration_epsilon = 0.05
+exploration_temperature = 1.0
+exploration_seed = 2203
+
+[plasticity]
+learning_rate = 0.02
+eligibility_decay = 0.90
+dopamine_decay = 0.0
+min_efficacy = 0.20
+max_efficacy = 2.0
+
+[reinforcement]
+progress_scale = 0.05
+blind_clear_pulse = 0.40
+ante_clear_pulse = 0.80
+run_failure_pulse = 0.60
+ante8_success_pulse = 1.50
+
+[training]
+# Placeholder only. Choose this budget after the dedicated-machine benchmarks.
+max_environment_decisions = 1000
+checkpoint_every_decisions = 100
+base_fly_seed = 2001
+plasticity_enabled = true
+
+[curriculum]
+enabled = true
+ladder = [1, 2, 3, 5, 8]
+promotion_win_rate = 0.70
+evaluation_every_decisions = 10000
+evaluation_episodes = 256
+
+[runtime]
+output_root = "runs"
+tensorboard = true

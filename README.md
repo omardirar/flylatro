@@ -1,80 +1,118 @@
 # Flylatro
 
-Flylatro is a reinforcement-learning experiment that uses the fixed adult
-*Drosophila* connectome as the neural processor for learning Balatro from
-scratch. The authoritative research design is [PLAN.MD](PLAN.MD); the current
-implementation ledger is [docs/V1_STATUS.md](docs/V1_STATUS.md).
+Flylatro tests whether dopamine-gated plasticity inside a connectome-derived
+model of the adult *Drosophila* mushroom body can acquire useful Balatro
+behaviour. The authoritative design is [PLAN.MD](PLAN.MD), implementation
+evidence is tracked in [docs/V1_STATUS.md](docs/V1_STATUS.md), and dedicated
+machine commands live in [docs/GPU_RUNBOOK.md](docs/GPU_RUNBOOK.md).
 
-The V1 execution path is:
+The primary V1 path is:
 
 ```text
-BalatroVecEnv observation
-→ fixed full-state sensory encoder
-→ reset-per-decision sparse FlyWire LIF simulation
-→ fixed descending-neuron rate/voltage features
-→ small structured actor + critic
-→ exact legal-action masks
-→ PPO
+Balatro state
+-> fixed seeded synthetic sensory mapping
+-> fixed FlyWire topology and simplified LIF dynamics
+-> sparse plastic KC->MBON efficacies
+-> MBON-direct or downstream descending activity
+-> fixed zero-parameter structured motor interface + legal mask
+-> Balatro outcome
+-> fixed appetitive/aversive dopamine mapping
+-> eligibility-gated KC->MBON update
 ```
 
-The encoder, FlyWire topology, neural dynamics, and feature extraction are
-fixed. Only the structured policy/readout and critic are trained. Training
-starts from random parameters and consumes environment reward only. The
-upstream Balatro heuristic is isolated to an explicit evaluation baseline and
-is never available to PPO.
+There is no trainable external actor, decoder, critic, PPO update, or gradient
+descent in this path. The persistent learned parameters are the efficacy values
+of existing KC->MBON edges. Neural and eligibility traces are dynamic fly
+state. Balatro sensing and motor interpretation are synthetic, fixed interfaces
+and are not claimed to be natural fly biology.
 
-## Safe local validation
+## Safe local plastic-brain smoke run
 
-Python 3.11+ is required. These commands use only mock Balatro and a fixed
-synthetic reservoir; they do not load FlyWire, use a GPU, or run long training.
+The smoke profile uses a tiny synthetic mushroom-body circuit and mock Balatro.
+It does not load FlyWire, compile the real simulator, use a GPU, or make a
+scientific performance claim.
 
 ```bash
 python -m venv .venv
 .venv/bin/python -m pip install -e '.[dev,training]'
 .venv/bin/python -m pytest
 .venv/bin/flylatro-train \
-  --config configs/smoke-v1.toml \
-  --run-dir /tmp/flylatro-smoke \
+  --config configs/plastic-smoke.toml \
+  --run-dir /tmp/flylatro-plastic-smoke \
   --no-tensorboard
+
+.venv/bin/flylatro-evaluate \
+  --config configs/plastic-smoke.toml \
+  --checkpoint /tmp/flylatro-plastic-smoke/plastic-checkpoint-final.pkl \
+  --output-dir /tmp/flylatro-plastic-eval \
+  --episodes 8
+
+.venv/bin/flylatro-analyze-synapses \
+  --config configs/plastic-smoke.toml \
+  --checkpoint /tmp/flylatro-plastic-smoke/plastic-checkpoint-final.pkl \
+  --output /tmp/flylatro-plastic-smoke/synaptic-analysis.json
 ```
 
-Real Balatro, real/shuffled FlyWire, more than 64 environments, or more than
-10 PPO updates are rejected unless `--heavy` is supplied. Full connectome
-construction separately requires `--full`. Final-test seeds require
-`--unlock-final-test`. Detailed spike recording is off unless
-`--record-neural` is explicitly requested for one episode.
+Real Balatro, a v783 artifact, CUDA, more than eight independent flies, or more
+than 1,000 training decisions require `--heavy`. Full artifact construction
+separately requires `--full`; final-test seeds require
+`--unlock-final-test`. These guards keep this development machine from starting
+the experiments intended for the dedicated GPU machine.
 
-## Main commands
+## Primary commands
 
 ```text
-flylatro-train              PPO training and checkpointing
-flylatro-evaluate           frozen policy evaluation + replay candidates
-flylatro-baseline-evaluate  random/legal or isolated heuristic baseline
-flylatro-replay             simulator verification, optional live replay
-flylatro-visualize          FlyWire-coordinate SVG/timeline generation
-bench-balatro               environment throughput
-bench-fly                   fly simulation throughput
-bench-policy                structured policy throughput
-bench-end-to-end            rollout throughput
+flylatro-train                 internal KC->MBON plastic learning
+flylatro-evaluate              frozen plastic-fly evaluation
+flylatro-analyze-synapses      learned-weight distributions and biological groups
+flylatro-shuffle-reward        deterministic shuffled-dopamine control schedule
+bench-plasticity               sparse plastic-edge update benchmark
+bench-plastic-end-to-end       plastic-fly decision throughput
+flylatro-replay                deterministic simulator and optional live replay
+flylatro-visualize             fixed-coordinate neural/plasticity rendering
 ```
 
-The default development profiles are `configs/dev-v1.toml` and
-`configs/smoke-v1.toml`. Dedicated-machine profiles cover benchmarks, Ante 1,
-curriculum, full training, controls, final evaluation, and showcase recording.
-Exact commands and success criteria are in
-[docs/GPU_RUNBOOK.md](docs/GPU_RUNBOOK.md).
+For a deliberately short showcase-training run,
+`flylatro-train --record-plasticity-events` records only changed KC->MBON edge
+IDs and efficacy deltas. It is opt-in because detailed edge events can be large
+on the real graph.
+
+`configs/plastic-real-template.toml` is deliberately a template. Training
+budgets and batch sizes must be selected from dedicated-machine benchmarks, not
+invented in advance.
+
+## Legacy reservoir/PPO baseline
+
+The earlier fixed-fly architecture is preserved as a comparison, not the main
+project direction. Its plan is archived at
+[docs/archive/RESERVOIR_V1_PLAN.md](docs/archive/RESERVOIR_V1_PLAN.md) and its
+entry points are explicitly named:
+
+```text
+flylatro-legacy-ppo-train
+flylatro-legacy-ppo-evaluate
+bench-policy
+bench-end-to-end
+```
+
+Legacy code still provides useful environment, seed, replay, benchmark, and
+visualisation infrastructure. A green legacy test is not evidence that the
+plastic-brain experiment is complete.
 
 ## External data and assets
 
-FlyWire FAFB v783 data are user-supplied and checksum-verified; they are not
-vendored. Balatro is proprietary and is used only from a user-owned local
-installation for the final visual replay. Flylatro does not recreate or
-distribute Balatro assets. See [docs/DEPENDENCIES.md](docs/DEPENDENCIES.md) and
-[ADR 0002](docs/adr/0002-flywire-populations-and-encoding.md).
+FlyWire FAFB v783 data are user-supplied, checksum-verified, and not vendored.
+The artifact builder records exact KC, MBON, DAN, PAM, PPL1, ALPN, APL, DPM and
+descending indices/root IDs plus sparse KC->MBON edge positions. Balatro is a
+proprietary user-owned installation used only for final replay; no game assets
+are distributed here. See [docs/DEPENDENCIES.md](docs/DEPENDENCIES.md) and the
+ADRs under `docs/adr/`.
 
-## Experimental status
+## Verification boundary
 
-The lightweight V1 stack is locally testable. Real PyO3 simulator build,
-full-connectome CPU/GPU dynamics, throughput sizing, training, final held-out
-evaluation, live Balatro replay, and final rendering remain dedicated-machine
-validation—not completed scientific results.
+Local synthetic tests can establish software properties such as deterministic
+mappings, legal actions, bounded plasticity, exact checkpoint resume, frozen
+evaluation, and propagation through tiny graphs. They cannot establish that
+the v783 populations are correctly censused on disk, that whole-brain dynamics
+are useful, that learning succeeds in real Balatro, or that GPU throughput is
+adequate. Those claims require the runbook on the dedicated machine.

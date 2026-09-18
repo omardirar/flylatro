@@ -57,6 +57,7 @@ class TorchFlyWireBackend:
         parameters: ShiuLIFParameters | None = None,
         readout_indices: Sequence[int] | None = None,
         shuffle_seed: int | None = None,
+        shuffle_preserve_populations: bool = False,
         record_events: bool = False,
     ) -> None:
         try:
@@ -82,7 +83,10 @@ class TorchFlyWireBackend:
             raise ValueError("at least one readout neuron is required")
         self.readout_indices = selected
         self.readout_root_ids = artifact.root_ids[selected]
-        pre, post, weights, procedure = artifact.edge_arrays(shuffle_seed=shuffle_seed)
+        pre, post, weights, procedure = artifact.edge_arrays(
+            shuffle_seed=shuffle_seed,
+            preserve_populations=shuffle_preserve_populations,
+        )
         sparse_indices = torch.from_numpy(np.stack((post, pre))).to(
             device=self.device, dtype=torch.int64
         )

@@ -8,7 +8,7 @@ from typing import Sequence
 import numpy as np
 
 
-NEURAL_SCHEMA_VERSION = 1
+NEURAL_SCHEMA_VERSION = 2
 
 
 class NeuralEventRecorder:
@@ -56,10 +56,26 @@ class NeuralEventRecorder:
         )
         if kind_values.shape != times.shape:
             raise ValueError("event kinds must match event count")
-        allowed_kinds = {"spike", "stimulation", "activity"}
+        allowed_kinds = {
+            "spike",
+            "stimulation",
+            "activity",
+            "dopamine",
+            "plasticity",
+            "weight_snapshot",
+        }
         if any(str(kind) not in allowed_kinds for kind in kind_values):
             raise ValueError(f"event kinds must be one of {sorted(allowed_kinds)}")
-        allowed = {"input", "internal", "readout"}
+        allowed = {
+            "input",
+            "internal",
+            "readout",
+            "kc",
+            "mbon",
+            "dan",
+            "descending",
+            "plasticity",
+        }
         if any(str(role) not in allowed for role in role_values):
             raise ValueError(f"neural roles must be one of {sorted(allowed)}")
         self._decision.append(np.full(count, decision_id, dtype=np.int32))

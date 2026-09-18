@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "flylatro"
-version = "0.1.0"
-description = "A fixed-connectome reinforcement-learning experiment for Balatro"
+version = "0.2.0"
+description = "Dopamine-gated mushroom-body plasticity experiments for Balatro"
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
@@ -34,17 +34,25 @@ balatro = [
 
 [project.scripts]
 flylatro-smoke = "flylatro.cli:main"
-flylatro-train = "flylatro.training.cli:main"
-flylatro-evaluate = "flylatro.evaluation.cli:main"
+flylatro-train = "flylatro.learning.cli:main"
+flylatro-evaluate = "flylatro.evaluation.plastic_cli:main"
+flylatro-legacy-ppo-train = "flylatro.training.cli:main"
+flylatro-legacy-ppo-evaluate = "flylatro.evaluation.cli:main"
 bench-balatro = "flylatro.benchmarks.cli:balatro_main"
 bench-fly = "flylatro.benchmarks.cli:fly_main"
 bench-policy = "flylatro.benchmarks.cli:policy_main"
 bench-end-to-end = "flylatro.benchmarks.cli:end_to_end_main"
+bench-plasticity = "flylatro.benchmarks.cli:plasticity_main"
+bench-plastic-end-to-end = "flylatro.benchmarks.cli:plastic_end_to_end_main"
 flylatro-replay = "flylatro.replay.cli:main"
 flylatro-visualize = "flylatro.visualization.cli:main"
 flylatro-baseline-evaluate = "flylatro.evaluation.baseline_cli:main"
 flylatro-package-showcase = "flylatro.replay.package:main"
 flylatro-video-command = "flylatro.visualization.video_cli:main"
+flylatro-analyze-synapses = "flylatro.analysis.cli:main"
+flylatro-verify-populations = "flylatro.analysis.populations_cli:main"
+flylatro-diagnose-representation = "flylatro.analysis.representation_cli:main"
+flylatro-shuffle-reward = "flylatro.learning.reward_schedule_cli:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]

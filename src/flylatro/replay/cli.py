@@ -6,12 +6,12 @@ import argparse
 from dataclasses import replace
 import json
 from pathlib import Path
+import tomllib
 from typing import Sequence
 
 from flylatro.replay.bundle import ReplayBundle
 from flylatro.replay.live import BalatrobotClient, play_live_replay
 from flylatro.replay.verify import verify_replay
-from flylatro.training.config import ExperimentConfig, build_environment
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -27,13 +27,30 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--settle-seconds", type=float, default=0.5)
     parser.add_argument("--cash-out-delay-seconds", type=float, default=8.0)
     args = parser.parse_args(argv)
-    config = ExperimentConfig.load(args.config)
-    config.require_heavy_opt_in(args.heavy)
-    one = replace(
-        config, environment=replace(config.environment, num_envs=1)
-    )
+    raw = tomllib.loads(args.config.read_text(encoding="utf-8"))
+    if "fly" in raw and "training" in raw:
+        from flylatro.learning.config import (
+            PlasticExperimentConfig,
+            build_plastic_environment,
+        )
+
+        config = PlasticExperimentConfig.load(args.config)
+        config.require_heavy_opt_in(args.heavy)
+        one = replace(
+            config, environment=replace(config.environment, num_envs=1)
+        )
+        env = build_plastic_environment(one)
+        env.set_win_ante(8)
+    else:
+        from flylatro.training.config import ExperimentConfig, build_environment
+
+        config = ExperimentConfig.load(args.config)
+        config.require_heavy_opt_in(args.heavy)
+        one = replace(
+            config, environment=replace(config.environment, num_envs=1)
+        )
+        env = build_environment(one, win_ante=8)
     bundle = ReplayBundle.open(args.bundle)
-    env = build_environment(one, win_ante=8)
     divergences = verify_replay(bundle, env)
     payload = {
         "bundle": str(bundle.path),

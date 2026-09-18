@@ -52,6 +52,35 @@ def test_control_shuffle_preserves_edges_degree_distributions_and_weights(
     assert "seed=42" in procedure
 
 
+def test_population_preserving_shuffle_keeps_kc_mbon_endpoints_in_population(
+    tmp_path: Path,
+) -> None:
+    base = tiny_artifact(tmp_path)
+    artifact = FlyWireArtifact(
+        path=base.path,
+        manifest=base.manifest,
+        root_ids=base.root_ids,
+        pre_indices=base.pre_indices,
+        post_indices=base.post_indices,
+        signed_synapse_counts=base.signed_synapse_counts,
+        sensory_indices=base.sensory_indices,
+        descending_indices=base.descending_indices,
+        coordinates_nm=base.coordinates_nm,
+        kenyon_indices=np.asarray([0, 1], dtype=np.int64),
+        mbon_indices=np.asarray([2, 3], dtype=np.int64),
+        kc_mbon_edge_indices=np.asarray([1, 2], dtype=np.int64),
+    )
+
+    _, post, _, procedure = artifact.edge_arrays(
+        shuffle_seed=3, preserve_populations=True
+    )
+
+    assert set(post[artifact.kc_mbon_edge_indices]).issubset(
+        set(artifact.mbon_indices)
+    )
+    assert procedure.startswith("population-preserving")
+
+
 def test_feature_extractor_resolves_real_neuron_ids() -> None:
     activity = FlyActivity(
         spike_counts=np.asarray([[1, 2]], dtype=np.int64),

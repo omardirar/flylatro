@@ -7,6 +7,8 @@ import pytest
 
 from flylatro.env.balatro_sim import (
     BalatroSimAdapter,
+    _ante_advanced,
+    _ante_cleared,
     _reward_components,
     action_batch_row_to_composite,
     composite_actions_to_batch,
@@ -161,3 +163,20 @@ def test_real_reward_is_decomposed_into_strategy_neutral_components() -> None:
     assert components["blind_clear"] == pytest.approx(0.575)
     assert components["blind_progress"] == pytest.approx(0.2)
     assert sum(components.values()) == pytest.approx(15.775)
+
+
+def test_ante_clear_is_inferred_from_observable_transition_only() -> None:
+    before = zero_batch(OBS_SPEC, 1)
+    after = zero_batch(OBS_SPEC, 1)
+    before["global"][0, GLOBAL_ANTE_OFF + 2] = 1
+    after["global"][0, GLOBAL_ANTE_OFF + 3] = 1
+
+    assert _ante_advanced(before, after, row=0, done=False)
+    assert not _ante_advanced(before, after, row=0, done=True)
+    assert _ante_cleared(
+        before,
+        after,
+        info={"episode": {"won": True}},
+        row=0,
+        done=True,
+    )

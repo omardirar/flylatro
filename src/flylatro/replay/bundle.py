@@ -36,6 +36,14 @@ class ReplayIdentity:
     simulator_seed: int | None = None
     fly_backend_version: str | None = None
     fly_dynamics_hash: str | None = None
+    architecture: str | None = None
+    plastic_weight_hash: str | None = None
+    plasticity_rule_hash: str | None = None
+    population_hash: str | None = None
+    sensory_mapping_hash: str | None = None
+    motor_mapping_hash: str | None = None
+    reinforcement_mapping_hash: str | None = None
+    artifact_hash: str | None = None
 
 
 class ReplayBundleWriter:

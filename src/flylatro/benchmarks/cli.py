@@ -87,8 +87,15 @@ def fly_main(argv: Sequence[str] | None = None) -> int:
             rates[:, : min(8, neuron_count)] = 50.0
             stimulus = Stimulus(rates, "benchmark-v1", "benchmark")
             backend.reset(batch, tuple(range(batch)))
+            if args.device.startswith("cuda"):
+                import torch
+
+                torch.cuda.synchronize()
+                torch.cuda.reset_peak_memory_stats()
             start = time.perf_counter()
             backend.simulate(stimulus, duration)
+            if args.device.startswith("cuda"):
+                torch.cuda.synchronize()
             seconds = time.perf_counter() - start
             row = _metrics(batch, seconds)
             row.update(batch_size=batch, duration_ms=duration)
@@ -155,6 +162,93 @@ def end_to_end_main(argv: Sequence[str] | None = None) -> int:
     stack = build_training_stack(config)
     _, metrics = stack.trainer.collect_rollout()
     print(json.dumps({"benchmark": "end_to_end", "metrics": metrics}, sort_keys=True))
+    return 0
+
+
+def plasticity_main(argv: Sequence[str] | None = None) -> int:
+    parser = _base_parser("Sparse KC->MBON plasticity update throughput")
+    parser.add_argument("--edges", type=int, default=10_000)
+    parser.add_argument("--learners", type=int, default=1)
+    parser.add_argument("--iterations", type=int, default=100)
+    args = parser.parse_args(argv)
+    work = args.edges * args.learners * args.iterations
+    _guard(args, real=False, work=work)
+    from flylatro.fly.mushroom_body.plasticity import ThreeFactorPlasticity
+    from flylatro.fly.mushroom_body.state import PlasticEdgeState
+    from flylatro.fly.mushroom_body.topology import PlasticEdgeTopology
+
+    pre = np.arange(args.edges, dtype=np.int64)
+    topology = PlasticEdgeTopology.synthetic(
+        pre,
+        pre + args.edges,
+        np.ones(args.edges, dtype=np.float32),
+    )
+    state = PlasticEdgeState.initialize(args.edges, learners=args.learners)
+    rule = ThreeFactorPlasticity(topology, state)
+    activity = np.ones((args.learners, args.edges), dtype=np.float32)
+    start = time.perf_counter()
+    for _ in range(args.iterations):
+        rule.record_activity(activity, activity)
+        rule.apply_dopamine(0.1, 0.0)
+    seconds = time.perf_counter() - start
+    _emit(
+        "plasticity",
+        "numpy-sparse-edge-vector",
+        args.learners * args.iterations,
+        seconds,
+        {
+            "plastic_edges": args.edges,
+            "learners": args.learners,
+            "iterations": args.iterations,
+            "edge_updates_per_second": work / seconds,
+        },
+    )
+    return 0
+
+
+def plastic_end_to_end_main(argv: Sequence[str] | None = None) -> int:
+    parser = _base_parser("Plastic fly environment-decision throughput")
+    parser.add_argument(
+        "--config", type=Path, default=Path("configs/plastic-smoke.toml")
+    )
+    parser.add_argument("--steps", type=int, default=10)
+    parser.add_argument("--output-mode", choices=("mbon_direct", "whole_brain"))
+    args = parser.parse_args(argv)
+    from flylatro.learning.config import PlasticExperimentConfig, build_plastic_stack
+
+    config = PlasticExperimentConfig.load(args.config)
+    if args.output_mode is not None:
+        from dataclasses import replace
+
+        config = replace(config, fly=replace(config.fly, mode=args.output_mode))
+    config.require_heavy_opt_in(args.heavy)
+    stack = build_plastic_stack(config)
+    if config.fly.device.startswith("cuda"):
+        import torch
+
+        torch.cuda.synchronize()
+        torch.cuda.reset_peak_memory_stats()
+    start = time.perf_counter()
+    last = {}
+    for _ in range(args.steps):
+        last = stack.trainer.step()
+    if config.fly.device.startswith("cuda"):
+        torch.cuda.synchronize()
+    seconds = time.perf_counter() - start
+    decisions = args.steps * stack.env.num_envs
+    _emit(
+        "plastic_end_to_end",
+        config.fly.backend,
+        decisions,
+        seconds,
+        {
+            "output_mode": config.fly.mode,
+            "plastic_edges": stack.agent.plasticity.topology.edge_count,
+            "learners": stack.agent.plasticity.state.learners,
+            "external_trainable_parameters": 0,
+            "last_metrics": last,
+        },
+    )
     return 0
 
 

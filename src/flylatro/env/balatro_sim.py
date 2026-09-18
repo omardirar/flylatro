@@ -115,6 +115,14 @@ class BalatroSimAdapter:
                     row=index,
                     beta=self._beta,
                 )
+            if before is not None and _ante_cleared(
+                before,
+                observations,
+                info=info,
+                row=index,
+                done=bool(dones[index]),
+            ):
+                info["ante_cleared"] = True
             enriched_infos.append(info)
         self._last_observations = observations
         return ArrayStep(
@@ -272,3 +280,36 @@ def _reward_components(
         if abs(value) < 1e-9:
             components[key] = 0.0
     return components
+
+
+def _ante_advanced(
+    before: ObsDict, after: ObsDict, *, row: int, done: bool
+) -> bool:
+    """Infer an Ante clear only from consecutive observable Ante one-hots."""
+
+    if done:
+        # The pinned vector environment auto-resets on terminal transitions;
+        # comparing the new episode to the terminal episode would be invalid.
+        return False
+
+    def ante(observations: ObsDict) -> int:
+        encoded = observations["global"][row, GLOBAL_ANTE_OFF : GLOBAL_ANTE_OFF + 9]
+        return int(np.argmax(encoded)) + 1 if bool(np.any(encoded)) else 0
+
+    previous = ante(before)
+    current = ante(after)
+    return previous > 0 and current > previous
+
+
+def _ante_cleared(
+    before: ObsDict,
+    after: ObsDict,
+    *,
+    info: dict[str, Any],
+    row: int,
+    done: bool,
+) -> bool:
+    if done:
+        episode = info.get("episode")
+        return bool(isinstance(episode, dict) and episode.get("won", False))
+    return _ante_advanced(before, after, row=row, done=False)
