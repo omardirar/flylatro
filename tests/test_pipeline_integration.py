@@ -22,10 +22,16 @@ from helpers import build_mock_corpus, write_config
 
 torch = pytest.importorskip("torch")
 
+#: The mock environment only ever reaches PLAYING states, so the shop, pack,
+#: joker and consumable motor contexts have no evidence in it.  These tests opt
+#: out of the context-evidence gate explicitly; `test_motor_interface_v2`
+#: asserts that the default gate refuses exactly this situation.
 RELAXED_MOTOR = [
     "--minimum-candidate-robust-scale-hz", "0.0001",
     "--minimum-effective-signal-fraction", "0.0",
     "--minimum-normalized-option-range", "0.0",
+    "--minimum-context-states", "0",
+    "--minimum-competing-context-states", "0",
 ]
 
 

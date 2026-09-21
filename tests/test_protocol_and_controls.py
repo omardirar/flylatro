@@ -39,7 +39,7 @@ def test_every_stored_seed_has_a_declared_effect() -> None:
     assert protocol.version == EXPERIMENT_PROTOCOL_VERSION
     replicate_fields = {
         field.name for field in dataclasses.fields(protocol.replicates[0])
-    } - {"replicate_id"}
+    } - {"replicate_id", "mapping_id"}
     assert replicate_fields == set(SEED_EFFECTS)
     for name, description in SEED_EFFECTS.items():
         assert description and len(description) > 20
@@ -143,11 +143,11 @@ def test_a_run_validates_itself_against_its_protocol_arm(tmp_path: Path) -> None
         protocol, base, protocol_path=protocol_path, output_dir=tmp_path / "arms",
         run_root="runs", budget_basis="unit", checkpoint_every_decisions=8,
     )
-    arm_path = tmp_path / "arms" / "replicate-000-plastic_real.toml"
+    arm_path = tmp_path / "arms" / "mapping-000-replicate-000-plastic_real.toml"
     config = PlasticExperimentConfig.load(arm_path)
     payload = json.loads(protocol_path.read_text(encoding="utf-8"))
     identity = assert_configuration_matches_arm(payload, config)
-    assert identity["arm_id"] == "replicate-000:plastic_real"
+    assert identity["arm_id"] == "mapping-000-replicate-000:plastic_real"
     assert identity["motor_mapping_id"] == "motor-sha"
 
     from dataclasses import replace
@@ -290,7 +290,7 @@ def test_a_run_refuses_a_motor_artifact_the_protocol_did_not_authorize(
         run_root="runs", budget_basis="unit", checkpoint_every_decisions=8,
     )
     arm = PlasticExperimentConfig.load(
-        tmp_path / "arms" / "replicate-000-plastic_real.toml"
+        tmp_path / "arms" / "mapping-000-replicate-000-plastic_real.toml"
     )
     with pytest.raises(ValueError, match="requires motor mapping"):
         build_plastic_stack(arm)
@@ -303,9 +303,9 @@ def test_a_run_refuses_a_motor_artifact_the_protocol_did_not_authorize(
         budget_basis="unit", checkpoint_every_decisions=8,
     )
     good = PlasticExperimentConfig.load(
-        tmp_path / "ok-arms" / "replicate-000-plastic_real.toml"
+        tmp_path / "ok-arms" / "mapping-000-replicate-000-plastic_real.toml"
     )
     stack = build_plastic_stack(good)
     assert stack.components["protocol_sha256"] == authorized.sha256
-    assert stack.components["protocol_arm_id"] == "replicate-000:plastic_real"
+    assert stack.components["protocol_arm_id"] == "mapping-000-replicate-000:plastic_real"
     assert stack.components["motor_mapping_sha256"] == mapping.structure_sha256

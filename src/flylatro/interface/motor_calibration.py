@@ -3,7 +3,15 @@
 Nothing in this module observes reward, win rate, game score, a correct action
 or any strategy label.  Selection uses only structural and statistical
 properties of neural activity recorded over a frozen, reward-free calibration
-state corpus.
+state corpus, plus the environment's own legality masks.
+
+Selection is **context-aware** (v3).  A routing group is evaluated in the states
+where its pools are actually read, not across the whole corpus: a neuron with a
+large dynamic range in ``PLAYING`` states and none in the shop is not evidence
+that the contextual slot pools carry shop signal.  The four contextual heads
+(shop, pack, joker, consumable) deliberately share one pool group, so each of
+them is assessed separately and a context with too little evidence is reported
+as such instead of being absorbed into a whole-corpus average.
 """
 
 from __future__ import annotations
@@ -22,10 +30,17 @@ from flylatro.interface.motor import (
     MotorNormalization,
     MotorRouting,
 )
+from flylatro.interface.motor_contexts import (
+    MOTOR_CONTEXT_VERSION,
+    MotorContextWindow,
+    group_relevant_rows,
+)
 
 
-MOTOR_CALIBRATION_VERSION = "reward-free-neural-motor-calibration-v2"
-MOTOR_SELECTION_METHOD = "reward-free-robust-scale-with-within-group-decorrelation"
+MOTOR_CALIBRATION_VERSION = "reward-free-neural-motor-calibration-v3"
+MOTOR_SELECTION_METHOD = (
+    "reward-free-context-conditioned-robust-scale-with-within-group-decorrelation"
+)
 
 
 class MotorCalibrationError(ValueError):
@@ -47,6 +62,12 @@ class MotorCalibrationThresholds:
     minimum_normalized_option_range: float = 0.25
     maximum_pool_silent_fraction: float = 0.90
     minimum_pool_width: int = 2
+    #: States in which a context is actually interpreted before its evidence
+    #: counts.  Set to 0 only to deliberately opt out (development doubles).
+    minimum_context_states: int = 4
+    #: Of those, states offering more than one legal option: a context where a
+    #: single option is always forced proves nothing about competition.
+    minimum_competing_context_states: int = 2
 
 
 @dataclass(frozen=True, slots=True)
@@ -67,6 +88,7 @@ def calibrate_reward_free_motor(
     pool_width: int = 2,
     routing: MotorRouting = CONTEXTUAL_ROUTING,
     thresholds: MotorCalibrationThresholds | None = None,
+    contexts: Mapping[str, MotorContextWindow] | None = None,
     exploration_epsilon: float = 0.0,
     exploration_temperature: float = 1.0,
     exploration_seed: int = 0,
@@ -85,6 +107,12 @@ def calibrate_reward_free_motor(
         )
     if values.shape[0] < 4 or not np.isfinite(values).all():
         raise MotorCalibrationError("insufficient finite reward-free calibration states")
+    if contexts is not None:
+        for window in contexts.values():
+            if window.relevant.shape[0] != values.shape[0]:
+                raise MotorCalibrationError(
+                    "motor context windows must align with the calibration samples"
+                )
 
     statistics = _candidate_statistics(values, limits)
     eligible = statistics["eligible"]
@@ -97,15 +125,12 @@ def calibrate_reward_free_motor(
             {"candidate_statistics": _summarize_candidates(statistics, roots)},
         )
 
-    order = _ranked_candidates(statistics, roots)
-    standardized = _standardize(values, statistics["std"])
+    group_evidence = _group_evidence(values, routing, contexts, limits, roots)
     assignment = _assign_pools(
-        order=order,
-        eligible=eligible,
-        standardized=standardized,
         routing=routing,
         pool_width=pool_width,
         maximum_correlation=limits.maximum_within_group_correlation,
+        group_evidence=group_evidence,
     )
     pool_indices = assignment["pool_indices"]
     pool_activity = np.stack(
@@ -120,12 +145,15 @@ def calibrate_reward_free_motor(
         normalized=normalized,
         routing=routing,
         limits=limits,
+        contexts=contexts,
     )
     selected_positions = np.asarray(
         [index for pool in pool_indices for index in pool], dtype=np.int64
     )
     raw_stats: dict[str, Any] = {
         "calibration_version": MOTOR_CALIBRATION_VERSION,
+        "context_version": MOTOR_CONTEXT_VERSION,
+        "context_aware": contexts is not None,
         "reward_used": False,
         "outcome_information_used": False,
         "sample_count": int(values.shape[0]),
@@ -142,6 +170,9 @@ def calibrate_reward_free_motor(
         ],
         "relaxed_correlation_assignments": assignment["relaxed"],
         "candidate_statistics": _summarize_candidates(statistics, roots),
+        "selection_evidence_by_group": {
+            group: evidence["summary"] for group, evidence in group_evidence.items()
+        },
         "selected_candidate_details": (
             [dict(candidate_details[int(position)]) for position in selected_positions]
             if candidate_details is not None
@@ -188,6 +219,58 @@ def calibrate_reward_free_motor(
         },
     }
     return MotorCalibrationResult(mapping=mapping, report=report)
+
+
+# --------------------------------------------------------------------------
+# context-conditioned candidate evidence
+# --------------------------------------------------------------------------
+
+
+def _group_evidence(
+    values: NDArray[np.float64],
+    routing: MotorRouting,
+    contexts: Mapping[str, MotorContextWindow] | None,
+    limits: MotorCalibrationThresholds,
+    roots: NDArray[np.int64],
+) -> dict[str, dict[str, Any]]:
+    """Rank and filter candidates inside each group's own interpretation states."""
+
+    evidence: dict[str, dict[str, Any]] = {}
+    all_rows = np.arange(values.shape[0], dtype=np.int64)
+    for group in routing.group_names:
+        rows = all_rows
+        restricted = False
+        note = "evaluated over every calibration state (no legality context supplied)"
+        if contexts is not None:
+            relevant = group_relevant_rows(contexts, group)
+            if relevant.size >= 2:
+                rows = relevant
+                restricted = True
+                note = "evaluated only in the states where this group is interpreted"
+            else:
+                note = (
+                    f"only {int(relevant.size)} state(s) interpret this group; fell "
+                    "back to the whole corpus and the context-evidence gate fails"
+                )
+        subset = values[rows]
+        statistics = _candidate_statistics(subset, limits)
+        evidence[group] = {
+            "rows": rows,
+            "eligible": statistics["eligible"],
+            "order": _ranked_candidates(statistics, roots),
+            "standardized": _standardize(subset, statistics["std"]),
+            "summary": {
+                "relevant_states": int(rows.size),
+                "context_restricted": restricted,
+                "note": note,
+                "eligible_candidates": int(statistics["eligible"].sum()),
+                "raw_pool_dynamic_range_hz": {
+                    "median": float(np.median(statistics["dynamic_range"])),
+                    "max": float(statistics["dynamic_range"].max(initial=0.0)),
+                },
+            },
+        }
+    return evidence
 
 
 def _candidate_statistics(
@@ -269,19 +352,20 @@ def _standardize(
 
 def _assign_pools(
     *,
-    order: NDArray[np.int64],
-    eligible: NDArray[np.bool_],
-    standardized: NDArray[np.float64],
     routing: MotorRouting,
     pool_width: int,
     maximum_correlation: float,
+    group_evidence: Mapping[str, dict[str, Any]],
 ) -> dict[str, Any]:
-    samples = standardized.shape[0]
-    ranked = [int(index) for index in order if bool(eligible[index])]
     used: set[int] = set()
     pools: list[tuple[int, ...] | None] = [None] * routing.pool_count
     relaxed: list[dict[str, Any]] = []
     for group, count in zip(routing.group_names, routing.group_pool_counts, strict=True):
+        evidence = group_evidence[group]
+        standardized = evidence["standardized"]
+        eligible = evidence["eligible"]
+        samples = standardized.shape[0]
+        ranked = [int(index) for index in evidence["order"] if bool(eligible[index])]
         pool_ids = routing.group_pool_ids(group)
         need = count * pool_width
         chosen: list[int] = []
@@ -289,7 +373,8 @@ def _assign_pools(
             available = [index for index in ranked if index not in used]
             if not available:
                 raise MotorCalibrationError(
-                    f"group {group} exhausted usable reward-free motor candidates"
+                    f"group {group} exhausted usable reward-free motor candidates "
+                    f"in the {samples} state(s) where it is interpreted"
                 )
             picked = None
             if chosen:
@@ -322,83 +407,206 @@ def _assign_pools(
     return {"pool_indices": tuple(pools), "relaxed": relaxed}  # type: ignore[arg-type]
 
 
+# --------------------------------------------------------------------------
+# quality evidence
+# --------------------------------------------------------------------------
+
+
 def _quality_report(
     *,
     pool_activity: NDArray[np.float64],
     normalized: NDArray[np.float64],
     routing: MotorRouting,
     limits: MotorCalibrationThresholds,
+    contexts: Mapping[str, MotorContextWindow] | None,
 ) -> dict[str, Any]:
     groups: dict[str, Any] = {}
+    for group in routing.group_names:
+        pool_ids = list(routing.group_pool_ids(group))
+        groups[group] = _block_metrics(
+            pool_activity[:, pool_ids], normalized[:, pool_ids], limits
+        )
+        groups[group]["pools"] = len(pool_ids)
+    by_context: dict[str, Any] = {}
     worst_range = np.inf
     worst_effective = np.inf
     worst_silent = 0.0
-    for group in routing.group_names:
-        pool_ids = list(routing.group_pool_ids(group))
-        raw = pool_activity[:, pool_ids]
-        norm = normalized[:, pool_ids]
-        correlation = _correlation_matrix(raw)
-        off_diagonal = correlation[~np.eye(len(pool_ids), dtype=bool)]
-        eigenvalues = np.linalg.eigvalsh(correlation)
-        eigenvalues = np.clip(eigenvalues, 0.0, None)
-        effective = float(
-            eigenvalues.sum() ** 2 / max(float((eigenvalues**2).sum()), 1e-12)
+    insufficient: list[str] = []
+    if contexts is None:
+        by_context = {}
+        insufficient = list(
+            () if limits.minimum_context_states <= 0 else ("<no legality context supplied>",)
         )
-        ranges = np.ptp(norm, axis=0)
-        silent = np.mean(raw <= limits.silence_hz, axis=0)
-        groups[group] = {
-            "pools": len(pool_ids),
-            "baseline_hz": {
-                "min": float(np.median(raw, axis=0).min()),
-                "median": float(np.median(np.median(raw, axis=0))),
-                "max": float(np.median(raw, axis=0).max()),
-            },
-            "dynamic_range_hz": {
-                "min": float(np.ptp(raw, axis=0).min()),
-                "median": float(np.median(np.ptp(raw, axis=0))),
-                "max": float(np.ptp(raw, axis=0).max()),
-            },
-            "variance_hz2": {
-                "min": float(raw.var(axis=0).min()),
-                "median": float(np.median(raw.var(axis=0))),
-                "max": float(raw.var(axis=0).max()),
-            },
-            "normalized_option_range": {
-                "min": float(ranges.min()),
-                "median": float(np.median(ranges)),
-                "max": float(ranges.max()),
-            },
-            "pool_silent_fraction": {
-                "min": float(silent.min()),
-                "median": float(np.median(silent)),
-                "max": float(silent.max()),
-            },
-            "pool_high_rate_fraction": {
-                "max": float(np.mean(raw >= limits.high_rate_hz, axis=0).max()),
-            },
-            "competing_pool_correlation": {
-                "mean_absolute": float(np.abs(off_diagonal).mean()) if off_diagonal.size else 0.0,
-                "max_absolute": float(np.abs(off_diagonal).max()) if off_diagonal.size else 0.0,
-            },
-            "effective_distinct_signals": effective,
-            "effective_signal_fraction": effective / max(len(pool_ids), 1),
-        }
-        worst_range = min(worst_range, float(ranges.min()))
-        worst_effective = min(worst_effective, effective / max(len(pool_ids), 1))
-        worst_silent = max(worst_silent, float(silent.max()))
+        worst_range = min(
+            (float(entry["normalized_option_range"]["min"]) for entry in groups.values()),
+            default=np.inf,
+        )
+        worst_effective = min(
+            (float(entry["effective_signal_fraction"]) for entry in groups.values()),
+            default=np.inf,
+        )
+        worst_silent = max(
+            (float(entry["pool_silent_fraction"]["max"]) for entry in groups.values()),
+            default=0.0,
+        )
+    else:
+        for name, window in contexts.items():
+            entry = _context_metrics(
+                window, pool_activity, normalized, routing, limits
+            )
+            by_context[name] = entry
+            if entry["insufficient_evidence"]:
+                # A zero requirement is an explicit declaration that this run
+                # does not demand context evidence (development doubles only).
+                # The per-context report still records exactly what was missing.
+                if limits.minimum_context_states > 0:
+                    insufficient.append(name)
+                continue
+            worst_range = min(worst_range, float(entry["normalized_option_range"]["min"]))
+            worst_effective = min(worst_effective, float(entry["effective_signal_fraction"]))
+            worst_silent = max(worst_silent, float(entry["pool_silent_fraction"]["max"]))
+        if not by_context:
+            insufficient.append("<no motor contexts>")
+    if worst_range is np.inf:
+        worst_range = 0.0
+    if worst_effective is np.inf:
+        worst_effective = 0.0
     checks = {
         "reward_free": True,
         "pool_width_sufficient": True,
+        "context_evidence_sufficient": not insufficient,
         "option_dynamic_range": worst_range >= limits.minimum_normalized_option_range,
         "group_signal_diversity": worst_effective >= limits.minimum_effective_signal_fraction,
         "pools_not_silent": worst_silent <= limits.maximum_pool_silent_fraction,
     }
     return {
+        "context_version": MOTOR_CONTEXT_VERSION,
         "by_group": groups,
+        "by_context": by_context,
+        "contexts_with_insufficient_evidence": insufficient,
         "minimum_normalized_option_range": worst_range,
         "minimum_effective_signal_fraction": worst_effective,
         "maximum_pool_silent_fraction": worst_silent,
+        "evidence_rule": (
+            "metrics are measured in the states where each head is actually "
+            "read; a context with too few relevant or competing states is "
+            "reported as insufficient and never averaged into a passing gate"
+        ),
         "checks": checks,
+    }
+
+
+def _context_metrics(
+    window: MotorContextWindow,
+    pool_activity: NDArray[np.float64],
+    normalized: NDArray[np.float64],
+    routing: MotorRouting,
+    limits: MotorCalibrationThresholds,
+) -> dict[str, Any]:
+    rows = window.relevant_indices
+    route = np.asarray(routing.head_routes[window.spec.head], dtype=np.int64)
+    active = window.active_options
+    options = np.asarray(
+        [int(option) for option in active if route[int(option)] >= 0], dtype=np.int64
+    )
+    competing = window.competing_states
+    insufficient = (
+        rows.size < limits.minimum_context_states
+        or competing < limits.minimum_competing_context_states
+        or options.size < 2
+        or rows.size < 2
+    )
+    base: dict[str, Any] = {
+        "group": window.spec.group,
+        "head": window.spec.head,
+        "description": window.spec.description,
+        "relevant_states": int(rows.size),
+        "states_with_competing_options": competing,
+        "active_option_count": int(options.size),
+        "option_width": int(route.size),
+        "coverage_of_contract_options": float(options.size / max(route.size, 1)),
+        "insufficient_evidence": bool(insufficient),
+        "minimum_states_required": limits.minimum_context_states,
+        "minimum_competing_states_required": limits.minimum_competing_context_states,
+    }
+    if insufficient:
+        return {
+            **base,
+            "reason": (
+                f"{int(rows.size)} relevant state(s), {competing} with competing "
+                f"options and {int(options.size)} active option(s): not enough "
+                "evidence that these pools carry usable signal in this context"
+            ),
+            "normalized_option_range": {"min": 0.0, "median": 0.0, "max": 0.0},
+            "raw_pool_hz": {"min": 0.0, "median": 0.0, "max": 0.0},
+            "dynamic_range_hz": {"min": 0.0, "median": 0.0, "max": 0.0},
+            "pool_silent_fraction": {"min": 1.0, "median": 1.0, "max": 1.0},
+            "competing_pool_correlation": {"mean_absolute": 0.0, "max_absolute": 0.0},
+            "effective_distinct_signals": 0.0,
+            "effective_signal_fraction": 0.0,
+        }
+    pool_ids = [int(route[int(option)]) for option in options]
+    metrics = _block_metrics(
+        pool_activity[np.ix_(rows, pool_ids)],
+        normalized[np.ix_(rows, pool_ids)],
+        limits,
+    )
+    return {**base, **metrics, "pools": len(pool_ids)}
+
+
+def _block_metrics(
+    raw: NDArray[np.float64],
+    norm: NDArray[np.float64],
+    limits: MotorCalibrationThresholds,
+) -> dict[str, Any]:
+    correlation = _correlation_matrix(raw)
+    off_diagonal = correlation[~np.eye(raw.shape[1], dtype=bool)]
+    eigenvalues = np.clip(np.linalg.eigvalsh(correlation), 0.0, None)
+    effective = float(
+        eigenvalues.sum() ** 2 / max(float((eigenvalues**2).sum()), 1e-12)
+    )
+    ranges = np.ptp(norm, axis=0)
+    silent = np.mean(raw <= limits.silence_hz, axis=0)
+    return {
+        "baseline_hz": {
+            "min": float(np.median(raw, axis=0).min()),
+            "median": float(np.median(np.median(raw, axis=0))),
+            "max": float(np.median(raw, axis=0).max()),
+        },
+        "raw_pool_hz": {
+            "min": float(raw.min()),
+            "median": float(np.median(raw)),
+            "max": float(raw.max()),
+        },
+        "dynamic_range_hz": {
+            "min": float(np.ptp(raw, axis=0).min()),
+            "median": float(np.median(np.ptp(raw, axis=0))),
+            "max": float(np.ptp(raw, axis=0).max()),
+        },
+        "variance_hz2": {
+            "min": float(raw.var(axis=0).min()),
+            "median": float(np.median(raw.var(axis=0))),
+            "max": float(raw.var(axis=0).max()),
+        },
+        "normalized_option_range": {
+            "min": float(ranges.min()),
+            "median": float(np.median(ranges)),
+            "max": float(ranges.max()),
+        },
+        "pool_silent_fraction": {
+            "min": float(silent.min()),
+            "median": float(np.median(silent)),
+            "max": float(silent.max()),
+        },
+        "pool_high_rate_fraction": {
+            "max": float(np.mean(raw >= limits.high_rate_hz, axis=0).max()),
+        },
+        "competing_pool_correlation": {
+            "mean_absolute": float(np.abs(off_diagonal).mean()) if off_diagonal.size else 0.0,
+            "max_absolute": float(np.abs(off_diagonal).max()) if off_diagonal.size else 0.0,
+        },
+        "effective_distinct_signals": effective,
+        "effective_signal_fraction": effective / max(raw.shape[1], 1),
     }
 
 

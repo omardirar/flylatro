@@ -73,11 +73,39 @@ diverse states and its actions are discarded.
   --heavy
 ```
 
-Inspect `phases_observed` and `phases_missing` in the printed coverage. Deeper
-phases (`SHOP`, `PACK`, `ROUND_EVAL`) need longer navigation: raise
-`--maximum-decisions-per-seed` and `--sample-every` until they appear, and
-record which phases the corpus does and does not reach. The corpus SHA-256 is
-part of experimental provenance and is recorded in every downstream report.
+Inspect `phases_observed`, `phases_missing` and `motor_context_coverage` in the
+printed coverage. Deeper phases (`SHOP`, `PACK`, `ROUND_EVAL`) need longer
+navigation: raise `--maximum-decisions-per-seed` and `--sample-every` until they
+appear, and record which phases the corpus does and does not reach. The corpus
+SHA-256 is part of experimental provenance and is recorded in every downstream
+report.
+
+Coverage is formally gated, not merely reported. `flylatro-preflight` evaluates
+the corpus against the versioned `calibration-corpus-coverage-policy-v1`
+requirements — minimum states, minimum unique states, minimum distinct source
+runs, minimum states and unique states per required phase, and for each motor
+interpretation context (`action_type`, `card_count`, `card_slot`, `shop_target`,
+`pack_target`, `joker_target`, `consumable_target`) a minimum number of relevant
+states, states with competing legal options, and active legal options. In the
+`initial` profile a shortfall is a WARN; in `ante1` it is a FAIL, and
+deficiencies are reported exactly, for example
+`SHOP: 0 states, required >= 4`. Override the defaults deliberately by writing a
+JSON policy and setting `[calibration].coverage_policy_path`; do not weaken it
+to make a gate pass.
+
+Preflight also binds the corpus to *this* environment. A real experiment
+(`fly.backend = flywire`, `environment.backend = balatro_sim`) requires the
+corpus manifest to record `environment_backend = "BalatroSimAdapter"` and
+`simulator_version = "balatroagent-38ae21431700"`. A mock-generated corpus is
+refused even when the configuration points at its SHA-256. The corpus arrays
+themselves are re-hashed on load, so an edited manifest cannot authorize a run,
+and `--store-snapshots` snapshots are hashed into the corpus identity
+(`snapshot_identity_policy = "snapshots-hashed-into-corpus-identity-v1"`).
+
+Each state additionally records the root reset-stream seed, the environment's
+actual current `run_seed()`, the episode index inside that stream, the decision
+index and a monotonic collection index, so auto-reset cannot make two states
+from different runs look like one.
 
 ## 4. Create the field-aware sensory mapping
 
@@ -174,6 +202,8 @@ topology. Permanently reserved action slots receive no neural population at all.
   --maximum-within-group-correlation 0.95 \
   --minimum-effective-signal-fraction 0.50 \
   --minimum-normalized-option-range 0.25 \
+  --minimum-context-states 4 \
+  --minimum-competing-context-states 2 \
   --output artefacts/motor-map-v783.json \
   --report artefacts/motor-map-v783-report.json \
   --heavy
@@ -186,6 +216,24 @@ high-rate fractions, pairwise correlation between competing pools, and the
 effective number of distinct signals per competition group. A group that cannot
 obtain enough usable neural diversity fails loudly rather than quietly assigning
 near-identical populations to competing alternatives.
+
+Selection and quality are **context-aware**
+(`reward-free-neural-motor-calibration-v3`). Each routing group is ranked and
+decorrelated in the corpus states where its pools are actually read, using the
+corpus's own legality masks: `selection_evidence_by_group` records how many
+states that was. `quality.by_context` then reports, separately for every motor
+interpretation context, the relevant state count, the number of states with
+competing legal options, the active option count, the raw pool dynamic range,
+the normalized dynamic range, pairwise correlation, the effective number of
+distinct signals and contract-option coverage. A context with fewer than
+`--minimum-context-states` relevant states or fewer than
+`--minimum-competing-context-states` competing states is reported as
+`insufficient_evidence` and fails the `context_evidence_sufficient` gate; it is
+never averaged into a passing number. Because the four contextual slot heads
+share one pool group by design, this is the evidence that the shared pools carry
+usable activity in each context in which they are interpreted. Setting either
+threshold to `0` is an explicit opt-out and is only appropriate for a
+development double.
 
 Set `[fly].motor_mapping_path = "artefacts/motor-map-v783.json"`. The same
 artifact is mandatory for real, no-plasticity, both topology controls, shuffled
@@ -215,6 +263,8 @@ Only this report may satisfy motor-related preflight gates.
   --minimum-normalized-option-range 0.25 \
   --minimum-action-coverage-fraction 0.50 \
   --maximum-competing-pool-correlation 0.99 \
+  --minimum-context-states 4 \
+  --minimum-competing-context-states 2 \
   --output artefacts/representation-post-50ms.json \
   --heavy
 ```
@@ -222,6 +272,18 @@ Only this report may satisfy motor-related preflight gates.
 It reports normalized motor-pool activity, per-head option dynamic ranges,
 action-option coverage, pairwise competition behaviour and motor score
 distributions for the exact persisted mapping.
+
+`motor_interface.by_group` and `by_head` remain descriptive whole-corpus
+numbers. The readiness figures come from `motor_interface.by_context`, which
+evaluates each head only in the states where it is read and only over the
+options legal there: eligible states, states with more than one competing legal
+option, normalized option dynamic range, options above the minimum range,
+distinct argmax options, argmax coverage, pairwise score correlation and the
+effective signal count. The gates `motor_context_evidence_sufficient`,
+`motor_option_dynamic_range`, `action_option_coverage` and
+`competing_pools_distinguishable` are all computed from those contexts, so a
+pool that swings widely in irrelevant states and is constant inside its own
+context cannot produce a PASS.
 
 ## 11. Calibrate eligibility and plasticity stability
 
@@ -263,7 +325,15 @@ message if a report belongs to another configuration.
 
 Proceed only with no FAIL. At this profile the benchmark, matched-control,
 tiny-run, protocol and specificity gates are WARN because those measurements
-happen later in this sequence.
+happen later in this sequence, a calibration-corpus coverage shortfall is a
+WARN, and a *failed* KC-reachability measurement is a WARN because the duration
+and the sensory route are still being chosen. The strict `ante1` profile in
+step 21 turns all of those into FAIL.
+
+Every gate also checks that the supplied artifact is the kind and version of
+report it asked for: a `sensory_health` report supplied as `motor_calibration`,
+a `representation_pre` report supplied as `representation_post`, or a report
+from an older incompatible version is a FAIL, not a silent pass.
 
 ## 13. Run a tiny real plastic experiment
 
@@ -334,6 +404,10 @@ It is not a licence to bias plasticity toward the chosen output in V1.
   --output artefacts/control-validation-tiny.json
 ```
 
+`--manifest` order is irrelevant: the reference is located by
+`condition = plastic_real`. Exactly one manifest must declare it; none or
+several is a clear failure rather than a silently wrong comparison.
+
 The report states each arm's matching rule explicitly:
 
 - `no_plasticity` and `shuffled_reward` are **exact action/state matched**: the
@@ -401,6 +475,7 @@ the `--budget-basis`.
   --exposure-budget-decisions REPLACE_WITH_MEASURED_ANTE1_BUDGET \
   --curriculum-ladder 1 \
   --reinforcement-condition primary-progress \
+  --sensory-mapping-seed 0 \
   --motor-mapping-id REPLACE_WITH_MOTOR_STRUCTURE_SHA256 \
   --output artefacts/ante1-protocol.json
 ```
@@ -412,9 +487,29 @@ additionally covers the exploration settings, which legitimately differ per
 replicate. Matched conditions must share the structure hash, and a run whose
 loaded motor artifact does not match its protocol arm refuses to start.
 
+`--replicates` is the number of **ordinary stochastic learning replicates**
+inside one sensory-mapping block. They vary only the environment/training seed
+stream, the fly Poisson seed and the motor exploration seed; they all reuse the
+one fixed sensory mapping (`--sensory-mapping-seed`, default `0`) and the one
+calibrated motor mapping. Arm IDs are therefore
+`mapping-000-replicate-000:plastic_real` and so on.
+
+A sensory-mapping change is a separate experimental factor, never replicate
+noise. Add an explicit mapping-sensitivity block with
+
+```bash
+  --mapping-sensitivity 7:MOTOR_STRUCTURE_SHA256_CALIBRATED_THROUGH_SEED_7
+```
+
+repeated once per additional mapping. Each block needs its **own** motor mapping
+SHA-256, because motor calibration, sensory health and both representation
+stages are all measured through the sensory mapping and must be regenerated when
+it changes; the protocol refuses two mapping blocks that share a motor mapping.
+
 Do not proceed while any `REPLACE_WITH_...` remains. Every seed the protocol
 stores controls a named stochastic mechanism; the manifest carries that audit
-table in `seed_effects`.
+table in `seed_effects`, which quantities vary per replicate in `seed_audit`,
+and the block-level factors in `block_level_factors`.
 
 ## 20. Materialize the protocol arms
 
@@ -433,6 +528,11 @@ This writes one complete, already-validated configuration per arm plus
 JSON seed has to be translated into a CLI flag by hand, and every generated run
 re-validates its configuration against the protocol arm before it starts.
 
+Each `shuffled_reward` arm additionally carries `prerequisite_commands`: the
+exact `flylatro-shuffle-reward` invocation, already carrying that arm's own
+`reward_seed` and its source arm IDs. Run it verbatim; the arm refuses a
+schedule shuffled with a different seed or derived from another reference run.
+
 ## 21. Run the strict Ante-1 preflight
 
 ```bash
@@ -450,33 +550,60 @@ re-validates its configuration against the protocol arm before it starts.
 All scientific/readiness gates must PASS before Ante-1. A visualization-only
 WARN is acceptable if final media is not being produced on this machine.
 
+This profile is strict where `initial` was permissive:
+
+- a **failed** KC/plastic-edge reachability report is a FAIL, not a WARN — the
+  configured ALPN route and neural duration must actually satisfy the
+  predeclared reachability gates. Do not lower the reachability thresholds;
+  either restrict the primary plastic population or add another anatomically
+  legitimate sensory route as a separate versioned model change;
+- calibration-corpus coverage must satisfy the coverage policy for every
+  required phase and every motor interpretation context;
+- the corpus must have been generated by the real Balatro adapter at the pinned
+  simulator revision;
+- every report must be the requested kind at a compatible version;
+- benchmark, matched-control, tiny-run, protocol and specificity evidence must
+  all be present and provenance-matched.
+
 ## 22. Run the paired Ante-1 experiments
 
 Execute `protocol-plan.json` in dependency order: every `plastic_real` arm
-first, then its matched controls. `shuffled_reward` additionally needs
+first, then its matched controls. `shuffled_reward` additionally needs its
+schedule, which the plan emits verbatim as that arm's `prerequisite_commands`:
 
 ```bash
 .venv/bin/flylatro-shuffle-reward \
-  --events runs/ante1/ante1-v1/replicate-000-plastic_real/synthetic-reinforcement-events.jsonl \
-  --seed REPLACE_WITH_REPLICATE_REWARD_SEED \
-  --output runs/ante1/ante1-v1/replicate-000-plastic_real/shuffled-reinforcement.jsonl
+  --events runs/ante1/ante1-v1/mapping-000-replicate-000-plastic_real/synthetic-reinforcement-events.jsonl \
+  --source-checkpoint runs/ante1/ante1-v1/mapping-000-replicate-000-plastic_real/plastic-checkpoint-final.pkl \
+  --source-run-manifest runs/ante1/ante1-v1/mapping-000-replicate-000-plastic_real/run-manifest.json \
+  --source-arm-id mapping-000-replicate-000:plastic_real \
+  --target-arm-id mapping-000-replicate-000:shuffled_reward \
+  --seed REPLACE_WITH_ARM_REWARD_SEED_FROM_protocol-plan.json \
+  --output runs/ante1/ante1-v1/mapping-000-replicate-000-plastic_real/shuffled-reinforcement.jsonl
 ```
 
-before its arm can start. Compare paired replicates; never report only the best
-seed.
+Take `--seed` from the arm's own `reward_seed` in `protocol-plan.json`; do not
+transcribe a seed by hand. The schedule records the source arm, the source
+checkpoint and plastic-weight hashes, the reinforcement event-log SHA-256, the
+executed action-schedule SHA-256 and the shuffle seed, and the
+`shuffled_reward` arm refuses to start if any of them disagrees with its
+protocol arm — including a schedule of exactly the right length taken from a
+different replicate.
+
+Compare paired replicates; never report only the best seed.
 
 ## 23. Analyze behaviour, plasticity specificity and stability
 
 ```bash
 .venv/bin/flylatro-validate-controls \
-  --manifest runs/ante1/ante1-v1/replicate-000-plastic_real/run-manifest.json \
-  --manifest runs/ante1/ante1-v1/replicate-000-no_plasticity/run-manifest.json \
-  --manifest runs/ante1/ante1-v1/replicate-000-kc_mbon_shuffled/run-manifest.json \
+  --manifest runs/ante1/ante1-v1/mapping-000-replicate-000-plastic_real/run-manifest.json \
+  --manifest runs/ante1/ante1-v1/mapping-000-replicate-000-no_plasticity/run-manifest.json \
+  --manifest runs/ante1/ante1-v1/mapping-000-replicate-000-kc_mbon_shuffled/run-manifest.json \
   --output artefacts/control-validation-ante1-000.json
 
 .venv/bin/flylatro-analyze-synapses \
-  --config artefacts/ante1-arms/replicate-000-plastic_real.toml \
-  --checkpoint runs/ante1/ante1-v1/replicate-000-plastic_real/plastic-checkpoint-final.pkl \
+  --config artefacts/ante1-arms/mapping-000-replicate-000-plastic_real.toml \
+  --checkpoint runs/ante1/ante1-v1/mapping-000-replicate-000-plastic_real/plastic-checkpoint-final.pkl \
   --output artefacts/ante1-000-synapses.json \
   --heavy
 ```
@@ -534,4 +661,10 @@ Stop and investigate rather than relaxing a threshold if:
 - the tiny real run produces zero eligible updates, non-finite state, or
   widespread bound saturation;
 - a matched control's action schedule or state hashes diverge;
-- a topology control reports the same plastic topology hash as the real arm.
+- a topology control reports the same plastic topology hash as the real arm;
+- the calibration corpus cannot reach a required observable phase or a required
+  motor interpretation context (extend navigation; do not lower the policy);
+- a shuffled-reward schedule is refused because its seed, source arm, event log
+  or action schedule does not match the protocol arm (regenerate it from the
+  plan's own `prerequisite_commands`);
+- `flylatro-validate-controls` cannot find exactly one `plastic_real` reference.

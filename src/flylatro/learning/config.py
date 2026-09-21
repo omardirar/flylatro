@@ -38,8 +38,11 @@ from flylatro.interface.motor_candidates import canonical_motor_candidates
 from flylatro.interface.sensory import FixedPlasticSensoryEncoder, SensoryMapping
 from flylatro.learning.agent import PlasticFlyAgent
 from flylatro.learning.reinforcement import ReinforcementConfig, ReinforcementMapper
-from flylatro.learning.reward_schedule import ReinforcementSchedule
-from flylatro.learning.reward_schedule import load_action_schedule
+from flylatro.learning.reward_schedule import (
+    ReinforcementSchedule,
+    assert_schedule_matches_arm,
+    load_action_schedule,
+)
 from flylatro.learning.trainer import PlasticTrainer, PlasticTrainingConfig
 from flylatro.seeds import SeedPlan
 
@@ -92,6 +95,11 @@ class TrainingSettings:
     reinforcement_mode: str = "outcome"
     reinforcement_schedule_path: str = ""
     action_schedule_path: str = ""
+    #: Run directory of the exact-action-matched source arm (the paired
+    #: ``plastic_real`` run).  Set by protocol materialization for
+    #: ``no_plasticity`` and ``shuffled_reward`` so a control can verify that
+    #: its dependencies really came from that run.
+    matched_source_run_dir: str = ""
     condition: str = "plastic_real"
     budget_basis: str = "development-default"
 
@@ -110,6 +118,8 @@ class CalibrationSettings:
     """Paths to the frozen evidence this experiment is authorized against."""
 
     corpus_path: str = ""
+    #: Optional JSON `CoveragePolicy`; empty means the versioned defaults.
+    coverage_policy_path: str = ""
     sensory_health_report: str = ""
     representation_pre_report: str = ""
     representation_post_report: str = ""
@@ -372,6 +382,32 @@ def resolve_path(config: PlasticExperimentConfig, value: str) -> Path:
     return path if path.is_absolute() else config.source_path.parent.parent / path
 
 
+#: How a corpus must declare the environment that produced it, per backend.
+#: ``environment_backend`` is the adapter class name recorded by
+#: ``build_calibration_corpus``; ``simulator_version`` is that adapter's own
+#: pinned version string.
+CORPUS_ENVIRONMENT_IDENTITY: dict[str, tuple[str, str]] = {
+    "balatro_sim": (BalatroSimAdapter.__name__, BalatroSimAdapter.simulator_version),
+    "mock": (MockArrayBalatroEnv.__name__, MockArrayBalatroEnv.simulator_version),
+}
+
+
+def expected_corpus_environment(config: PlasticExperimentConfig) -> tuple[str, str]:
+    """The adapter class name and simulator version a valid corpus must declare."""
+
+    return CORPUS_ENVIRONMENT_IDENTITY[config.environment.backend]
+
+
+def coverage_policy(config: PlasticExperimentConfig) -> Any:
+    """The versioned corpus-coverage policy this experiment is gated against."""
+
+    from flylatro.analysis.coverage import CoveragePolicy
+
+    if not config.calibration.coverage_policy_path:
+        return CoveragePolicy()
+    return CoveragePolicy.load(resolve_path(config, config.calibration.coverage_policy_path))
+
+
 def calibration_corpus_hash(config: PlasticExperimentConfig) -> str | None:
     """SHA-256 of the configured frozen calibration corpus, if any."""
 
@@ -400,9 +436,12 @@ def _development_motor_mapping(
     persisted `flylatro-calibrate-motor` artifact instead.
     """
 
+    from flylatro.interface.motor_contexts import motor_context_windows
+
     rows = []
+    mask_rows: list[dict[str, Any]] = []
     for sample in range(8):
-        observations, _ = env.reset(
+        observations, masks = env.reset(
             tuple(70_000_000 + sample * learners + row for row in range(learners))
         )
         activity = processor.process(
@@ -413,6 +452,12 @@ def _development_motor_mapping(
             efficacy=np.ones((learners, topology.edge_count), dtype=np.float32),
         )
         rows.append(activity.output_activity)
+        mask_rows.append({key: np.array(value, copy=True) for key, value in masks.items()})
+    stacked_masks = {
+        key: np.concatenate([block[key] for block in mask_rows], axis=0)
+        for key in mask_rows[0]
+    }
+    contexts = motor_context_windows(stacked_masks)
     try:
         result = calibrate_reward_free_motor(
             processor.output_root_ids,
@@ -425,12 +470,21 @@ def _development_motor_mapping(
                 minimum_normalized_option_range=0.0,
                 minimum_effective_signal_fraction=0.0,
                 maximum_pool_silent_fraction=1.0,
+                # The development double only ever reaches PLAYING states, so
+                # the shop/pack/joker/consumable contexts have no evidence.
+                # That is declared here, never hidden.
+                minimum_context_states=0,
+                minimum_competing_context_states=0,
             ),
+            contexts=contexts,
             exploration_epsilon=config.motor.exploration_epsilon,
             exploration_temperature=config.motor.exploration_temperature,
             exploration_seed=config.motor.exploration_seed,
             calibration_metadata={
                 "development_only_relaxed_thresholds": True,
+                "motor_context_coverage": {
+                    name: window.counts() for name, window in contexts.items()
+                },
                 "state_sampling": "synthetic development bootstrap resets",
                 "reward_or_outcome_observed": False,
             },
@@ -656,20 +710,38 @@ def build_plastic_stack(
     agent = PlasticFlyAgent(processor, plasticity, motor, reinforcement)
     dopamine_schedule = None
     schedule_hash = None
+    schedule_binding: dict[str, Any] | None = None
     action_schedule = None
     action_schedule_hash = None
-    if config.training.reinforcement_mode == "shuffled_schedule":
-        schedule_path = Path(config.training.reinforcement_schedule_path)
-        if not schedule_path.is_absolute():
-            schedule_path = config.source_path.parent.parent / schedule_path
-        schedule = ReinforcementSchedule.load(schedule_path)
-        dopamine_schedule = schedule.pulses
-        schedule_hash = schedule.sha256
     if config.training.action_schedule_path:
         action_path = Path(config.training.action_schedule_path)
         if not action_path.is_absolute():
             action_path = config.source_path.parent.parent / action_path
         action_schedule, action_schedule_hash = load_action_schedule(action_path)
+    if config.training.reinforcement_mode == "shuffled_schedule":
+        schedule_path = Path(config.training.reinforcement_schedule_path)
+        if not schedule_path.is_absolute():
+            schedule_path = config.source_path.parent.parent / schedule_path
+        schedule = ReinforcementSchedule.load(schedule_path)
+        # The protocol owns the shuffle seed and the source run. A schedule
+        # generated with another seed, or derived from another reference run,
+        # is refused *before* any training happens.
+        schedule_binding = assert_schedule_matches_arm(
+            schedule,
+            expected_seed=(
+                None if protocol_arm is None else int(protocol_arm["reward_seed"])
+            ),
+            expected_source_arm_id=(
+                None if protocol_arm is None else str(protocol_arm["reference_arm_id"])
+            ),
+            expected_target_arm_id=(
+                None if protocol_arm is None else str(protocol_arm["arm_id"])
+            ),
+            action_schedule_sha256=action_schedule_hash,
+            source_manifest=_matched_source_manifest(config),
+        )
+        dopamine_schedule = schedule.pulses
+        schedule_hash = schedule.sha256
     trainer = PlasticTrainer(
         env,
         agent,
@@ -759,6 +831,8 @@ def build_plastic_stack(
         },
         "reinforcement_mode": config.training.reinforcement_mode,
         "synthetic_reinforcement_schedule_sha256": schedule_hash,
+        "synthetic_reinforcement_schedule_binding": schedule_binding,
+        "matched_source_run_dir": config.training.matched_source_run_dir or None,
         "action_schedule_sha256": action_schedule_hash,
         "state_hash_schedule_sha256": action_schedule_hash,
         "training_seeds": list(trainer.training_seeds),
@@ -772,6 +846,19 @@ def build_plastic_stack(
         ),
     }
     return PlasticTrainingStack(env, agent, trainer, components)
+
+
+def _matched_source_manifest(
+    config: PlasticExperimentConfig,
+) -> Mapping[str, Any] | None:
+    """The paired reference run's manifest, when the arm declares its source."""
+
+    if not config.training.matched_source_run_dir:
+        return None
+    path = resolve_path(config, config.training.matched_source_run_dir) / "run-manifest.json"
+    if not path.exists():
+        return None
+    return json.loads(path.read_text(encoding="utf-8"))
 
 
 def validate_protocol_binding(config: PlasticExperimentConfig) -> dict[str, Any] | None:

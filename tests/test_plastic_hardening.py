@@ -319,7 +319,11 @@ def test_replicate_protocol_expands_paired_condition_arms() -> None:
         motor_mapping_id="motor-hash",
     )
     assert len(protocol.arms) == 6
-    first = [arm for arm in protocol.arms if arm.replicate_id == "replicate-000"]
+    first = [
+        arm
+        for arm in protocol.arms
+        if arm.replicate_id == "mapping-000-replicate-000"
+    ]
     assert {arm.condition for arm in first} == {
         "plastic_real", "no_plasticity", "kc_mbon_shuffled"
     }

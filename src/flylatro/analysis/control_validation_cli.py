@@ -9,7 +9,11 @@ from pathlib import Path
 from typing import Sequence
 
 from flylatro.analysis.provenance import EvidenceIdentity, git_identity
-from flylatro.learning.protocol import CONTROL_VALIDATION_VERSION, validate_control_group
+from flylatro.learning.protocol import (
+    CONTROL_VALIDATION_VERSION,
+    find_reference,
+    validate_control_group,
+)
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -19,17 +23,29 @@ def main(argv: Sequence[str] | None = None) -> int:
         type=Path,
         action="append",
         required=True,
-        help="run-manifest.json of one arm; the first is the reference arm",
+        help=(
+            "run-manifest.json of one arm; order is irrelevant. Exactly one "
+            "manifest must declare condition=plastic_real: that is the reference"
+        ),
     )
     parser.add_argument("--output", type=Path, required=True)
     args = parser.parse_args(argv)
     manifests = [
         json.loads(path.read_text(encoding="utf-8")) for path in args.manifest
     ]
-    report = validate_control_group(manifests)
+    try:
+        report = validate_control_group(manifests)
+    except ValueError as error:
+        print(json.dumps({"status": "FAIL", "error": str(error)}, sort_keys=True))
+        return 2
     report["manifest_paths"] = [str(path) for path in args.manifest]
     git = git_identity()
-    reference = manifests[0].get("components", manifests[0])
+    # The evidence identity describes the reference arm, located by condition
+    # rather than by the order the --manifest flags happened to be typed in.
+    reference_index, _ = find_reference(manifests)
+    reference = manifests[reference_index].get(
+        "components", manifests[reference_index]
+    )
     report["evidence_identity"] = EvidenceIdentity(
         report_kind="control_validation",
         report_version=CONTROL_VALIDATION_VERSION,

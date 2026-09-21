@@ -744,6 +744,11 @@ class FixedMotorInterface:
         )
         scores = self.head_scores(values)
         actions = empty_action_batch(batch)
+        # `empty_action_batch` pads every field with -1, but the pinned
+        # simulator's strict referee requires `n_cards == 0` (not -1) for every
+        # action type that does not consume cards, and rejects the step
+        # otherwise.  Card-consuming branches overwrite this below.
+        actions["n_cards"][:] = 0
         choices: list[dict[str, int]] = []
         for row in range(batch):
             rng = np.random.default_rng(

@@ -23,11 +23,21 @@ from typing import Any, Callable, Mapping, Sequence
 
 import numpy as np
 
+from flylatro.analysis.corpus import (
+    CalibrationCorpus,
+    SUPPORTED_CALIBRATION_CORPUS_VERSIONS,
+)
+from flylatro.analysis.coverage import CoveragePolicy, evaluate_coverage
 from flylatro.analysis.provenance import (
     EvidenceIdentity,
     describe_mismatches,
     git_identity,
 )
+from flylatro.analysis.reachability import REACHABILITY_REPORT_VERSION
+from flylatro.analysis.representation import REPRESENTATION_REPORT_VERSION
+from flylatro.analysis.sensory_health import SENSORY_HEALTH_VERSION
+from flylatro.analysis.specificity import SPECIFICITY_REPORT_VERSION
+from flylatro.interface.motor_calibration import MOTOR_CALIBRATION_VERSION
 from flylatro.fly.flywire_artifact import FlyWireArtifact
 from flylatro.fly.mushroom_body.state import PlasticEdgeState
 from flylatro.fly.mushroom_body.topology import PlasticEdgeTopology, weak_edge_diagnostics
@@ -43,6 +53,8 @@ from flylatro.learning.config import (
     SYNTHETIC_SENSORY_IDENTITY,
     PlasticExperimentConfig,
     calibration_corpus_hash,
+    coverage_policy,
+    expected_corpus_environment,
     fly_dynamics_payload,
     payload_sha256,
     resolve_path,
@@ -51,7 +63,54 @@ from flylatro.learning.config import (
 from flylatro.learning.protocol import ExperimentProtocol, validate_control_group
 
 
-PREFLIGHT_VERSION = "flylatro-preflight-v2"
+PREFLIGHT_VERSION = "flylatro-preflight-v3"
+
+@dataclass(frozen=True, slots=True)
+class ReportKindPolicy:
+    """What *kind* of artifact a gate will accept, and which versions.
+
+    Verifying component hashes proves the evidence was measured under this
+    configuration.  It does not prove the supplied file is the report the gate
+    asked for: a sensory-health report and a motor-calibration report can carry
+    identical component hashes.  Each gate therefore also pins the report kind
+    and an explicit list of compatible report versions — compatibility is
+    declared, never inferred from an arbitrary version string.
+    """
+
+    kind: str
+    compatible_versions: tuple[str, ...]
+
+
+#: The only report kinds and versions the current gates accept.  A version is
+#: listed here only when this build has been checked against that report's
+#: exact field layout; anything else must be regenerated.
+REPORT_KIND_POLICY: dict[str, ReportKindPolicy] = {
+    "sensory_health": ReportKindPolicy(
+        "sensory_health", (SENSORY_HEALTH_VERSION,)
+    ),
+    "representation_pre": ReportKindPolicy(
+        "representation_pre", (REPRESENTATION_REPORT_VERSION,)
+    ),
+    "representation_post": ReportKindPolicy(
+        "representation_post", (REPRESENTATION_REPORT_VERSION,)
+    ),
+    "motor_calibration": ReportKindPolicy(
+        "motor_calibration", (MOTOR_CALIBRATION_VERSION,)
+    ),
+    "kc_reachability": ReportKindPolicy(
+        "kc_reachability", (REACHABILITY_REPORT_VERSION,)
+    ),
+    "plasticity_calibration": ReportKindPolicy(
+        "plasticity_calibration", ("plasticity-calibration-v2",)
+    ),
+    "chosen_action_specificity": ReportKindPolicy(
+        "chosen_action_specificity", (SPECIFICITY_REPORT_VERSION,)
+    ),
+    "benchmark": ReportKindPolicy(
+        "benchmark", ("plastic-end-to-end-benchmark-v2",)
+    ),
+}
+
 
 #: Identity fields each report kind must bind to the current experiment.
 REPORT_IDENTITY_FIELDS: dict[str, tuple[str, ...]] = {
@@ -139,6 +198,17 @@ class PreflightProfile:
     require_control_manifests: bool = False
     require_tiny_real_run: bool = False
     require_protocol: bool = False
+    #: ``initial`` still allows a failed real KC-reachability measurement to be
+    #: a WARN: at that stage the duration and the sensory route are still being
+    #: calibrated and the measurement exists precisely to inform that choice.
+    #: A strict Ante-1 preflight must not pass when the predeclared reachability
+    #: gates fail for the configured ALPN route and neural duration.
+    reachability_failure_is_warning: bool = True
+    #: Whether missing/weak calibration-corpus coverage blocks the profile.
+    require_corpus_coverage: bool = False
+    #: Whether the corpus must have been produced by this experiment's real
+    #: environment backend and pinned simulator revision.
+    require_corpus_environment_match: bool = True
 
 
 PREFLIGHT_PROFILES: dict[str, PreflightProfile] = {
@@ -150,6 +220,8 @@ PREFLIGHT_PROFILES: dict[str, PreflightProfile] = {
         require_control_manifests=True,
         require_tiny_real_run=True,
         require_protocol=True,
+        reachability_failure_is_warning=False,
+        require_corpus_coverage=True,
     ),
 }
 
@@ -257,7 +329,9 @@ def run_preflight(
         reachability_report,
         "kc_reachability",
         required=selected.require_reachability,
-        treat_fail_as="WARN",
+        # Strict Ante-1 must not pass on a failed reachability measurement; the
+        # thresholds themselves are never loosened to make it pass.
+        treat_fail_as="WARN" if selected.reachability_failure_is_warning else "FAIL",
     )
 
     # ---- fixed motor interface -------------------------------------------
@@ -527,6 +601,36 @@ def _identity_verifier(
                 "matched to this experiment; regenerate it",
             )
             return
+        # A matching component hash does not prove the file is the report this
+        # gate asked for: verify the declared kind and version first.
+        policy = REPORT_KIND_POLICY[kind]
+        if identity.report_kind != policy.kind:
+            gate(
+                name,
+                "FAIL",
+                f"{name} expects a {policy.kind!r} report but the supplied "
+                f"artifact declares report_kind={identity.report_kind!r}",
+                {
+                    "expected_report_kind": policy.kind,
+                    "report_kind": identity.report_kind,
+                    "report_version": identity.report_version,
+                },
+            )
+            return
+        if identity.report_version not in policy.compatible_versions:
+            gate(
+                name,
+                "FAIL",
+                f"{name} report version {identity.report_version!r} is not "
+                f"compatible with this build; regenerate it "
+                f"(accepted: {list(policy.compatible_versions)})",
+                {
+                    "expected_report_kind": policy.kind,
+                    "report_version": identity.report_version,
+                    "compatible_versions": list(policy.compatible_versions),
+                },
+            )
+            return
         fields = REPORT_IDENTITY_FIELDS[kind]
         mismatches = identity.mismatches(expected, required_fields=fields)
         if mismatches:
@@ -643,42 +747,185 @@ def _corpus_gate(
     profile: PreflightProfile,
     expected: EvidenceIdentity,
 ) -> None:
+    """Identity, provenance and coverage of the frozen calibration corpus.
+
+    Three different questions are gated separately:
+
+    1. does a reward-free corpus exist and does the configuration bind to it;
+    2. was it produced by *this* experiment's environment — the real Balatro
+       adapter at the pinned simulator revision for a real run, never a
+       mock-generated corpus that merely happens to be the configured file;
+    3. does it cover the observable phases and motor contexts that later
+       reward-free calibration is about to be measured in.
+    """
+
     if not config.calibration.corpus_path:
         gate(
             "calibration_corpus_identity",
             "FAIL" if profile.require_calibration_corpus else "WARN",
             "no frozen reward-free calibration corpus is configured",
         )
+        gate(
+            "calibration_corpus_provenance",
+            "FAIL" if profile.require_calibration_corpus else "WARN",
+            "no calibration corpus to verify against this environment",
+        )
+        gate(
+            "calibration_corpus_coverage",
+            "FAIL" if profile.require_corpus_coverage else "WARN",
+            "no calibration corpus to measure coverage on",
+        )
         return
     path = resolve_path(config, config.calibration.corpus_path)
     manifest_path = path.with_suffix(path.suffix + ".manifest.json")
     if not manifest_path.exists():
-        gate(
+        for name in (
             "calibration_corpus_identity",
-            "FAIL",
-            f"configured calibration corpus manifest is missing: {manifest_path}",
-        )
+            "calibration_corpus_provenance",
+            "calibration_corpus_coverage",
+        ):
+            gate(
+                name,
+                "FAIL",
+                f"configured calibration corpus manifest is missing: {manifest_path}",
+            )
         return
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-    coverage = manifest.get("coverage", {})
+    # The manifest alone is not trusted: the corpus arrays themselves are
+    # loaded and re-hashed, so an edited manifest cannot authorize a run.
+    corpus: CalibrationCorpus | None = None
+    load_error: str | None = None
+    try:
+        corpus = CalibrationCorpus.load(path)
+    except Exception as error:  # exact external readiness failure
+        load_error = str(error)
+    coverage = (
+        corpus.coverage() if corpus is not None else manifest.get("coverage", {})
+    )
     reward_free = manifest.get("contains_reward_or_strategy_labels") is False
+    version_ok = str(manifest.get("version")) in SUPPORTED_CALIBRATION_CORPUS_VERSIONS
+    hash_ok = (
+        expected.calibration_corpus_sha256 is None
+        or manifest.get("sha256") == expected.calibration_corpus_sha256
+    )
+    identity_checks = {
+        "corpus_loads_and_rehashes": load_error is None,
+        "declares_reward_free": reward_free,
+        "supported_corpus_version": version_ok,
+        "matches_configured_sha256": hash_ok,
+    }
     gate(
         "calibration_corpus_identity",
-        "PASS" if reward_free else "FAIL",
-        "frozen reward-free calibration corpus is versioned and hashed"
-        if reward_free
-        else "calibration corpus does not declare itself reward-free",
+        "PASS" if all(identity_checks.values()) else "FAIL",
+        "frozen reward-free calibration corpus is versioned, hashed and loads"
+        if all(identity_checks.values())
+        else f"calibration corpus identity failed: {load_error or identity_checks}",
         {
             "sha256": manifest.get("sha256"),
             "expected_sha256": expected.calibration_corpus_sha256,
             "version": manifest.get("version"),
-            "simulator_version": manifest.get("simulator_version"),
+            "supported_versions": list(SUPPORTED_CALIBRATION_CORPUS_VERSIONS),
             "states": manifest.get("state_count"),
             "generation_method": manifest.get("generation_method"),
-            "phases_observed": coverage.get("phases_observed"),
-            "phases_missing": coverage.get("phases_missing"),
+            "snapshot_identity_policy": manifest.get("snapshot_identity_policy"),
+            "stores_environment_snapshots": manifest.get(
+                "stores_environment_snapshots"
+            ),
+            "records_run_provenance": manifest.get("records_run_provenance"),
+            "checks": identity_checks,
+            "load_error": load_error,
         },
     )
+    _corpus_provenance_gate(config, gate, profile, manifest, corpus)
+    _corpus_coverage_gate(config, gate, profile, coverage)
+
+
+def _corpus_provenance_gate(
+    config: PlasticExperimentConfig,
+    gate: Callable[..., None],
+    profile: PreflightProfile,
+    manifest: Mapping[str, Any],
+    corpus: CalibrationCorpus | None,
+) -> None:
+    """Bind the corpus to the environment that is actually configured.
+
+    A mock-generated corpus must never authorize a real experiment merely
+    because the configuration points at its SHA-256.
+    """
+
+    backend, simulator = expected_corpus_environment(config)
+    declared_backend = str(
+        (corpus.environment_backend if corpus is not None else manifest.get("environment_backend"))
+        or ""
+    )
+    declared_simulator = str(
+        (corpus.simulator_version if corpus is not None else manifest.get("simulator_version"))
+        or ""
+    )
+    checks = {
+        "environment_backend_matches": declared_backend == backend,
+        "simulator_version_matches": declared_simulator == simulator,
+    }
+    real_experiment = config.environment.backend == "balatro_sim"
+    status = "PASS" if all(checks.values()) else "FAIL"
+    if status == "FAIL" and not profile.require_corpus_environment_match:
+        status = "WARN"
+    gate(
+        "calibration_corpus_provenance",
+        status,
+        (
+            "calibration corpus was generated by this experiment's environment "
+            f"({backend} @ {simulator})"
+            if status == "PASS"
+            else (
+                "calibration corpus was generated by "
+                f"{declared_backend or 'an unknown adapter'} @ "
+                f"{declared_simulator or 'an unknown simulator'}, but this "
+                f"configuration requires {backend} @ {simulator}"
+            )
+        ),
+        {
+            "required_environment_backend": backend,
+            "required_simulator_version": simulator,
+            "corpus_environment_backend": declared_backend,
+            "corpus_simulator_version": declared_simulator,
+            "real_experiment_configuration": real_experiment,
+            "checks": checks,
+        },
+    )
+
+
+def _corpus_coverage_gate(
+    config: PlasticExperimentConfig,
+    gate: Callable[..., None],
+    profile: PreflightProfile,
+    coverage: Mapping[str, Any],
+) -> None:
+    """Require the corpus to actually reach the states calibration needs."""
+
+    try:
+        policy = coverage_policy(config)
+    except Exception as error:
+        gate(
+            "calibration_corpus_coverage",
+            "FAIL",
+            f"configured coverage policy is invalid: {error}",
+        )
+        return
+    result = evaluate_coverage(coverage, policy)
+    if result["satisfied"]:
+        status = "PASS"
+        reason = (
+            f"calibration corpus satisfies coverage policy {policy.version} "
+            "for every required phase and motor context"
+        )
+    else:
+        status = "FAIL" if profile.require_corpus_coverage else "WARN"
+        reason = (
+            "calibration corpus coverage is insufficient: "
+            + "; ".join(result["deficiency_summary"])
+        )
+    gate("calibration_corpus_coverage", status, reason, result)
 
 
 def _sensory_structure_gate(

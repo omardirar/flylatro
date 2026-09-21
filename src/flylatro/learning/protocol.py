@@ -17,7 +17,7 @@ from typing import Any, Mapping, Sequence
 from flylatro.seeds import derive_seed
 
 
-EXPERIMENT_PROTOCOL_VERSION = "plastic-replicate-protocol-v2"
+EXPERIMENT_PROTOCOL_VERSION = "plastic-replicate-protocol-v3"
 
 CONTROL_CONDITIONS = (
     "plastic_real",
@@ -32,6 +32,13 @@ CONTROL_CONDITIONS = (
 #: `plasticity_seed` was removed in v2: initial efficacy is a fixed constant and
 #: the update rule is deterministic given neural activity and reinforcement, so
 #: no independent plasticity randomness exists to seed.
+#:
+#: `sensory_mapping_seed` stopped being a per-replicate seed in v3.  Redrawing
+#: the fixed Balatro-to-ALPN projection changes the experiment's *interface*,
+#: not its stochastic realization, and it invalidates every downstream
+#: calibration measured through the old projection.  It is now a block-level
+#: experimental factor (`SensoryMappingVariant`), constant across the ordinary
+#: stochastic replicates inside a block.
 SEED_EFFECTS: dict[str, str] = {
     "training_seed_offset": (
         "offset into the reserved training seed range; selects the exact "
@@ -43,7 +50,10 @@ SEED_EFFECTS: dict[str, str] = {
     ),
     "sensory_mapping_seed": (
         "fly.sensory_mapping_seed; draws the fixed Balatro-feature-to-ALPN "
-        "random projection. Changing it is a mapping replicate"
+        "random projection. It is a BLOCK-LEVEL experimental factor, fixed "
+        "across the ordinary stochastic replicates of one mapping block; "
+        "changing it defines a separate sensory-mapping replicate whose motor "
+        "calibration and representation evidence must be regenerated"
     ),
     "fly_seed": (
         "training.base_fly_seed; seeds the per-decision Poisson input streams "
@@ -60,7 +70,32 @@ SEED_EFFECTS: dict[str, str] = {
     ),
     "reward_seed": (
         "seed of the offline deterministic synthetic-reinforcement permutation; "
-        "only active for the shuffled_reward condition"
+        "only active for the shuffled_reward condition. The materialized plan "
+        "generates the schedule with exactly this seed and the run refuses a "
+        "schedule shuffled with another one"
+    ),
+}
+
+#: Seeds that vary between the ordinary stochastic replicates of one mapping
+#: block.  Everything else is a fixed interface or an explicit factor.
+STOCHASTIC_REPLICATE_SEEDS: tuple[str, ...] = (
+    "training_seed_offset",
+    "environment_seed_stream",
+    "fly_seed",
+    "motor_seed",
+)
+
+#: Factors that are deliberately *not* ordinary replicate noise.  Changing one
+#: is a separate experimental block with its own regenerated calibration.
+BLOCK_LEVEL_FACTORS: dict[str, str] = {
+    "sensory_mapping_seed": (
+        "fixed synthetic Balatro-to-ALPN projection; a change invalidates "
+        "sensory health, representation pre/post and motor calibration"
+    ),
+    "motor_mapping_id": (
+        "the calibrated reward-free motor artifact's structure SHA-256; it is "
+        "measured through one sensory mapping and cannot be reused across "
+        "mapping replicates"
     ),
 }
 
@@ -78,10 +113,47 @@ CONDITION_SEED_USAGE: dict[str, tuple[str, ...]] = {
     ),
 }
 
+#: Which of a condition's active seeds actually vary between its ordinary
+#: replicates.  `sensory_mapping_seed` appears in every condition's usage
+#: because every arm configures it, but it is constant inside a mapping block.
+CONDITION_STOCHASTIC_SEEDS: dict[str, tuple[str, ...]] = {
+    condition: tuple(
+        name for name in seeds if name in set(STOCHASTIC_REPLICATE_SEEDS)
+    )
+    for condition, seeds in CONDITION_SEED_USAGE.items()
+}
+
+
+@dataclass(frozen=True, slots=True)
+class SensoryMappingVariant:
+    """One fixed sensory interface plus the motor artifact calibrated for it.
+
+    A protocol conceptually contains ``mapping-000 -> replicates 0..n`` and,
+    for an explicit sensitivity block, ``mapping-001 -> replicates 0..n``.  The
+    ordinary replicate count never introduces a new mapping.
+    """
+
+    mapping_id: str
+    sensory_mapping_seed: int
+    motor_mapping_id: str
+    role: str = "primary"
+
+    def __post_init__(self) -> None:
+        if not self.mapping_id:
+            raise ValueError("a sensory mapping variant needs an identifier")
+        if not self.motor_mapping_id or "REPLACE_WITH" in self.motor_mapping_id:
+            raise ValueError(
+                f"sensory mapping {self.mapping_id!r} requires the measured motor "
+                "mapping SHA-256 calibrated through that exact mapping"
+            )
+        if self.role not in {"primary", "mapping_sensitivity"}:
+            raise ValueError("mapping variant role must be primary or mapping_sensitivity")
+
 
 @dataclass(frozen=True, slots=True)
 class ReplicateSpec:
     replicate_id: str
+    mapping_id: str
     training_seed_offset: int
     environment_seed_stream: str
     sensory_mapping_seed: int
@@ -95,6 +167,7 @@ class ReplicateSpec:
 class ConditionArm:
     arm_id: str
     replicate_id: str
+    mapping_id: str
     condition: str
     training_seed_offset: int
     environment_seed_stream: str
@@ -108,6 +181,13 @@ class ConditionArm:
     curriculum_ladder: tuple[int, ...]
     reinforcement_condition: str
     active_seeds: tuple[str, ...]
+    stochastic_seeds: tuple[str, ...] = ()
+
+    @property
+    def reference_arm_id(self) -> str:
+        """The paired ``plastic_real`` arm this arm is matched against."""
+
+        return f"{self.replicate_id}:{REFERENCE_CONDITION}"
 
 
 @dataclass(frozen=True, slots=True)
@@ -123,6 +203,17 @@ class ExperimentProtocol:
     reinforcement_condition: str
     replicates: tuple[ReplicateSpec, ...]
     arms: tuple[ConditionArm, ...]
+    sensory_mappings: tuple[SensoryMappingVariant, ...] = ()
+
+    @property
+    def mapping_replicate_count(self) -> int:
+        return len(self.sensory_mappings)
+
+    def mapping(self, mapping_id: str) -> SensoryMappingVariant:
+        for variant in self.sensory_mappings:
+            if variant.mapping_id == mapping_id:
+                return variant
+        raise KeyError(f"protocol has no sensory mapping {mapping_id!r}")
 
     @classmethod
     def create(
@@ -135,8 +226,20 @@ class ExperimentProtocol:
         exposure_budget_decisions: int,
         curriculum_ladder: Sequence[int],
         motor_mapping_id: str,
+        sensory_mapping_seed: int = 0,
+        mapping_sensitivity_variants: Sequence[Mapping[str, Any]] = (),
         reinforcement_condition: str = "primary-progress",
     ) -> "ExperimentProtocol":
+        """Build a protocol.
+
+        ``replicate_count`` is the number of ordinary *stochastic* replicates
+        per sensory mapping block.  It never redraws the sensory mapping.  A
+        deliberate sensory-mapping sensitivity block is added by supplying
+        ``mapping_sensitivity_variants`` — each needs its own
+        ``sensory_mapping_seed`` *and* its own motor mapping SHA-256, because
+        motor calibration is measured through the sensory mapping.
+        """
+
         unknown = set(conditions) - set(CONTROL_CONDITIONS)
         if unknown or replicate_count < 1 or exposure_budget_decisions < 1:
             raise ValueError(
@@ -144,25 +247,51 @@ class ExperimentProtocol:
             )
         if not motor_mapping_id or "REPLACE_WITH" in motor_mapping_id:
             raise ValueError("protocol requires the measured motor mapping SHA-256")
-        replicates = tuple(
-            ReplicateSpec(
-                replicate_id=f"replicate-{index:03d}",
-                training_seed_offset=index,
-                environment_seed_stream=f"training-replicate-{index:03d}",
-                sensory_mapping_seed=derive_seed("sensory-mapping", base_seed, index)
-                % (2**31),
-                fly_seed=derive_seed("fly", base_seed, index) % (2**31),
-                motor_seed=derive_seed("motor", base_seed, index) % (2**31),
-                topology_seed=derive_seed("topology", base_seed, index) % (2**31),
-                reward_seed=derive_seed("reward", base_seed, index) % (2**31),
+        mappings = [
+            SensoryMappingVariant(
+                mapping_id="mapping-000",
+                sensory_mapping_seed=int(sensory_mapping_seed),
+                motor_mapping_id=motor_mapping_id,
+                role="primary",
             )
-            for index in range(replicate_count)
-        )
+        ]
+        for position, payload in enumerate(mapping_sensitivity_variants, start=1):
+            mappings.append(
+                SensoryMappingVariant(
+                    mapping_id=str(payload.get("mapping_id", f"mapping-{position:03d}")),
+                    sensory_mapping_seed=int(payload["sensory_mapping_seed"]),
+                    motor_mapping_id=str(payload["motor_mapping_id"]),
+                    role="mapping_sensitivity",
+                )
+            )
+        _validate_mapping_variants(mappings)
         ladder = tuple(int(value) for value in curriculum_ladder)
+        replicates: list[ReplicateSpec] = []
+        for block, variant in enumerate(mappings):
+            for index in range(replicate_count):
+                replicates.append(
+                    ReplicateSpec(
+                        replicate_id=f"{variant.mapping_id}-replicate-{index:03d}",
+                        mapping_id=variant.mapping_id,
+                        training_seed_offset=block * replicate_count + index,
+                        environment_seed_stream=(
+                            f"training-{variant.mapping_id}-replicate-{index:03d}"
+                        ),
+                        # Constant across the ordinary replicates of this block.
+                        sensory_mapping_seed=variant.sensory_mapping_seed,
+                        fly_seed=derive_seed("fly", base_seed, block, index) % (2**31),
+                        motor_seed=derive_seed("motor", base_seed, block, index) % (2**31),
+                        topology_seed=derive_seed("topology", base_seed, block, index)
+                        % (2**31),
+                        reward_seed=derive_seed("reward", base_seed, block, index)
+                        % (2**31),
+                    )
+                )
         arms = tuple(
             ConditionArm(
                 arm_id=f"{replicate.replicate_id}:{condition}",
                 replicate_id=replicate.replicate_id,
+                mapping_id=replicate.mapping_id,
                 condition=condition,
                 training_seed_offset=replicate.training_seed_offset,
                 environment_seed_stream=replicate.environment_seed_stream,
@@ -171,11 +300,16 @@ class ExperimentProtocol:
                 motor_seed=replicate.motor_seed,
                 topology_seed=replicate.topology_seed,
                 reward_seed=replicate.reward_seed,
-                motor_mapping_id=motor_mapping_id,
+                motor_mapping_id=next(
+                    variant.motor_mapping_id
+                    for variant in mappings
+                    if variant.mapping_id == replicate.mapping_id
+                ),
                 exposure_budget_decisions=exposure_budget_decisions,
                 curriculum_ladder=ladder,
                 reinforcement_condition=reinforcement_condition,
                 active_seeds=CONDITION_SEED_USAGE[condition],
+                stochastic_seeds=CONDITION_STOCHASTIC_SEEDS[condition],
             )
             for replicate in replicates
             for condition in conditions
@@ -190,8 +324,9 @@ class ExperimentProtocol:
             curriculum_ladder=ladder,
             motor_mapping_id=motor_mapping_id,
             reinforcement_condition=reinforcement_condition,
-            replicates=replicates,
+            replicates=tuple(replicates),
             arms=arms,
+            sensory_mappings=tuple(mappings),
         )
 
     def arm(self, arm_id: str) -> ConditionArm:
@@ -200,6 +335,47 @@ class ExperimentProtocol:
                 return arm
         raise KeyError(f"protocol has no arm {arm_id!r}")
 
+    def replicate(self, replicate_id: str) -> ReplicateSpec:
+        for replicate in self.replicates:
+            if replicate.replicate_id == replicate_id:
+                return replicate
+        raise KeyError(f"protocol has no replicate {replicate_id!r}")
+
+    def seed_audit(self) -> dict[str, Any]:
+        """Which quantities vary with what. Asserted by tests."""
+
+        varying = {
+            name: len({getattr(item, name) for item in self.replicates})
+            for name in (
+                "training_seed_offset",
+                "sensory_mapping_seed",
+                "fly_seed",
+                "motor_seed",
+                "topology_seed",
+                "reward_seed",
+            )
+        }
+        return {
+            "distinct_values_across_replicates": varying,
+            "stochastic_replicate_seeds": list(STOCHASTIC_REPLICATE_SEEDS),
+            "block_level_factors": dict(BLOCK_LEVEL_FACTORS),
+            "sensory_mapping_seeds_per_block": {
+                variant.mapping_id: variant.sensory_mapping_seed
+                for variant in self.sensory_mappings
+            },
+            "ordinary_replicates_share_one_sensory_mapping": all(
+                len(
+                    {
+                        item.sensory_mapping_seed
+                        for item in self.replicates
+                        if item.mapping_id == variant.mapping_id
+                    }
+                )
+                == 1
+                for variant in self.sensory_mappings
+            ),
+        }
+
     def to_payload(self) -> dict[str, Any]:
         return {
             **asdict(self),
@@ -207,6 +383,11 @@ class ExperimentProtocol:
             "condition_seed_usage": {
                 name: list(values) for name, values in CONDITION_SEED_USAGE.items()
             },
+            "condition_stochastic_seeds": {
+                name: list(values) for name, values in CONDITION_STOCHASTIC_SEEDS.items()
+            },
+            "block_level_factors": dict(BLOCK_LEVEL_FACTORS),
+            "seed_audit": self.seed_audit(),
             "sha256": self.sha256,
         }
 
@@ -232,8 +413,15 @@ class ExperimentProtocol:
 
     @classmethod
     def from_payload(cls, payload: Mapping[str, Any]) -> "ExperimentProtocol":
+        version = str(payload["version"])
+        if version != EXPERIMENT_PROTOCOL_VERSION:
+            raise ValueError(
+                f"unsupported experiment protocol version {version!r}; this build "
+                f"requires {EXPERIMENT_PROTOCOL_VERSION!r}. Regenerate the protocol: "
+                "older protocols redrew the sensory mapping per replicate"
+            )
         return cls(
-            version=str(payload["version"]),
+            version=version,
             name=str(payload["name"]),
             base_seed=int(payload["base_seed"]),
             replicate_count=int(payload["replicate_count"]),
@@ -244,9 +432,19 @@ class ExperimentProtocol:
             reinforcement_condition=str(
                 payload.get("reinforcement_condition", "primary-progress")
             ),
+            sensory_mappings=tuple(
+                SensoryMappingVariant(
+                    mapping_id=str(item["mapping_id"]),
+                    sensory_mapping_seed=int(item["sensory_mapping_seed"]),
+                    motor_mapping_id=str(item["motor_mapping_id"]),
+                    role=str(item.get("role", "primary")),
+                )
+                for item in payload.get("sensory_mappings", ())
+            ),
             replicates=tuple(
                 ReplicateSpec(
                     replicate_id=str(item["replicate_id"]),
+                    mapping_id=str(item["mapping_id"]),
                     training_seed_offset=int(item["training_seed_offset"]),
                     environment_seed_stream=str(item["environment_seed_stream"]),
                     sensory_mapping_seed=int(item["sensory_mapping_seed"]),
@@ -261,6 +459,7 @@ class ExperimentProtocol:
                 ConditionArm(
                     arm_id=str(item["arm_id"]),
                     replicate_id=str(item["replicate_id"]),
+                    mapping_id=str(item["mapping_id"]),
                     condition=str(item["condition"]),
                     training_seed_offset=int(item["training_seed_offset"]),
                     environment_seed_stream=str(item["environment_seed_stream"]),
@@ -278,9 +477,31 @@ class ExperimentProtocol:
                         item.get("reinforcement_condition", "primary-progress")
                     ),
                     active_seeds=tuple(str(value) for value in item["active_seeds"]),
+                    stochastic_seeds=tuple(
+                        str(value) for value in item.get("stochastic_seeds", ())
+                    ),
                 )
                 for item in payload["arms"]
             ),
+        )
+
+
+def _validate_mapping_variants(variants: Sequence[SensoryMappingVariant]) -> None:
+    ids = [variant.mapping_id for variant in variants]
+    if len(set(ids)) != len(ids):
+        raise ValueError("sensory mapping variants need distinct mapping_id values")
+    seeds = [variant.sensory_mapping_seed for variant in variants]
+    if len(set(seeds)) != len(seeds):
+        raise ValueError(
+            "sensory mapping variants need distinct sensory_mapping_seed values; "
+            "an identical mapping is not a mapping replicate"
+        )
+    motors = [variant.motor_mapping_id for variant in variants]
+    if len(set(motors)) != len(motors):
+        raise ValueError(
+            "each sensory mapping replicate needs its own motor mapping SHA-256: "
+            "motor calibration is measured through the sensory mapping and must "
+            "be regenerated when the mapping changes"
         )
 
 
@@ -330,14 +551,18 @@ def assert_configuration_matches_arm(
         "protocol_sha256": protocol.sha256,
         "protocol_name": protocol.name,
         "replicate_id": arm.replicate_id,
+        "mapping_id": arm.mapping_id,
         "arm_id": arm.arm_id,
+        "reference_arm_id": arm.reference_arm_id,
         "condition": arm.condition,
         "motor_mapping_id": arm.motor_mapping_id,
+        "reward_seed": arm.reward_seed,
         "active_seeds": list(arm.active_seeds),
+        "stochastic_seeds": list(arm.stochastic_seeds),
     }
 
 
-CONTROL_VALIDATION_VERSION = "matched-control-validation-v2"
+CONTROL_VALIDATION_VERSION = "matched-control-validation-v3"
 
 #: Matched in every condition: the same exposure, seeds and fixed interfaces.
 COMMON_MATCHED_FIELDS = (
@@ -393,15 +618,63 @@ def _value(manifest: Mapping[str, Any], field: str) -> Any:
     return None
 
 
+#: The one condition a matched comparison group measures everything against.
+REFERENCE_CONDITION = "plastic_real"
+
+
+def find_reference(manifests: Sequence[Mapping[str, Any]]) -> tuple[int, Mapping[str, Any]]:
+    """Locate the single ``plastic_real`` reference, whatever the CLI order.
+
+    Trusting ``manifests[0]`` silently made the report depend on the order the
+    ``--manifest`` flags happened to be typed in: a group listed control-first
+    would have been validated against a control.
+    """
+
+    positions = [
+        index
+        for index, manifest in enumerate(manifests)
+        if _value(manifest, "condition") == REFERENCE_CONDITION
+    ]
+    if not positions:
+        observed = sorted(
+            str(_value(manifest, "condition")) for manifest in manifests
+        )
+        raise ValueError(
+            "matched-control validation needs exactly one plastic_real reference "
+            f"manifest; supplied conditions: {observed}"
+        )
+    if len(positions) > 1:
+        raise ValueError(
+            "matched-control validation needs exactly one plastic_real reference "
+            f"manifest; {len(positions)} were supplied"
+        )
+    return positions[0], manifests[positions[0]]
+
+
 def validate_control_group(manifests: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
-    """Validate a matched-control group and explain each arm's matching rule."""
+    """Validate a matched-control group and explain each arm's matching rule.
+
+    The result is invariant to the order the manifests are supplied in: the
+    reference is located by condition, and the arms are reported in a stable
+    condition/arm order rather than in argument order.
+    """
 
     if len(manifests) < 2:
         raise ValueError("matched-control validation needs at least two manifests")
-    reference = manifests[0]
+    reference_index, reference = find_reference(manifests)
+    order = sorted(
+        range(len(manifests)),
+        key=lambda index: (
+            0 if index == reference_index else 1,
+            str(_value(manifests[index], "condition")),
+            str(_value(manifests[index], "protocol_arm_id") or ""),
+            str(_value(manifests[index], "plastic_topology_sha256") or ""),
+        ),
+    )
+    ordered = [manifests[index] for index in order]
     differences: dict[str, list[Any]] = {}
     for field in COMMON_MATCHED_FIELDS:
-        values = [_value(manifest, field) for manifest in manifests]
+        values = [_value(manifest, field) for manifest in ordered]
         if any(item is None for item in values) or any(
             item != values[0] for item in values[1:]
         ):
@@ -409,12 +682,13 @@ def validate_control_group(manifests: Sequence[Mapping[str, Any]]) -> dict[str, 
     arms: list[dict[str, Any]] = []
     reference_actions = {field: _value(reference, field) for field in ACTION_MATCHED_FIELDS}
     reference_topology = _value(reference, "plastic_topology_sha256")
-    for manifest in manifests:
+    for manifest in ordered:
         condition = _value(manifest, "condition")
         kind = control_class(condition)
         arm: dict[str, Any] = {
             "condition": condition,
             "control_class": kind,
+            "is_reference": manifest is reference,
             "topology_condition": _value(manifest, "topology_condition"),
             "plastic_topology_sha256": _value(manifest, "plastic_topology_sha256"),
             "matched_fields": list(COMMON_MATCHED_FIELDS),
@@ -453,6 +727,7 @@ def validate_control_group(manifests: Sequence[Mapping[str, Any]]) -> dict[str, 
                 )
         arms.append(arm)
     checks = {
+        "single_plastic_real_reference": True,
         "common_fields_match": not any(
             field in differences for field in COMMON_MATCHED_FIELDS
         ),
@@ -469,6 +744,10 @@ def validate_control_group(manifests: Sequence[Mapping[str, Any]]) -> dict[str, 
         "version": CONTROL_VALIDATION_VERSION,
         "manifests": len(manifests),
         "reference_condition": _value(reference, "condition"),
+        "reference_selection": (
+            "located by condition == plastic_real; independent of manifest order"
+        ),
+        "reference_arm_id": _value(reference, "protocol_arm_id"),
         "arms": arms,
         "differences": differences,
         "control_semantics": {

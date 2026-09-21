@@ -33,6 +33,7 @@ from flylatro.analysis.representation import (
     RepresentationThresholds,
     representation_diagnostics,
 )
+from flylatro.interface.motor_contexts import motor_context_windows
 from flylatro.learning.config import PlasticExperimentConfig, build_plastic_stack
 
 
@@ -68,6 +69,21 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--minimum-action-coverage-fraction", type=float, default=0.50)
     parser.add_argument("--minimum-normalized-option-range", type=float, default=0.25)
     parser.add_argument("--maximum-competing-pool-correlation", type=float, default=0.99)
+    parser.add_argument(
+        "--minimum-context-states",
+        type=int,
+        default=4,
+        help=(
+            "states in which a motor head must actually be read before its "
+            "post-motor evidence counts; 0 deliberately opts out"
+        ),
+    )
+    parser.add_argument(
+        "--minimum-competing-context-states",
+        type=int,
+        default=2,
+        help="of those, states offering more than one legal option",
+    )
     parser.add_argument("--duration-ms", type=float)
     args = parser.parse_args(argv)
     if args.repeats < 2:
@@ -108,6 +124,11 @@ def main(argv: Sequence[str] | None = None) -> int:
         state_labels=activity.state_labels,
         observable_categories=observable_category_labels(corpus, order),
         motor_interface=stack.agent.motor if args.stage == "post" else None,
+        motor_contexts=(
+            motor_context_windows(corpus.masks, order=order)
+            if args.stage == "post"
+            else None
+        ),
         stage=args.stage,
         thresholds=RepresentationThresholds(
             silence_hz=args.silence_hz,
@@ -119,6 +140,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             minimum_action_coverage_fraction=args.minimum_action_coverage_fraction,
             minimum_normalized_option_range=args.minimum_normalized_option_range,
             maximum_competing_pool_correlation=args.maximum_competing_pool_correlation,
+            minimum_context_states=args.minimum_context_states,
+            minimum_competing_context_states=args.minimum_competing_context_states,
         ),
     )
     report["backend_evidence"] = (

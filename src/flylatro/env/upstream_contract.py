@@ -133,3 +133,112 @@ def empty_action_batch(num_envs: int) -> ActionDict:
     for key, (row_shape, dtype) in ACTION_SPEC.items():
         batch[key] = np.full((num_envs, *row_shape), -1, dtype=dtype)
     return batch
+
+
+#: Action types the pinned referee lets carry card selections
+#: (``sim/py/src/action.rs::needs_cards``).
+CARD_CONSUMING_ACTION_TYPES: tuple[int, ...] = (
+    int(UpstreamActionType.PLAY_HAND),
+    int(UpstreamActionType.DISCARD),
+    int(UpstreamActionType.USE_CONSUMABLE),
+)
+
+#: Minimum ``n_cards`` per card-consuming type (``card_pick_min``).  A play or
+#: discard needs at least one card; a consumable may target none.
+CARD_PICK_MINIMUM: dict[int, int] = {
+    int(UpstreamActionType.PLAY_HAND): 1,
+    int(UpstreamActionType.DISCARD): 1,
+    int(UpstreamActionType.USE_CONSUMABLE): 0,
+}
+
+#: Which pointer field each action type must fill, and which mask legalizes it.
+#: Every other pointer must be exactly ``-1``.
+ACTION_POINTER_REQUIREMENTS: tuple[tuple[str, str, tuple[int, ...]], ...] = (
+    ("joker_target", "joker_target_mask", (int(UpstreamActionType.SELL_JOKER),)),
+    (
+        "consumable_target",
+        "consumable_target_mask",
+        (
+            int(UpstreamActionType.USE_CONSUMABLE),
+            int(UpstreamActionType.SELL_CONSUMABLE),
+        ),
+    ),
+    ("shop_target", "shop_target_mask", (int(UpstreamActionType.BUY_SHOP),)),
+    ("pack_target", "pack_target_mask", (int(UpstreamActionType.PICK_PACK),)),
+)
+
+
+def validate_strict_action_row(
+    actions: ActionDict, masks: MaskDict, row: int
+) -> None:
+    """Mirror the pinned simulator's strict referee for one batch row.
+
+    This is a faithful local re-implementation of
+    ``balatroagent@38ae214 sim/py/src/action.rs::validate``, which
+    ``BalatroVecEnv`` runs before every step when ``strict=True``.  Reproducing
+    it here lets the fixed motor interface be checked against the real contract
+    without the compiled extension:
+
+    * the action type must be legal in the emitted mask;
+    * every pointer field must be ``-1`` unless the type needs it, and legal in
+      its mask when it does;
+    * a type that consumes no cards must carry ``n_cards == 0`` — **not** the
+      ``-1`` padding value — and an all-``-1`` ``cards`` row;
+    * a card-consuming type needs ``n_cards`` in ``[minimum, MAX_CARD_PICKS]``,
+      ``-1`` padding past ``n_cards``, and distinct legal card indices.
+
+    Leniency the simulator applies *after* validation (Psychic short plays,
+    Cerulean Bell forced cards, consumable target legalization and the
+    documented unusable-consumable no-op) is deliberately not reproduced: it
+    never rejects an action, so it cannot turn a valid action into an error.
+    """
+
+    action_type = int(actions["action_type"][row])
+    if not 0 <= action_type < N_ACTION_TYPES:
+        raise ValueError(f"row {row}: illegal action_type {action_type}")
+    if not bool(masks["action_type_mask"][row, action_type]):
+        raise ValueError(f"row {row}: illegal action_type {action_type}")
+    for field, mask_name, needed_by in ACTION_POINTER_REQUIREMENTS:
+        value = int(actions[field][row])
+        if action_type not in needed_by:
+            if value != -1:
+                raise ValueError(
+                    f"row {row}: {field}={value} must be -1 for type {action_type}"
+                )
+            continue
+        mask = masks[mask_name][row]
+        if value < 0 or value >= len(mask) or not bool(mask[value]):
+            raise ValueError(
+                f"row {row}: illegal {field}={value} for type {action_type}"
+            )
+    count = int(actions["n_cards"][row])
+    cards = [int(value) for value in actions["cards"][row]]
+    if action_type not in CARD_CONSUMING_ACTION_TYPES:
+        if count != 0 or any(value != -1 for value in cards):
+            raise ValueError(
+                f"row {row}: card params must be empty for type {action_type} "
+                f"(n_cards={count}, cards={cards})"
+            )
+        return
+    minimum = CARD_PICK_MINIMUM[action_type]
+    if count < minimum or count > MAX_CARD_PICKS:
+        raise ValueError(
+            f"row {row}: n_cards={count} out of [{minimum},{MAX_CARD_PICKS}] "
+            f"for type {action_type}"
+        )
+    if any(value != -1 for value in cards[count:]):
+        raise ValueError(f"row {row}: cards not -1-padded past n_cards")
+    select = masks["card_select_mask"][row]
+    for position, value in enumerate(cards[:count]):
+        if value < 0 or value >= len(select) or not bool(select[value]):
+            raise ValueError(f"row {row}: illegal card pick {value}")
+        if value in cards[:position]:
+            raise ValueError(f"row {row}: duplicate card pick {value}")
+
+
+def validate_strict_action_batch(actions: ActionDict, masks: MaskDict) -> None:
+    """Apply the pinned strict referee to every row of a batch."""
+
+    batch = int(actions["action_type"].shape[0])
+    for row in range(batch):
+        validate_strict_action_row(actions, masks, row)

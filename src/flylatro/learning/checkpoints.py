@@ -29,6 +29,7 @@ COMPLETION_DERIVED_COMPONENT_FIELDS: frozenset[str] = frozenset(
         "action_schedule_sha256",
         "state_hash_schedule_sha256",
         "executed_action_schedule_sha256",
+        "synthetic_reinforcement_event_log_sha256",
         "reserved_action_legal_observations",
         "component_identity_version",
         "completed_at",

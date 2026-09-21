@@ -112,15 +112,20 @@ class PlasticTrainer:
             )
             for learner in range(self.env.num_envs)
         )
+        # The motor exploration RNG needs a cheap, deterministic, CPU-side
+        # decision identifier. Reading the plastic state's `decision_count`
+        # tensor would convert a CUDA scalar to a Python int on every decision
+        # and synchronize the device. `vector_steps` is the same quantity on
+        # this path (one decision per learner per vector step), lives on the
+        # host, is checkpointed, and is restored exactly on resume.
+        decision_ids = (self.state.vector_steps,) * self.env.num_envs
         decision = self.agent.act(
             self.observations,
             self.masks,
             fly_seeds=fly_seeds,
             deterministic_motor=self.config.deterministic_motor,
             motor_learner_ids=self.training_seeds,
-            motor_decision_ids=tuple(
-                int(value) for value in self.agent.plasticity.state.decision_count
-            ),
+            motor_decision_ids=decision_ids,
         )
         executed_actions = (
             scheduled.actions

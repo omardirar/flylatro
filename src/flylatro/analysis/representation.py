@@ -26,8 +26,13 @@ from typing import Any, Mapping
 import numpy as np
 from numpy.typing import NDArray
 
+from flylatro.interface.motor_contexts import (
+    MOTOR_CONTEXT_VERSION,
+    MotorContextWindow,
+)
 
-REPRESENTATION_REPORT_VERSION = "flylatro-representation-v2"
+
+REPRESENTATION_REPORT_VERSION = "flylatro-representation-v3"
 MOTOR_POPULATION_BY_MODE: dict[str, str] = {
     "mbon_direct": "mbon",
     "whole_brain": "descending",
@@ -45,6 +50,10 @@ class RepresentationThresholds:
     minimum_action_coverage_fraction: float = 0.50
     minimum_normalized_option_range: float = 0.25
     maximum_competing_pool_correlation: float = 0.99
+    #: A head is only judged where it is actually read.  These mirror the motor
+    #: calibration gates; 0 deliberately opts out (development doubles).
+    minimum_context_states: int = 4
+    minimum_competing_context_states: int = 2
 
 
 def representation_diagnostics(
@@ -57,6 +66,7 @@ def representation_diagnostics(
     state_labels: NDArray[np.integer] | None = None,
     observable_categories: Mapping[str, NDArray[np.integer]] | None = None,
     motor_interface: Any | None = None,
+    motor_contexts: Mapping[str, MotorContextWindow] | None = None,
     stage: str = "pre",
     thresholds: RepresentationThresholds | None = None,
 ) -> dict[str, Any]:
@@ -115,10 +125,18 @@ def representation_diagnostics(
         >= limits.minimum_motor_dynamic_range_hz,
     }
     if stage == "post":
-        interface = _motor_interface_diagnostics(motor_interface, motor, limits)
+        interface = _motor_interface_diagnostics(
+            motor_interface, motor, limits, motor_contexts
+        )
         result["motor_interface"] = interface
         checks.update(
             {
+                # Every motor readiness number below is measured in the states
+                # where the head is actually read, never across irrelevant
+                # states that cannot exercise it.
+                "motor_context_evidence_sufficient": not interface[
+                    "contexts_with_insufficient_evidence"
+                ],
                 "motor_option_dynamic_range": interface["minimum_normalized_option_range"]
                 >= limits.minimum_normalized_option_range,
                 "action_option_coverage": interface["action_option_coverage_fraction"]
@@ -233,32 +251,40 @@ def _motor_population(
 
 
 def _motor_interface_diagnostics(
-    interface: Any, motor: NDArray[np.float64], limits: RepresentationThresholds
+    interface: Any,
+    motor: NDArray[np.float64],
+    limits: RepresentationThresholds,
+    contexts: Mapping[str, MotorContextWindow] | None,
 ) -> dict[str, Any]:
-    """Post-motor stage: measure the decoder's own normalized comparisons."""
+    """Post-motor stage: measure the decoder's own normalized comparisons.
+
+    Whole-corpus ``by_group``/``by_head`` numbers are retained as descriptive
+    context, but every readiness figure is computed per motor interpretation
+    context: the states where the head is actually read, restricted to the
+    options that are actually legal there.  A pool that swings widely outside
+    its context and is flat inside it can no longer produce a passing gate.
+    """
 
     mapping = interface.mapping
     pool_activity = interface.pool_activity(motor)
     scores = interface.head_scores(motor)
-    normalized = (mapping.normalization or None)
+    normalization = mapping.normalization
     normalized_pools = (
-        normalized.apply(pool_activity)
-        if normalized is not None
+        normalization.apply(pool_activity)
+        if normalization is not None
         else pool_activity
     )
     ranges = np.ptp(normalized_pools, axis=0)
     by_group: dict[str, Any] = {}
-    worst_correlation = 0.0
     for group in mapping.routing.group_names:
         pool_ids = list(mapping.routing.group_pool_ids(group))
         block = normalized_pools[:, pool_ids]
         correlation = _correlation(block)
         off = correlation[~np.eye(len(pool_ids), dtype=bool)]
-        maximum = float(np.abs(off).max()) if off.size else 0.0
-        worst_correlation = max(worst_correlation, maximum)
         eigenvalues = np.clip(np.linalg.eigvalsh(correlation), 0.0, None)
         by_group[group] = {
             "pools": len(pool_ids),
+            "measured_over": "every corpus state (descriptive, not a gate)",
             "normalized_option_range": {
                 "min": float(ranges[pool_ids].min()),
                 "median": float(np.median(ranges[pool_ids])),
@@ -269,14 +295,14 @@ def _motor_interface_diagnostics(
                 "median": float(np.median(pool_activity[:, pool_ids])),
                 "max": float(pool_activity[:, pool_ids].max()),
             },
-            "competing_pool_correlation_max_absolute": maximum,
+            "competing_pool_correlation_max_absolute": (
+                float(np.abs(off).max()) if off.size else 0.0
+            ),
             "effective_distinct_signals": float(
                 eigenvalues.sum() ** 2 / max(float((eigenvalues**2).sum()), 1e-12)
             ),
         }
     by_head: dict[str, Any] = {}
-    covered = 0
-    total = 0
     for head, options in mapping.represented_pools().items():
         option_indices = sorted(options)
         head_scores = scores[head][:, option_indices]
@@ -291,6 +317,7 @@ def _motor_interface_diagnostics(
         by_head[head] = {
             "represented_options": len(option_indices),
             "contract_options": len(scores[head][0]),
+            "measured_over": "every corpus state (descriptive, not a gate)",
             "option_normalized_range": [float(value) for value in head_ranges],
             "minimum_option_normalized_range": float(head_ranges.min()),
             "distinct_unmasked_argmax_options": int(np.count_nonzero(counts)),
@@ -302,10 +329,13 @@ def _motor_interface_diagnostics(
                 "max": float(head_scores.max()),
             },
         }
-        covered += int(np.count_nonzero(head_ranges >= limits.minimum_normalized_option_range))
-        total += len(option_indices)
+    by_context, summary = _context_diagnostics(
+        mapping, scores, normalized_pools, pool_activity, limits, contexts
+    )
     return {
         "evaluated": True,
+        "context_version": MOTOR_CONTEXT_VERSION,
+        "context_aware": contexts is not None,
         "motor_mapping_sha256": mapping.structure_sha256,
         "motor_artifact_sha256": mapping.sha256,
         "motor_routing_sha256": mapping.routing.sha256,
@@ -318,10 +348,198 @@ def _motor_interface_diagnostics(
         "pool_width": mapping.pool_width,
         "by_group": by_group,
         "by_head": by_head,
-        "minimum_normalized_option_range": float(ranges.min()),
+        "by_context": by_context,
+        "readiness_rule": (
+            "motor readiness is decided from the contexts where each head is "
+            "interpreted and from the options legal there, never from variation "
+            "in states that never read the head"
+        ),
+        **summary,
+        "reserved_action_slots": list(mapping.routing.reserved_action_types),
+    }
+
+
+def _context_diagnostics(
+    mapping: Any,
+    scores: Mapping[str, NDArray[np.float64]],
+    normalized_pools: NDArray[np.float64],
+    pool_activity: NDArray[np.float64],
+    limits: RepresentationThresholds,
+    contexts: Mapping[str, MotorContextWindow] | None,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Per-context decoder behaviour plus the aggregated readiness figures."""
+
+    if contexts is None:
+        # Without legality masks the decoder cannot be judged in context. That
+        # is reported as missing evidence rather than silently falling back to
+        # the whole-corpus numbers.
+        insufficient = (
+            [] if limits.minimum_context_states <= 0 else ["<no legality context supplied>"]
+        )
+        ranges = np.ptp(normalized_pools, axis=0)
+        return {}, {
+            "contexts_with_insufficient_evidence": insufficient,
+            "minimum_normalized_option_range": float(ranges.min()),
+            "maximum_competing_pool_correlation": max(
+                (
+                    float(
+                        np.abs(
+                            _correlation(
+                                normalized_pools[
+                                    :, list(mapping.routing.group_pool_ids(group))
+                                ]
+                            )[
+                                ~np.eye(
+                                    len(mapping.routing.group_pool_ids(group)),
+                                    dtype=bool,
+                                )
+                            ]
+                        ).max()
+                    )
+                    for group in mapping.routing.group_names
+                    if len(mapping.routing.group_pool_ids(group)) > 1
+                ),
+                default=0.0,
+            ),
+            "action_option_coverage_fraction": float(
+                np.mean(ranges >= limits.minimum_normalized_option_range)
+            ),
+            "argmax_coverage_fraction": 0.0,
+        }
+    by_context: dict[str, Any] = {}
+    insufficient: list[str] = []
+    worst_range = np.inf
+    worst_correlation = 0.0
+    covered = 0
+    total = 0
+    argmax_covered = 0
+    argmax_total = 0
+    for name, window in contexts.items():
+        entry = _one_context(
+            name, window, mapping, scores, normalized_pools, pool_activity, limits
+        )
+        by_context[name] = entry
+        if entry["insufficient_evidence"]:
+            if limits.minimum_context_states > 0:
+                insufficient.append(name)
+            continue
+        worst_range = min(worst_range, float(entry["normalized_option_range"]["min"]))
+        worst_correlation = max(
+            worst_correlation, float(entry["competing_pool_correlation_max_absolute"])
+        )
+        covered += int(entry["options_above_minimum_range"])
+        total += int(entry["active_option_count"])
+        argmax_covered += int(entry["distinct_argmax_options"])
+        argmax_total += int(entry["active_option_count"])
+    if worst_range is np.inf:
+        worst_range = 0.0
+    return by_context, {
+        "contexts_with_insufficient_evidence": insufficient,
+        "minimum_normalized_option_range": worst_range,
         "maximum_competing_pool_correlation": worst_correlation,
         "action_option_coverage_fraction": covered / max(total, 1),
-        "reserved_action_slots": list(mapping.routing.reserved_action_types),
+        "argmax_coverage_fraction": argmax_covered / max(argmax_total, 1),
+        "evaluated_contexts": [
+            name for name, entry in by_context.items() if not entry["insufficient_evidence"]
+        ],
+    }
+
+
+def _one_context(
+    name: str,
+    window: MotorContextWindow,
+    mapping: Any,
+    scores: Mapping[str, NDArray[np.float64]],
+    normalized_pools: NDArray[np.float64],
+    pool_activity: NDArray[np.float64],
+    limits: RepresentationThresholds,
+) -> dict[str, Any]:
+    head = window.spec.head
+    route = np.asarray(mapping.routing.head_routes[head], dtype=np.int64)
+    rows = window.relevant_indices
+    active = np.asarray(
+        [int(option) for option in window.active_options if route[int(option)] >= 0],
+        dtype=np.int64,
+    )
+    competing_rows = np.flatnonzero(
+        window.relevant & (window.option_legal.sum(axis=1) > 1)
+    ).astype(np.int64)
+    insufficient = (
+        rows.size < max(limits.minimum_context_states, 2)
+        or competing_rows.size < max(limits.minimum_competing_context_states, 1)
+        or active.size < 2
+    )
+    base: dict[str, Any] = {
+        "group": window.spec.group,
+        "head": head,
+        "description": window.spec.description,
+        "eligible_states": int(rows.size),
+        "states_with_competing_legal_options": int(competing_rows.size),
+        "active_option_count": int(active.size),
+        "contract_option_count": int(route.size),
+        "insufficient_evidence": bool(insufficient),
+    }
+    if insufficient:
+        return {
+            **base,
+            "reason": (
+                f"{int(rows.size)} eligible state(s), {int(competing_rows.size)} with "
+                f"more than one legal option and {int(active.size)} active option(s): "
+                "this context cannot demonstrate that its pools are usable"
+            ),
+            "normalized_option_range": {"min": 0.0, "median": 0.0, "max": 0.0},
+            "raw_pool_hz": {"min": 0.0, "median": 0.0, "max": 0.0},
+            "options_above_minimum_range": 0,
+            "distinct_argmax_options": 0,
+            "argmax_coverage_fraction": 0.0,
+            "competing_pool_correlation_max_absolute": 0.0,
+            "effective_distinct_signals": 0.0,
+            "effective_signal_fraction": 0.0,
+        }
+    pool_ids = [int(route[int(option)]) for option in active]
+    block = normalized_pools[np.ix_(rows, pool_ids)]
+    option_ranges = np.ptp(block, axis=0)
+    correlation = _correlation(block)
+    off = correlation[~np.eye(len(pool_ids), dtype=bool)]
+    eigenvalues = np.clip(np.linalg.eigvalsh(correlation), 0.0, None)
+    head_scores = scores[head]
+    argmax_options: list[int] = []
+    for row in competing_rows:
+        legal = window.option_legal[row].copy()
+        legal[route < 0] = False
+        candidates = np.flatnonzero(legal)
+        if not candidates.size:
+            continue
+        argmax_options.append(int(candidates[int(np.argmax(head_scores[row, candidates]))]))
+    distinct_argmax = len(set(argmax_options))
+    return {
+        **base,
+        "normalized_option_range": {
+            "min": float(option_ranges.min()),
+            "median": float(np.median(option_ranges)),
+            "max": float(option_ranges.max()),
+        },
+        "raw_pool_hz": {
+            "min": float(pool_activity[np.ix_(rows, pool_ids)].min()),
+            "median": float(np.median(pool_activity[np.ix_(rows, pool_ids)])),
+            "max": float(pool_activity[np.ix_(rows, pool_ids)].max()),
+        },
+        "options_above_minimum_range": int(
+            np.count_nonzero(option_ranges >= limits.minimum_normalized_option_range)
+        ),
+        "distinct_argmax_options": distinct_argmax,
+        "argmax_coverage_fraction": distinct_argmax / max(int(active.size), 1),
+        "competing_pool_correlation_max_absolute": (
+            float(np.abs(off).max()) if off.size else 0.0
+        ),
+        "effective_distinct_signals": float(
+            eigenvalues.sum() ** 2 / max(float((eigenvalues**2).sum()), 1e-12)
+        ),
+        "effective_signal_fraction": float(
+            eigenvalues.sum() ** 2
+            / max(float((eigenvalues**2).sum()), 1e-12)
+            / max(len(pool_ids), 1)
+        ),
     }
 
 

@@ -21,6 +21,47 @@ from flylatro.fly.plastic_features import (
 )
 
 
+#: v3 draws each feature's own ALPN population *without replacement*, so a
+#: feature can no longer be counted as several independent contributors to one
+#: ALPN.  Collisions between different features remain deliberate. The
+#: projection stays deterministic, seeded, versioned, hashable and untrained.
+SENSORY_MAPPING_VERSION = "plastic-balatro-alpn-random-projection-v3"
+
+#: Mapping versions this build can still read. ``v2`` sampled with replacement
+#: and is retained only so an archived artifact can be inspected.
+SUPPORTED_SENSORY_MAPPING_VERSIONS: tuple[str, ...] = (
+    "plastic-balatro-alpn-random-projection-v2",
+    SENSORY_MAPPING_VERSION,
+)
+
+
+def _sample_distinct(
+    rng: np.random.Generator, population: int, width: int
+) -> NDArray[np.int64]:
+    """Deterministic seeded draw of `width` distinct positions."""
+
+    chosen: list[int] = []
+    seen: set[int] = set()
+    # Rejection sampling keeps the stream cheap when width << population and
+    # is exact for any seed; the permutation fallback covers the dense case.
+    for _ in range(16 * width):
+        if len(chosen) == width:
+            break
+        candidate = int(rng.integers(0, population))
+        if candidate not in seen:
+            seen.add(candidate)
+            chosen.append(candidate)
+    if len(chosen) < width:
+        for candidate in rng.permutation(population):
+            value = int(candidate)
+            if value not in seen:
+                seen.add(value)
+                chosen.append(value)
+            if len(chosen) == width:
+                break
+    return np.asarray(chosen, dtype=np.int64)
+
+
 @dataclass(frozen=True, slots=True)
 class SensoryMapping:
     version: str
@@ -52,6 +93,14 @@ class SensoryMapping:
             raise ValueError("sensory mapping index is outside the connectome")
         if self.max_rate_hz <= 0:
             raise ValueError("max_rate_hz must be positive")
+        if self.version == SENSORY_MAPPING_VERSION and self.population_indices.size:
+            width = self.population_indices.shape[1]
+            for row in self.population_indices:
+                if len(set(row.tolist())) != width:
+                    raise ValueError(
+                        f"{SENSORY_MAPPING_VERSION} requires distinct ALPNs inside "
+                        "one feature population"
+                    )
 
     @property
     def sha256(self) -> str:
@@ -113,18 +162,24 @@ class SensoryMapping:
                 "plastic-brain sensory mapping requires annotated ALPN inputs"
             )
         names = feature_names()
+        if population_width > len(inputs):
+            raise ValueError(
+                f"population_width={population_width} exceeds the {len(inputs)} "
+                "annotated ALPNs available; one feature cannot drive more "
+                "distinct input neurons than exist"
+            )
         rng = np.random.default_rng(mapping_seed)
-        # More Balatro features exist than ALPNs. Sampling with replacement is
-        # an explicit fixed random projection, not a learned encoder.
-        positions = rng.integers(
-            0,
-            len(inputs),
-            size=(len(names), population_width),
-            dtype=np.int64,
-        )
+        # More Balatro features exist than ALPNs, so *different* features may
+        # legitimately collide on one ALPN. Within a single feature, however,
+        # the draw is without replacement: population_width must mean
+        # population_width distinct neurons, or the collision and contributor
+        # diagnostics would count one feature as several contributors.
+        positions = np.empty((len(names), population_width), dtype=np.int64)
+        for row in range(len(names)):
+            positions[row] = _sample_distinct(rng, len(inputs), population_width)
         indices = inputs[positions]
         return cls(
-            version="plastic-balatro-alpn-random-projection-v2",
+            version=SENSORY_MAPPING_VERSION,
             mapping_seed=mapping_seed,
             neuron_count=artifact.neuron_count,
             feature_names=names,
@@ -146,7 +201,15 @@ class SensoryMapping:
         state-conditioned metrics in ``flylatro.analysis.sensory_health``.
         """
 
-        unique, used_counts = np.unique(self.population_root_ids, return_counts=True)
+        distinct_per_feature = [
+            len(set(row.tolist())) for row in self.population_root_ids
+        ]
+        # Count each feature at most once per ALPN, so a (legacy v2) duplicate
+        # assignment is never reported as two independent contributors.
+        deduplicated = np.concatenate(
+            [np.unique(row) for row in self.population_root_ids]
+        ) if self.population_root_ids.size else np.zeros(0, dtype=np.int64)
+        unique, used_counts = np.unique(deduplicated, return_counts=True)
         lookup = {int(root): int(count) for root, count in zip(unique, used_counts, strict=True)}
         counts = np.asarray(
             [lookup.get(int(root), 0) for root in self.available_alpn_root_ids],
@@ -182,6 +245,22 @@ class SensoryMapping:
             "assignments": int(self.population_root_ids.size),
             "feature_channels": len(self.feature_names),
             "population_width": int(self.population_indices.shape[1]),
+            "distinct_alpns_per_feature": {
+                "min": int(min(distinct_per_feature, default=0)),
+                "max": int(max(distinct_per_feature, default=0)),
+            },
+            "features_with_duplicate_alpns": int(
+                sum(
+                    1
+                    for count in distinct_per_feature
+                    if count != self.population_indices.shape[1]
+                )
+            ),
+            "contributor_counting_rule": (
+                "one feature contributes at most one simultaneous drive to an "
+                "ALPN; duplicate within-feature assignments would inflate both "
+                "structural and simultaneous contributor counts and are refused"
+            ),
             "available_alpns": int(len(self.available_alpn_root_ids)),
             "unique_alpns": int(len(unique)),
             "fraction_alpns_used": float(len(unique) / len(self.available_alpn_root_ids)),
@@ -228,6 +307,11 @@ class SensoryMapping:
         )
         if payload.get("sha256") != mapping.sha256:
             raise ValueError("sensory mapping artifact hash mismatch")
+        if mapping.version not in SUPPORTED_SENSORY_MAPPING_VERSIONS:
+            raise ValueError(
+                f"unsupported sensory mapping version {mapping.version!r}; "
+                f"supported: {list(SUPPORTED_SENSORY_MAPPING_VERSIONS)}"
+            )
         return mapping
 
     @classmethod

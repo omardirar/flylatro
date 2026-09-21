@@ -17,6 +17,7 @@ import numpy as np
 
 from flylatro.analysis.evidence import experiment_identity, load_corpus, record_corpus_activity
 from flylatro.analysis.provenance import EvidenceIdentity
+from flylatro.interface.motor_contexts import motor_context_windows
 from flylatro.interface.motor_calibration import (
     MOTOR_CALIBRATION_VERSION,
     MotorCalibrationError,
@@ -42,6 +43,21 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--minimum-effective-signal-fraction", type=float, default=0.50)
     parser.add_argument("--minimum-normalized-option-range", type=float, default=0.25)
     parser.add_argument("--maximum-pool-silent-fraction", type=float, default=0.90)
+    parser.add_argument(
+        "--minimum-context-states",
+        type=int,
+        default=4,
+        help=(
+            "states in which a motor context must actually be interpreted before "
+            "its evidence counts; 0 deliberately opts out (development doubles)"
+        ),
+    )
+    parser.add_argument(
+        "--minimum-competing-context-states",
+        type=int,
+        default=2,
+        help="of those, states offering more than one legal option",
+    )
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument(
         "--report",
@@ -75,6 +91,13 @@ def main(argv: Sequence[str] | None = None) -> int:
         minimum_normalized_option_range=args.minimum_normalized_option_range,
         maximum_pool_silent_fraction=args.maximum_pool_silent_fraction,
         minimum_pool_width=2,
+        minimum_context_states=args.minimum_context_states,
+        minimum_competing_context_states=args.minimum_competing_context_states,
+    )
+    # Candidate quality is judged in the states where each routing group is
+    # actually read, using the corpus's own legality masks.
+    contexts = motor_context_windows(
+        corpus.masks, order=activity.state_labels.tolist()
     )
     details = _candidate_details(stack, config)
     report_path = args.report or args.output.with_name(args.output.stem + "-report.json")
@@ -92,6 +115,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             mode=config.fly.mode,
             pool_width=config.fly.motor_pool_width,
             thresholds=thresholds,
+            contexts=contexts,
             exploration_epsilon=config.motor.exploration_epsilon,
             exploration_temperature=config.motor.exploration_temperature,
             exploration_seed=config.motor.exploration_seed,
@@ -104,6 +128,9 @@ def main(argv: Sequence[str] | None = None) -> int:
                 "calibration_corpus_sha256": corpus.sha256,
                 "corpus_states": len(set(activity.state_labels.tolist())),
                 "repeats_per_state": args.repeats,
+                "motor_context_coverage": {
+                    name: window.counts() for name, window in contexts.items()
+                },
                 "observable_state_hashes": list(dict.fromkeys(activity.state_hashes)),
                 "state_sampling": (
                     "frozen reward-free calibration corpus; no bootstrap decoder "
@@ -119,6 +146,9 @@ def main(argv: Sequence[str] | None = None) -> int:
             "gates": {"status": "FAIL", "checks": {}, "failed": ["calibration_error"]},
             "error": str(error),
             "detail": error.report,
+            "motor_context_coverage": {
+                name: window.counts() for name, window in contexts.items()
+            },
             "candidate_set": candidate_set,
             "evidence_identity": identity.to_dict(),
         }

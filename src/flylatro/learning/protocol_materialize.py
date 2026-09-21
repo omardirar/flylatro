@@ -17,6 +17,7 @@ from typing import Any, Mapping, Sequence
 from flylatro.learning.config import PlasticExperimentConfig
 from flylatro.learning.protocol import (
     ConditionArm,
+    EXACT_ACTION_MATCHED_CONDITIONS,
     ExperimentProtocol,
     INDEPENDENT_TOPOLOGY_CONDITIONS,
 )
@@ -35,6 +36,10 @@ class MaterializedArm:
     run_dir: str
     command: tuple[str, ...]
     depends_on: tuple[str, ...]
+    source_arm_id: str = ""
+    source_run_dir: str = ""
+    prerequisite_commands: tuple[tuple[str, ...], ...] = ()
+    reward_seed: int | None = None
 
 
 def arm_directory(protocol_name: str, arm: ConditionArm, root: str) -> str:
@@ -60,15 +65,17 @@ def materialize_protocol(
     if payload.get("sha256") != protocol.sha256:
         raise ValueError("protocol file hash does not match the loaded protocol")
     output_dir.mkdir(parents=True, exist_ok=True)
+    by_id = {item.arm_id: item for item in protocol.arms}
     arms: list[MaterializedArm] = []
     for arm in protocol.arms:
-        real_arm = f"{arm.replicate_id}:plastic_real"
+        real_arm = arm.reference_arm_id
+        if arm.condition in EXACT_ACTION_MATCHED_CONDITIONS and real_arm not in by_id:
+            raise ValueError(
+                f"arm {arm.arm_id} is exact-action matched but its reference "
+                f"{real_arm} is not in this protocol; include plastic_real"
+            )
         real_dir = arm_directory(
-            protocol.name,
-            next(item for item in protocol.arms if item.arm_id == real_arm)
-            if any(item.arm_id == real_arm for item in protocol.arms)
-            else arm,
-            run_root,
+            protocol.name, by_id.get(real_arm, arm), run_root
         )
         run_dir = arm_directory(protocol.name, arm, run_root)
         document = _arm_document(
@@ -89,8 +96,16 @@ def materialize_protocol(
             raise ValueError("materialized configuration lost its protocol identity")
         command = _command(materialized, config_path, run_dir, arm, heavy=heavy)
         depends: tuple[str, ...] = ()
-        if arm.condition in {"no_plasticity", "shuffled_reward"}:
+        if arm.condition in EXACT_ACTION_MATCHED_CONDITIONS:
             depends = (real_arm,)
+        # The shuffled-reward dependency is generated, never transcribed: the
+        # schedule is produced with exactly `arm.reward_seed` and bound to the
+        # source run, and the arm refuses any other schedule.
+        prerequisites = (
+            _shuffled_reward_commands(arm, real_dir, run_dir)
+            if arm.condition == "shuffled_reward"
+            else ()
+        )
         arms.append(
             MaterializedArm(
                 arm_id=arm.arm_id,
@@ -100,6 +115,10 @@ def materialize_protocol(
                 run_dir=run_dir,
                 command=command,
                 depends_on=depends,
+                source_arm_id=real_arm if depends else "",
+                source_run_dir=real_dir if depends else "",
+                prerequisite_commands=prerequisites,
+                reward_seed=arm.reward_seed if arm.condition == "shuffled_reward" else None,
             )
         )
     plan = {
@@ -110,6 +129,15 @@ def materialize_protocol(
         "base_config": str(base_config.source_path),
         "base_config_sha256": base_config.sha256,
         "motor_mapping_id": protocol.motor_mapping_id,
+        "sensory_mappings": [
+            {
+                "mapping_id": variant.mapping_id,
+                "sensory_mapping_seed": variant.sensory_mapping_seed,
+                "motor_mapping_id": variant.motor_mapping_id,
+                "role": variant.role,
+            }
+            for variant in protocol.sensory_mappings
+        ],
         "run_root": run_root,
         "arms": [
             {
@@ -120,14 +148,24 @@ def materialize_protocol(
                 "run_dir": item.run_dir,
                 "command": list(item.command),
                 "depends_on": list(item.depends_on),
+                "source_arm_id": item.source_arm_id or None,
+                "source_run_dir": item.source_run_dir or None,
+                "reward_seed": item.reward_seed,
+                "prerequisite_commands": [
+                    list(command) for command in item.prerequisite_commands
+                ],
             }
             for item in arms
         ],
         "execution_notes": [
             "run every plastic_real arm before its matched controls",
             "no_plasticity replays the real arm's executed action schedule",
-            "shuffled_reward needs flylatro-shuffle-reward on the real arm's "
-            "synthetic-reinforcement-events.jsonl before it can start",
+            "shuffled_reward's prerequisite_commands generate its schedule with "
+            "the protocol arm's own reward_seed; the run refuses a schedule "
+            "shuffled with any other seed or derived from another source run",
+            "ordinary replicates inside one mapping block share the sensory "
+            "mapping and the calibrated motor mapping; a different "
+            "sensory_mapping_seed is a separate mapping block",
             "topology controls are behaviourally independent and deliberately "
             "do not replay the real arm's actions",
         ],
@@ -136,6 +174,32 @@ def materialize_protocol(
         json.dumps(plan, indent=2, sort_keys=True) + "\n", encoding="utf-8"
     )
     return plan
+
+
+def _shuffled_reward_commands(
+    arm: ConditionArm, source_dir: str, run_dir: str
+) -> tuple[tuple[str, ...], ...]:
+    """The exact schedule-generation command for one shuffled-reward arm."""
+
+    return (
+        (
+            "flylatro-shuffle-reward",
+            "--events",
+            f"{source_dir}/synthetic-reinforcement-events.jsonl",
+            "--source-checkpoint",
+            f"{source_dir}/plastic-checkpoint-final.pkl",
+            "--source-run-manifest",
+            f"{source_dir}/run-manifest.json",
+            "--source-arm-id",
+            arm.reference_arm_id,
+            "--target-arm-id",
+            arm.arm_id,
+            "--seed",
+            str(arm.reward_seed),
+            "--output",
+            f"{source_dir}/shuffled-reinforcement.jsonl",
+        ),
+    )
 
 
 def _arm_document(
@@ -179,7 +243,12 @@ def _arm_document(
         ),
         action_schedule_path=(
             f"{matched_source_dir}/training-actions.jsonl"
-            if arm.condition in {"no_plasticity", "shuffled_reward"}
+            if arm.condition in EXACT_ACTION_MATCHED_CONDITIONS
+            else ""
+        ),
+        matched_source_run_dir=(
+            matched_source_dir
+            if arm.condition in EXACT_ACTION_MATCHED_CONDITIONS
             else ""
         ),
     )

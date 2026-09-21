@@ -297,6 +297,12 @@ def main(argv: Sequence[str] | None = None) -> int:
             if plasticity_parquet is not None:
                 plasticity_parquet.close()
     generated_action_hash = sha256_file(run_dir / "training-actions.jsonl")
+    reinforcement_event_log = run_dir / "synthetic-reinforcement-events.jsonl"
+    reinforcement_event_hash = (
+        sha256_file(reinforcement_event_log)
+        if reinforcement_event_log.exists()
+        else None
+    )
     completed_at = datetime.now(timezone.utc).isoformat()
     # One canonical completed identity is written to every final product, so a
     # manifest, a summary and a checkpoint can never disagree merely because
@@ -304,6 +310,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     completed_components = finalize_components(
         stack.components,
         executed_action_schedule_sha256=generated_action_hash,
+        synthetic_reinforcement_event_log_sha256=reinforcement_event_hash,
         reserved_action_legal_observations=stack.agent.motor.reserved_action_legal_count,
         completed_at=completed_at,
     )
@@ -366,6 +373,7 @@ COMPLETED_COMPONENT_IDENTITY_VERSION = "completed-run-component-identity-v1"
 #: final checkpoint (and its manifest). Asserted by tests.
 COMPLETED_IDENTITY_FIELDS: tuple[str, ...] = (
     "executed_action_schedule_sha256",
+    "synthetic_reinforcement_event_log_sha256",
     "action_schedule_sha256",
     "state_hash_schedule_sha256",
     "motor_mapping_sha256",
@@ -388,10 +396,17 @@ def finalize_components(
     executed_action_schedule_sha256: str,
     reserved_action_legal_observations: int,
     completed_at: str,
+    synthetic_reinforcement_event_log_sha256: str | None = None,
 ) -> dict[str, object]:
     """Build the single immutable completed-run component identity."""
 
     completed = dict(components)
+    # A shuffled-reward control is only valid against *this* run's event log,
+    # so the log's hash is part of the completed identity a later schedule is
+    # checked against.
+    completed["synthetic_reinforcement_event_log_sha256"] = (
+        synthetic_reinforcement_event_log_sha256
+    )
     declared = completed.get("action_schedule_sha256")
     if declared is None:
         completed["action_schedule_sha256"] = executed_action_schedule_sha256
