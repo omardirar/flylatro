@@ -2,6 +2,7 @@
 
 from flylatro.learning.reinforcement import (
     DopaminePulse,
+    ReinforcementPulse,
     ReinforcementConfig,
     ReinforcementMapper,
     shuffled_pulse_schedule,
@@ -9,6 +10,7 @@ from flylatro.learning.reinforcement import (
 
 __all__ = [
     "DopaminePulse",
+    "ReinforcementPulse",
     "ReinforcementConfig",
     "ReinforcementMapper",
     "shuffled_pulse_schedule",

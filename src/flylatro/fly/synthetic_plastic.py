@@ -11,7 +11,7 @@ from numpy.typing import NDArray
 from flylatro.env.upstream_contract import ObsDict
 from flylatro.fly.mushroom_body.topology import PlasticEdgeTopology
 from flylatro.fly.plastic_backend import PlasticFlyDecisionActivity
-from flylatro.fly.upstream_encoder import full_feature_names, observation_features
+from flylatro.fly.plastic_features import feature_names, observation_features
 from flylatro.interface.motor import HEAD_SIZES
 
 
@@ -50,7 +50,7 @@ class SyntheticPlasticFlyProcessor:
             raise ValueError("unknown output mode")
         self.mode = mode
         rng = np.random.default_rng(self.spec.seed)
-        feature_count = len(full_feature_names())
+        feature_count = len(feature_names())
         self._sensory_projection = rng.normal(
             0.0, 1.0 / np.sqrt(feature_count), (feature_count, self.spec.kenyon_count)
         ).astype(np.float32)
@@ -116,25 +116,29 @@ class SyntheticPlasticFlyProcessor:
         kc = np.where(drive >= threshold[:, None], drive, 0.0)
         peak = np.maximum(kc.max(axis=1, keepdims=True), 1e-8)
         kc = kc / peak
-        edge_pre = kc[:, self._edge_pre_local]
+        kc_hz = kc * 20.0
+        edge_pre = kc_hz[:, self._edge_pre_local]
         edge_post = np.zeros_like(edge_pre)
         mbon = np.zeros((batch, self.spec.output_count), dtype=np.float32)
         effective = efficacy_values * self.topology.anatomical_weights[None, :]
-        contributions = edge_pre * effective
+        contributions = kc[:, self._edge_pre_local] * effective
         for row in range(batch):
             np.add.at(mbon[row], self._edge_post_local, contributions[row])
         scale = np.maximum(mbon.mean(axis=1, keepdims=True), 1e-8)
         mbon = np.tanh(mbon / scale)
-        edge_post[:] = mbon[:, self._edge_post_local]
+        mbon_hz = mbon * 20.0
+        edge_post[:] = mbon_hz[:, self._edge_post_local]
         descending = np.tanh(mbon @ self._downstream)
-        output = mbon if self.mode == "mbon_direct" else descending
+        descending_hz = descending * 20.0
+        output = mbon_hz if self.mode == "mbon_direct" else descending_hz
         return PlasticFlyDecisionActivity(
             output_activity=output.astype(np.float32, copy=False),
             edge_pre_activity=edge_pre.astype(np.float32, copy=False),
             edge_post_activity=edge_post.astype(np.float32, copy=False),
-            kc_activity=kc.astype(np.float32, copy=False),
-            mbon_activity=mbon.astype(np.float32, copy=False),
+            kc_activity=kc_hz.astype(np.float32, copy=False),
+            mbon_activity=mbon_hz.astype(np.float32, copy=False),
             dan_activity=np.zeros((batch, 2), dtype=np.float32),
-            descending_activity=descending.astype(np.float32, copy=False),
+            descending_activity=descending_hz.astype(np.float32, copy=False),
             duration_ms=self.duration_ms,
+            activity_unit="synthetic_rate_hz_proxy",
         )

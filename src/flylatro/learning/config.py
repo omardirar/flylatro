@@ -15,19 +15,20 @@ from flylatro.env.array_mock import MockArrayBalatroEnv
 from flylatro.env.balatro_sim import BalatroSimAdapter
 from flylatro.fly.flywire_artifact import FlyWireArtifact
 from flylatro.fly.mushroom_body.plasticity import PlasticityConfig, ThreeFactorPlasticity
-from flylatro.fly.mushroom_body.state import PlasticEdgeState
+from flylatro.fly.mushroom_body.compartmental import EdgeModulationAssignment
+from flylatro.fly.mushroom_body.state import PlasticEdgeState, TorchPlasticEdgeState
 from flylatro.fly.mushroom_body.topology import PlasticEdgeTopology
 from flylatro.fly.plastic_backend import PlasticFlyProcessor, PlasticTorchFlyWireBackend
 from flylatro.fly.synthetic_plastic import (
     SyntheticPlasticCircuitSpec,
     SyntheticPlasticFlyProcessor,
 )
-from flylatro.fly.upstream_encoder import full_feature_names
-from flylatro.interface.motor import FixedMotorInterface, MotorMapping
+from flylatro.fly.plastic_features import channel_manifest, feature_names
+from flylatro.interface.motor import HEAD_SIZES, FixedMotorInterface, MotorMapping
 from flylatro.interface.sensory import FixedPlasticSensoryEncoder, SensoryMapping
 from flylatro.learning.agent import PlasticFlyAgent
 from flylatro.learning.reinforcement import ReinforcementConfig, ReinforcementMapper
-from flylatro.learning.reward_schedule import DopamineSchedule
+from flylatro.learning.reward_schedule import ReinforcementSchedule
 from flylatro.learning.reward_schedule import load_action_schedule
 from flylatro.learning.trainer import PlasticTrainer, PlasticTrainingConfig
 from flylatro.seeds import SeedPlan
@@ -54,11 +55,13 @@ class FlySettings:
     sensory_mapping_seed: int = 0
     sensory_population_width: int = 3
     max_rate_hz: float = 150.0
-    motor_pool_width: int = 1
+    motor_pool_width: int = 2
+    motor_mapping_path: str = ""
     synthetic_seed: int = 1701
     synthetic_kenyon_count: int = 48
     topology: str = "real"
     shuffle_seed: int = 1701
+    minimum_synapse_count: int = 1
 
 
 @dataclass(frozen=True, slots=True)
@@ -77,9 +80,10 @@ class TrainingSettings:
     plasticity_enabled: bool = True
     training_seed_offset: int = 0
     reinforcement_mode: str = "outcome"
-    dopamine_schedule_path: str = ""
+    reinforcement_schedule_path: str = ""
     action_schedule_path: str = ""
     condition: str = "plastic_real"
+    budget_basis: str = "development-default"
 
 
 @dataclass(frozen=True, slots=True)
@@ -160,15 +164,27 @@ class PlasticExperimentConfig:
             raise ValueError("fly backend must be synthetic or flywire")
         if self.fly.mode not in {"mbon_direct", "whole_brain"}:
             raise ValueError("fly mode must be mbon_direct or whole_brain")
-        if self.fly.topology not in {"real", "shuffled"}:
-            raise ValueError("fly topology must be real or shuffled")
+        if self.fly.topology not in {"real", "kc_mbon_shuffled", "whole_brain_shuffled"}:
+            raise ValueError("fly topology must be real, kc_mbon_shuffled or whole_brain_shuffled")
         if self.fly.backend == "synthetic" and self.fly.topology != "real":
             raise ValueError("synthetic topology control uses its own fixed test graph")
+        if self.fly.motor_pool_width < 2:
+            raise ValueError("scientific motor pools require motor_pool_width >= 2")
+        if self.fly.sensory_population_width < 1 or self.fly.duration_ms <= 0:
+            raise ValueError("sensory population width and duration must be positive")
+        if self.fly.minimum_synapse_count < 1:
+            raise ValueError("minimum_synapse_count must be at least one")
+        if self.fly.backend == "synthetic" and self.fly.minimum_synapse_count != 1:
+            raise ValueError("synthetic test topology supports minimum_synapse_count=1 only")
         if self.curriculum.enabled:
+            if not self.curriculum.ladder or not 1 <= self.curriculum.ladder[0] <= 8:
+                raise ValueError("curriculum needs at least one Ante in [1, 8]")
             if tuple(sorted(set(self.curriculum.ladder))) != self.curriculum.ladder:
                 raise ValueError("curriculum ladder must be strictly increasing")
-            if self.curriculum.ladder[-1] != 8:
-                raise ValueError("curriculum must end at Ante 8")
+            if len(self.curriculum.ladder) > 1 and self.curriculum.ladder[-1] != 8:
+                raise ValueError(
+                    "curriculum must be one fixed Ante or end at Ante 8"
+                )
             if self.curriculum.evaluation_every_decisions < 1:
                 raise ValueError("curriculum evaluation cadence must be positive")
             if self.curriculum.evaluation_episodes < 1:
@@ -177,21 +193,24 @@ class PlasticExperimentConfig:
             raise ValueError("unknown reinforcement_mode")
         if (
             self.training.reinforcement_mode == "shuffled_schedule"
-            and not self.training.dopamine_schedule_path
+            and not self.training.reinforcement_schedule_path
         ):
-            raise ValueError("shuffled_schedule requires dopamine_schedule_path")
+            raise ValueError("shuffled_schedule requires reinforcement_schedule_path")
         conditions = {
             "plastic_real",
             "no_plasticity",
-            "shuffled_topology",
+            "kc_mbon_shuffled",
+            "whole_brain_shuffled",
             "shuffled_reward",
         }
         if self.training.condition not in conditions:
             raise ValueError("unknown experimental condition")
         if self.training.condition == "no_plasticity" and self.training.plasticity_enabled:
             raise ValueError("no_plasticity condition requires plasticity_enabled=false")
-        if self.training.condition == "shuffled_topology" and self.fly.topology != "shuffled":
-            raise ValueError("shuffled_topology condition requires fly.topology=shuffled")
+        if self.training.condition in {"kc_mbon_shuffled", "whole_brain_shuffled"} and self.fly.topology != self.training.condition:
+            raise ValueError("topology-control condition must equal fly.topology")
+        if self.training.condition not in {"kc_mbon_shuffled", "whole_brain_shuffled"} and self.fly.topology != "real":
+            raise ValueError("non-topology control conditions require fly.topology=real")
         if (
             self.training.condition == "shuffled_reward"
             and self.training.reinforcement_mode != "shuffled_schedule"
@@ -241,7 +260,9 @@ class PlasticTrainingStack:
     components: dict[str, Any]
 
 
-def build_plastic_stack(config: PlasticExperimentConfig) -> PlasticTrainingStack:
+def build_plastic_stack(
+    config: PlasticExperimentConfig, *, allow_uncalibrated_motor: bool = False
+) -> PlasticTrainingStack:
     env = build_plastic_environment(config)
     learners = config.environment.num_envs
     if config.fly.backend == "synthetic":
@@ -249,6 +270,7 @@ def build_plastic_stack(config: PlasticExperimentConfig) -> PlasticTrainingStack
             SyntheticPlasticCircuitSpec(
                 seed=config.fly.synthetic_seed,
                 kenyon_count=config.fly.synthetic_kenyon_count,
+                output_count=sum(HEAD_SIZES.values()) * config.fly.motor_pool_width,
             ),
             mode=config.fly.mode,
         )
@@ -269,7 +291,8 @@ def build_plastic_stack(config: PlasticExperimentConfig) -> PlasticTrainingStack
         sensory_manifest: dict[str, Any] = {
             "version": "synthetic-fixed-projection-v1",
             "seed": config.fly.synthetic_seed,
-            "feature_names": list(full_feature_names()),
+            "feature_names": list(feature_names()),
+            "feature_contract": channel_manifest(),
             "note": "development-only fixed dense projection; matrix is reproduced from seed",
         }
         backend_version = processor.version
@@ -288,22 +311,26 @@ def build_plastic_stack(config: PlasticExperimentConfig) -> PlasticTrainingStack
         if not artifact_path.is_absolute():
             artifact_path = config.source_path.parent.parent / artifact_path
         artifact = FlyWireArtifact.load(artifact_path)
-        shuffle_seed = (
-            config.fly.shuffle_seed if config.fly.topology == "shuffled" else None
+        shuffle_seed = config.fly.shuffle_seed if config.fly.topology != "real" else None
+        shuffle_scope = (
+            "kc_mbon" if config.fly.topology == "kc_mbon_shuffled" else "whole_brain"
         )
         shuffled_post = None
         if shuffle_seed is not None:
             _, shuffled_post, _, _ = artifact.edge_arrays(
-                shuffle_seed=shuffle_seed, preserve_populations=True
+                shuffle_seed=shuffle_seed,
+                preserve_populations=True,
+                shuffle_scope=shuffle_scope,
             )
         topology = PlasticEdgeTopology.from_artifact(
             artifact,
             post_indices=shuffled_post,
             version=(
-                f"flywire-v783-kc-mbon-population-shuffle-v1-seed-{shuffle_seed}"
+                f"flywire-v783-{shuffle_scope}-shuffle-v1-seed-{shuffle_seed}"
                 if shuffle_seed is not None
                 else "flywire-v783-kc-mbon-neuron-pairs-v1"
             ),
+            minimum_synapse_count=config.fly.minimum_synapse_count,
         )
         sensory_mapping = SensoryMapping.from_artifact(
             artifact,
@@ -313,7 +340,7 @@ def build_plastic_stack(config: PlasticExperimentConfig) -> PlasticTrainingStack
         )
         encoder = FixedPlasticSensoryEncoder(sensory_mapping)
         output_indices = (
-            np.unique(topology.post_indices)
+            artifact.mbon_indices
             if config.fly.mode == "mbon_direct"
             else artifact.descending_indices
         )
@@ -326,6 +353,7 @@ def build_plastic_stack(config: PlasticExperimentConfig) -> PlasticTrainingStack
             device=config.fly.device,
             readout_indices=readout,
             shuffle_seed=shuffle_seed,
+            shuffle_scope=shuffle_scope,
         )
         processor = PlasticFlyProcessor(
             encoder,
@@ -359,16 +387,61 @@ def build_plastic_stack(config: PlasticExperimentConfig) -> PlasticTrainingStack
             ),
         }
         topology_procedure = backend.topology_procedure
-    state = PlasticEdgeState.initialize(topology.edge_count, learners=learners)
-    plasticity = ThreeFactorPlasticity(topology, state, config.plasticity)
-    motor_mapping = MotorMapping.round_robin(
-        processor.output_root_ids,
-        mode=config.fly.mode,
-        pool_width=config.fly.motor_pool_width,
-        exploration_epsilon=config.motor.exploration_epsilon,
-        exploration_temperature=config.motor.exploration_temperature,
-        exploration_seed=config.motor.exploration_seed,
+    state = (
+        TorchPlasticEdgeState.initialize(
+            topology.edge_count, learners=learners, device=config.fly.device
+        )
+        if config.fly.backend == "flywire"
+        else PlasticEdgeState.initialize(topology.edge_count, learners=learners)
     )
+    plasticity = ThreeFactorPlasticity(topology, state, config.plasticity)
+    modulation = EdgeModulationAssignment.global_v1(topology)
+    configured_motor_path: Path | None = None
+    if config.fly.motor_mapping_path:
+        motor_path = Path(config.fly.motor_mapping_path)
+        if not motor_path.is_absolute():
+            motor_path = config.source_path.parent.parent / motor_path
+        configured_motor_path = motor_path
+    if configured_motor_path is not None and configured_motor_path.exists():
+        motor_mapping = MotorMapping.load(configured_motor_path)
+        if motor_mapping.mode != config.fly.mode or not np.array_equal(
+            motor_mapping.output_root_ids, processor.output_root_ids
+        ):
+            raise ValueError("motor calibration artifact does not match canonical output roots")
+    elif config.fly.backend == "flywire" and not allow_uncalibrated_motor:
+        raise ValueError(
+            f"real FlyWire training requires the reward-free motor mapping artifact: {configured_motor_path}"
+        )
+    elif config.fly.backend == "flywire":
+        motor_mapping = MotorMapping.round_robin(
+            processor.output_root_ids,
+            mode=config.fly.mode,
+            pool_width=config.fly.motor_pool_width,
+            exploration_epsilon=0.0,
+            exploration_seed=config.motor.exploration_seed,
+        )
+    else:
+        calibration_rows = []
+        for sample in range(8):
+            observations, _ = env.reset(
+                tuple(70_000_000 + sample * learners + row for row in range(learners))
+            )
+            activity = processor.process(
+                observations,
+                fly_seeds=tuple(80_000_000 + sample * learners + row for row in range(learners)),
+                efficacy=np.ones((learners, topology.edge_count), dtype=np.float32),
+            )
+            calibration_rows.append(activity.output_activity)
+        motor_mapping = MotorMapping.from_reward_free_calibration(
+            processor.output_root_ids,
+            np.concatenate(calibration_rows, axis=0),
+            mode=config.fly.mode,
+            pool_width=config.fly.motor_pool_width,
+            high_rate_hz=200.0,
+            exploration_epsilon=config.motor.exploration_epsilon,
+            exploration_temperature=config.motor.exploration_temperature,
+            exploration_seed=config.motor.exploration_seed,
+        )
     motor = FixedMotorInterface(motor_mapping)
     reinforcement = ReinforcementMapper(config.reinforcement)
     agent = PlasticFlyAgent(processor, plasticity, motor, reinforcement)
@@ -377,10 +450,10 @@ def build_plastic_stack(config: PlasticExperimentConfig) -> PlasticTrainingStack
     action_schedule = None
     action_schedule_hash = None
     if config.training.reinforcement_mode == "shuffled_schedule":
-        schedule_path = Path(config.training.dopamine_schedule_path)
+        schedule_path = Path(config.training.reinforcement_schedule_path)
         if not schedule_path.is_absolute():
             schedule_path = config.source_path.parent.parent / schedule_path
-        schedule = DopamineSchedule.load(schedule_path)
+        schedule = ReinforcementSchedule.load(schedule_path)
         dopamine_schedule = schedule.pulses
         schedule_hash = schedule.sha256
     if config.training.action_schedule_path:
@@ -424,23 +497,42 @@ def build_plastic_stack(config: PlasticExperimentConfig) -> PlasticTrainingStack
         "topology_condition": config.fly.topology,
         "topology_procedure": topology_procedure,
         "topology_shuffle_seed": (
-            config.fly.shuffle_seed if config.fly.topology == "shuffled" else None
+            config.fly.shuffle_seed if config.fly.topology != "real" else None
         ),
         "artifact_sha256": artifact_hash,
         "population_sha256": population_hash,
         "population_manifest": population_manifest,
         "plastic_topology_sha256": topology.sha256,
+        "minimum_synapse_count": topology.minimum_synapse_count,
         "plasticity_rule_sha256": config.plasticity.sha256,
         "sensory_mapping_sha256": sensory_hash,
         "sensory_mapping": sensory_manifest,
         "motor_mapping_sha256": motor_mapping.sha256,
         "motor_mapping": motor_mapping.to_manifest(),
+        "motor_mapping_bootstrap_only": bool(
+            allow_uncalibrated_motor and config.fly.backend == "flywire" and (configured_motor_path is None or not configured_motor_path.exists())
+        ),
+        "canonical_motor_root_ids_sha256": hashlib.sha256(
+            processor.output_root_ids.astype("<i8", copy=False).tobytes()
+        ).hexdigest(),
         "reinforcement_mapping_sha256": config.reinforcement.sha256,
         "reinforcement_mapping": asdict(config.reinforcement),
         "plasticity_rule": asdict(config.plasticity),
+        "edge_modulation": {
+            "version": modulation.version,
+            "sha256": modulation.sha256,
+            "channel_names": list(modulation.channel_names),
+            "evidence": modulation.evidence,
+            "future_extension": "compartmental-dan-v2 requires evidence-backed compartment-to-DAN assignments",
+        },
         "reinforcement_mode": config.training.reinforcement_mode,
-        "dopamine_schedule_sha256": schedule_hash,
+        "synthetic_reinforcement_schedule_sha256": schedule_hash,
         "action_schedule_sha256": action_schedule_hash,
+        "state_hash_schedule_sha256": action_schedule_hash,
+        "training_seeds": list(trainer.training_seeds),
+        "exposure_budget_decisions": config.training.max_environment_decisions,
+        "curriculum_ladder": list(config.curriculum.ladder),
+        "curriculum_enabled": config.curriculum.enabled,
         "learner_semantics": (
             "one-sequential-fly"
             if learners == 1

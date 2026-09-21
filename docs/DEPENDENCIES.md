@@ -41,8 +41,9 @@ The implementation distinguishes evidence from modelling choices:
 | Bennett et al. 2021, DOI `10.1038/s41467-021-22592-4` | A computational precedent for KC->MBON plasticity and reinforcement signals | A requirement for an external learned critic; V1 begins with absolute outcome pulses |
 | Gerstner et al. 2018, DOI `10.3389/fncir.2018.00053` | Eligibility traces as a transparent three-factor modelling convention | Fly-specific eligibility constants |
 
-The fixed sensory random projection, structured motor pools, dopamine pulse
-magnitudes, trace decay, efficacy bounds, simplified LIF model, and decision-
+The field-aware synthetic sensory projection, reward-free calibrated motor
+pools, synthetic reinforcement magnitudes, trace decay, efficacy bounds,
+simplified LIF model, and decision-
 scale timing are Flylatro-specific engineering choices. They are versioned in
 configuration and checkpoint hashes and must be calibrated empirically rather
 than described as measured biological constants.

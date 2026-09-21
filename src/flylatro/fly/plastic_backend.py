@@ -21,10 +21,9 @@ from flylatro.fly.torch_backend import (
 class PlasticTorchFlyWireBackend(TorchFlyWireBackend):
     """Torch LIF backend whose only mutable weights are known KC->MBON pairs.
 
-    A backend instance executes one efficacy vector at a time. Independent
-    learners share the artifact/topology at the orchestrator level and are
-    evaluated sequentially or by separate backend instances; weights are never
-    mixed across learners.
+    Fixed recurrence is one shared sparse matrix.  The plastic contribution is
+    gathered and scatter-added per batch row, so independent efficacy vectors
+    run in one simulation without duplicating the 3.7M-edge fixed graph.
     """
 
     backend_version = "flywire-shiu-torch-plastic-kc-mbon-v1"
@@ -39,6 +38,7 @@ class PlasticTorchFlyWireBackend(TorchFlyWireBackend):
         readout_indices: Sequence[int] | None = None,
         record_events: bool = False,
         shuffle_seed: int | None = None,
+        shuffle_scope: str = "whole_brain",
     ) -> None:
         super().__init__(
             artifact,
@@ -48,6 +48,7 @@ class PlasticTorchFlyWireBackend(TorchFlyWireBackend):
             record_events=record_events,
             shuffle_seed=shuffle_seed,
             shuffle_preserve_populations=shuffle_seed is not None,
+            shuffle_scope=shuffle_scope,
         )
         self.plastic_topology = topology
         torch = self.torch
@@ -70,31 +71,61 @@ class PlasticTorchFlyWireBackend(TorchFlyWireBackend):
             dtype=torch.float32,
             device=self.device,
         )
-        self._efficacy = np.ones(topology.edge_count, dtype=np.float32)
+        self._plastic_pre = torch.as_tensor(
+            topology.pre_indices, dtype=torch.int64, device=self.device
+        )
+        self._plastic_post = torch.as_tensor(
+            topology.post_indices, dtype=torch.int64, device=self.device
+        )
+        with torch.no_grad():
+            self.weights.values().index_fill_(0, self._plastic_positions, 0.0)
+        self._efficacy = torch.ones(
+            (1, topology.edge_count), dtype=torch.float32, device=self.device
+        )
 
     @property
     def efficacy(self) -> NDArray[np.float32]:
-        return self._efficacy.copy()
+        return self._efficacy.detach().cpu().numpy().copy()
 
     def set_plastic_efficacy(self, efficacy: NDArray[np.floating]) -> None:
-        values = np.asarray(efficacy, dtype=np.float32)
-        if values.shape != (self.plastic_topology.edge_count,):
-            raise ValueError("efficacy vector does not match plastic topology")
-        if not np.isfinite(values).all() or np.any(values < 0):
-            raise ValueError("efficacy must be finite and non-negative")
         torch = self.torch
-        effective = self._plastic_anatomical * torch.as_tensor(
-            values, dtype=torch.float32, device=self.device
-        )
-        # The COO structure and every fixed value remain shared. Updating the
-        # existing coalesced value buffer touches only identified plastic
-        # positions instead of copying/re-coalescing all ~3.7M whole-brain
-        # connections for every decision.
-        with torch.no_grad():
-            self.weights.values().index_copy_(
-                0, self._plastic_positions, effective
+        if hasattr(efficacy, "detach"):
+            tensor = efficacy.detach().to(device=self.device, dtype=self.torch.float32)
+        else:
+            tensor = self.torch.as_tensor(
+                np.asarray(efficacy, dtype=np.float32),
+                dtype=self.torch.float32,
+                device=self.device,
             )
-        self._efficacy = values.copy()
+        if tensor.ndim == 1:
+            tensor = tensor[None, :]
+        if tensor.ndim != 2 or tensor.shape[1] != self.plastic_topology.edge_count:
+            raise ValueError("efficacy batch does not match plastic topology")
+        if not bool(self.torch.isfinite(tensor).all()) or bool((tensor < 0).any()):
+            raise ValueError("efficacy must be finite and non-negative")
+        with torch.no_grad():
+            self._efficacy = tensor.clone()
+
+    def _recurrent(self, spikes: object) -> object:
+        torch = self.torch
+        fixed = torch.sparse.mm(self.weights, spikes.T).T
+        if self._efficacy.shape[0] != spikes.shape[0]:
+            if self._efficacy.shape[0] == 1:
+                efficacy = self._efficacy.expand(spikes.shape[0], -1)
+            else:
+                raise ValueError("plastic efficacy batch differs from neural batch")
+        else:
+            efficacy = self._efficacy
+        contribution = (
+            spikes.index_select(1, self._plastic_pre)
+            * efficacy
+            * self._plastic_anatomical[None, :]
+        )
+        plastic = torch.zeros_like(fixed)
+        plastic.scatter_add_(
+            1, self._plastic_post[None, :].expand(spikes.shape[0], -1), contribution
+        )
+        return fixed + plastic
 
     def propagate_once(
         self, activity: NDArray[np.floating]
@@ -108,7 +139,7 @@ class PlasticTorchFlyWireBackend(TorchFlyWireBackend):
         if values.ndim != 2 or values.shape[1] != self.neuron_count:
             raise ValueError("activity has the wrong neuron dimension")
         tensor = self.torch.as_tensor(values, dtype=self.torch.float32, device=self.device)
-        result = self.torch.sparse.mm(self.weights, tensor.T).T
+        result = self._recurrent(tensor)
         array = result.detach().cpu().numpy().astype(np.float32, copy=False)
         return array[0] if one_row else array
 
@@ -116,13 +147,20 @@ class PlasticTorchFlyWireBackend(TorchFlyWireBackend):
 @dataclass(frozen=True, slots=True)
 class PlasticFlyDecisionActivity:
     output_activity: NDArray[np.float32]
-    edge_pre_activity: NDArray[np.float32]
-    edge_post_activity: NDArray[np.float32]
+    edge_pre_activity: object
+    edge_post_activity: object
     kc_activity: NDArray[np.float32]
     mbon_activity: NDArray[np.float32]
     dan_activity: NDArray[np.float32]
     descending_activity: NDArray[np.float32]
     duration_ms: float
+    activity_unit: str
+    event_batch: NDArray[np.int64] | None = None
+    event_neuron_ids: NDArray[np.int64] | None = None
+    event_times_ms: NDArray[np.float32] | None = None
+    stimulation_batch: NDArray[np.int64] | None = None
+    stimulation_neuron_ids: NDArray[np.int64] | None = None
+    stimulation_rates_hz: NDArray[np.float32] | None = None
 
 
 class PlasticFlyProcessor:
@@ -174,6 +212,11 @@ class PlasticFlyProcessor:
             )
         self._readout_position = np.full(backend.neuron_count, -1, dtype=np.int64)
         self._readout_position[required] = np.arange(len(required), dtype=np.int64)
+        self._readout_position_device = backend.torch.as_tensor(
+            self._readout_position,
+            dtype=backend.torch.int64,
+            device=backend.device,
+        )
         self._kc_indices = np.unique(topology.pre_indices)
         self._mbon_indices = np.unique(topology.post_indices)
         self._dan_indices = backend.artifact.dan_indices
@@ -212,46 +255,43 @@ class PlasticFlyProcessor:
         efficacy: NDArray[np.floating],
     ) -> PlasticFlyDecisionActivity:
         batch = next(iter(observations.values())).shape[0]
-        efficacy_values = np.asarray(efficacy, dtype=np.float32)
-        if efficacy_values.shape != (batch, self.topology.edge_count):
+        efficacy_values = efficacy
+        if tuple(efficacy_values.shape) != (batch, self.topology.edge_count):
             raise ValueError("one efficacy vector is required per independent fly")
         if len(fly_seeds) != batch:
             raise ValueError("one fly seed is required per independent fly")
-        output_rows = []
-        edge_pre_rows = []
-        edge_post_rows = []
-        kc_rows = []
-        mbon_rows = []
-        descending_rows = []
-        dan_rows = []
-        for row in range(batch):
-            one = {key: value[row : row + 1] for key, value in observations.items()}
-            stimulus: Stimulus = self.encoder.encode(one)
-            self.backend.set_plastic_efficacy(efficacy_values[row])
-            self.backend.reset(1, (int(fly_seeds[row]),))
-            activity: TorchFlyActivity = self.backend.simulate_tensor(
-                stimulus, self.duration_ms
+        stimulus: Stimulus = self.encoder.encode(observations)
+        self.backend.set_plastic_efficacy(efficacy_values)
+        self.backend.reset(batch, tuple(int(seed) for seed in fly_seeds))
+        activity: TorchFlyActivity = self.backend.simulate_tensor(stimulus, self.duration_ms)
+        stimulation_batch, stimulation_indices = np.nonzero(stimulus.rates_hz > 0)
+        rates_device = activity.spike_counts.to(dtype=self.backend.torch.float32)
+        rates_device /= self.duration_ms / 1000.0
+        rates = rates_device.detach().cpu().numpy()
+        def selected(indices: NDArray[np.int64]) -> NDArray[np.float32]:
+            return rates[:, self._readout_position[indices]]
+        def selected_device(indices: NDArray[np.int64]) -> object:
+            positions = self._readout_position_device.index_select(
+                0,
+                self.backend.torch.as_tensor(
+                    indices, dtype=self.backend.torch.int64, device=self.backend.device
+                ),
             )
-            rates = (
-                activity.spike_counts.detach().cpu().numpy().astype(np.float32)
-                / (self.duration_ms / 1000.0)
-            )[0]
-            output_rows.append(rates[self._readout_position[self.output_indices]])
-            edge_pre_rows.append(rates[self._readout_position[self.topology.pre_indices]])
-            edge_post_rows.append(rates[self._readout_position[self.topology.post_indices]])
-            kc_rows.append(rates[self._readout_position[self._kc_indices]])
-            mbon_rows.append(rates[self._readout_position[self._mbon_indices]])
-            dan_rows.append(rates[self._readout_position[self._dan_indices]])
-            descending_rows.append(
-                rates[self._readout_position[self.backend.artifact.descending_indices]]
-            )
+            return rates_device.index_select(1, positions)
         return PlasticFlyDecisionActivity(
-            output_activity=np.stack(output_rows),
-            edge_pre_activity=np.stack(edge_pre_rows),
-            edge_post_activity=np.stack(edge_post_rows),
-            kc_activity=np.stack(kc_rows),
-            mbon_activity=np.stack(mbon_rows),
-            dan_activity=np.stack(dan_rows),
-            descending_activity=np.stack(descending_rows),
+            output_activity=selected(self.output_indices),
+            edge_pre_activity=selected_device(self.topology.pre_indices),
+            edge_post_activity=selected_device(self.topology.post_indices),
+            kc_activity=selected(self._kc_indices),
+            mbon_activity=selected(self._mbon_indices),
+            dan_activity=selected(self._dan_indices),
+            descending_activity=selected(self.backend.artifact.descending_indices),
             duration_ms=self.duration_ms,
+            activity_unit="spikes_per_second_hz",
+            event_batch=(activity.event_batch.detach().cpu().numpy().astype(np.int64) if activity.event_batch is not None else None),
+            event_neuron_ids=(activity.event_neuron_ids.detach().cpu().numpy().astype(np.int64) if activity.event_neuron_ids is not None else None),
+            event_times_ms=(activity.event_times_ms.detach().cpu().numpy().astype(np.float32) if activity.event_times_ms is not None else None),
+            stimulation_batch=stimulation_batch.astype(np.int64, copy=False),
+            stimulation_neuron_ids=self.backend.artifact.root_ids[stimulation_indices],
+            stimulation_rates_hz=stimulus.rates_hz[stimulation_batch, stimulation_indices].astype(np.float32, copy=False),
         )

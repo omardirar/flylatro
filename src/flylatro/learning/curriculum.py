@@ -16,8 +16,12 @@ class PlasticCurriculumConfig:
     evaluation_episodes: int = 256
 
     def __post_init__(self) -> None:
-        if tuple(sorted(set(self.ladder))) != self.ladder or self.ladder[-1] != 8:
-            raise ValueError("curriculum ladder must be increasing and end at 8")
+        if not self.ladder or not 1 <= self.ladder[0] <= 8 or tuple(sorted(set(self.ladder))) != self.ladder or (
+            len(self.ladder) > 1 and self.ladder[-1] != 8
+        ):
+            raise ValueError(
+                "curriculum ladder must be increasing and either contain one fixed Ante or end at 8"
+            )
         if not 0 <= self.promotion_win_rate <= 1:
             raise ValueError("promotion_win_rate must be in [0, 1]")
         if min(self.evaluation_every_decisions, self.evaluation_episodes) < 1:

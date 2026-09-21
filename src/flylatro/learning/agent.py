@@ -72,7 +72,8 @@ class PlasticFlyAgent:
 
     @property
     def plastic_parameter_count(self) -> int:
-        return self.plasticity.state.efficacy.size
+        efficacy = self.plasticity.state.efficacy
+        return int(efficacy.numel() if hasattr(efficacy, "numel") else efficacy.size)
 
     def act(
         self,
@@ -82,6 +83,8 @@ class PlasticFlyAgent:
         fly_seeds: Sequence[int],
         deterministic_motor: bool,
         record_eligibility: bool = True,
+        motor_learner_ids: Sequence[int] | None = None,
+        motor_decision_ids: Sequence[int] | None = None,
     ) -> PlasticDecision:
         batch = next(iter(observations.values())).shape[0]
         if batch != self.plasticity.state.learners:
@@ -98,7 +101,11 @@ class PlasticFlyAgent:
                 neural.edge_pre_activity, neural.edge_post_activity
             )
         actions = self.motor.decode(
-            neural.output_activity, masks, deterministic=deterministic_motor
+            neural.output_activity,
+            masks,
+            deterministic=deterministic_motor,
+            learner_ids=(None if motor_learner_ids is None else np.asarray(motor_learner_ids)),
+            decision_ids=(None if motor_decision_ids is None else np.asarray(motor_decision_ids)),
         )
         return PlasticDecision(actions=actions, neural=neural)
 
@@ -129,4 +136,11 @@ class PlasticFlyAgent:
         for index, info in enumerate(infos):
             if isinstance(info.get("episode"), dict):
                 self.plasticity.state.episode_count[index] += 1
+                # The terminal outcome must first update the persistent
+                # efficacy, then both fast traces are cleared for this learner
+                # only. Auto-reset environments can otherwise leak terminal
+                # credit into the next episode.
+                self.plasticity.state.reset_fast_traces(
+                    learners=(index,), eligibility=True
+                )
         return LearningResult(pulses=pulses, events=events)

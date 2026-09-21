@@ -5,6 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 import hashlib
 import json
+from pathlib import Path
 from typing import Mapping
 
 import numpy as np
@@ -25,6 +26,7 @@ from flylatro.env.upstream_contract import (
     empty_action_batch,
     validate_batch,
 )
+from flylatro.seeds import derive_seed
 
 
 HEAD_SIZES: dict[str, int] = {
@@ -49,6 +51,9 @@ class MotorMapping:
     exploration_epsilon: float = 0.0
     exploration_temperature: float = 1.0
     exploration_seed: int = 0
+    selection_method: str = "legacy-round-robin"
+    calibration_sha256: str | None = None
+    calibration_stats: Mapping[str, object] | None = None
 
     def __post_init__(self) -> None:
         if self.mode not in {"mbon_direct", "whole_brain"}:
@@ -79,6 +84,9 @@ class MotorMapping:
             "exploration_epsilon": self.exploration_epsilon,
             "exploration_temperature": self.exploration_temperature,
             "exploration_seed": self.exploration_seed,
+            "selection_method": self.selection_method,
+            "calibration_sha256": self.calibration_sha256,
+            "calibration_stats": self.calibration_stats,
         }
         digest = hashlib.sha256(
             json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
@@ -100,8 +108,110 @@ class MotorMapping:
             "exploration_epsilon": self.exploration_epsilon,
             "exploration_temperature": self.exploration_temperature,
             "exploration_seed": self.exploration_seed,
+            "selection_method": self.selection_method,
+            "calibration_sha256": self.calibration_sha256,
+            "calibration_stats": self.calibration_stats,
             "sha256": self.sha256,
         }
+
+    def save(self, path: Path) -> Path:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(self.to_manifest(), indent=2, sort_keys=True) + "\n")
+        return path
+
+    @classmethod
+    def load(cls, path: Path) -> "MotorMapping":
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        mapping = cls(
+            version=str(payload["version"]),
+            mode=str(payload["mode"]),
+            output_root_ids=np.asarray(payload["output_root_ids"], dtype=np.int64),
+            pools={
+                name: tuple(tuple(int(index) for index in pool) for pool in pools)
+                for name, pools in payload["pools"].items()
+            },
+            exploration_epsilon=float(payload["exploration_epsilon"]),
+            exploration_temperature=float(payload["exploration_temperature"]),
+            exploration_seed=int(payload["exploration_seed"]),
+            selection_method=str(payload.get("selection_method", "unknown")),
+            calibration_sha256=payload.get("calibration_sha256"),
+            calibration_stats=payload.get("calibration_stats"),
+        )
+        if payload.get("sha256") != mapping.sha256:
+            raise ValueError("motor mapping artifact hash mismatch")
+        return mapping
+
+    @classmethod
+    def from_reward_free_calibration(
+        cls,
+        output_root_ids: NDArray[np.int64],
+        activity_hz: NDArray[np.floating],
+        *,
+        mode: str,
+        pool_width: int = 3,
+        high_rate_hz: float = 200.0,
+        exploration_epsilon: float = 0.0,
+        exploration_temperature: float = 1.0,
+        exploration_seed: int = 0,
+        calibration_metadata: Mapping[str, object] | None = None,
+    ) -> "MotorMapping":
+        roots = np.asarray(output_root_ids, dtype=np.int64)
+        values = np.asarray(activity_hz, dtype=np.float64)
+        required = sum(HEAD_SIZES.values()) * pool_width
+        if values.ndim != 2 or values.shape[1] != len(roots):
+            raise ValueError("calibration activity must be sample-by-output")
+        if pool_width < 2:
+            raise ValueError("calibrated motor pools must contain at least two neurons")
+        if values.shape[0] < 2 or len(roots) < required or not np.isfinite(values).all():
+            raise ValueError("insufficient finite reward-free motor calibration data")
+        dynamic = np.ptp(values, axis=0)
+        variance = values.var(axis=0)
+        active_fraction = np.mean(values > 0, axis=0)
+        high_fraction = np.mean(values >= high_rate_hz, axis=0)
+        eligible = (active_fraction > 0) & (high_fraction < 1.0)
+        score = dynamic + np.sqrt(variance)
+        # Stable root-ID tie break makes the artifact reproducible.
+        order = np.lexsort((roots, -score))
+        order = order[eligible[order]]
+        if len(order) < required:
+            raise ValueError(
+                f"motor calibration found {len(order)} usable outputs; needs {required}"
+            )
+        selected = order[:required]
+        cursor = 0
+        heads: dict[str, tuple[tuple[int, ...], ...]] = {}
+        for name, size in HEAD_SIZES.items():
+            pools = []
+            for _ in range(size):
+                pools.append(tuple(int(v) for v in selected[cursor:cursor + pool_width]))
+                cursor += pool_width
+            heads[name] = tuple(pools)
+        raw = {
+            "sample_count": int(values.shape[0]),
+            "high_rate_hz": high_rate_hz,
+            "pool_width": pool_width,
+            "usable_output_count": int(len(order)),
+            "selected_root_ids": roots[selected].tolist(),
+            "selected_dynamic_range_hz": dynamic[selected].tolist(),
+            "selected_variance_hz2": variance[selected].tolist(),
+            "reward_used": False,
+            "state_sample_set": dict(calibration_metadata or {}),
+        }
+        calibration_hash = hashlib.sha256(
+            json.dumps(raw, sort_keys=True, separators=(",", ":")).encode()
+        ).hexdigest()
+        return cls(
+            version="reward-free-neural-motor-calibration-v1",
+            mode=mode,
+            output_root_ids=roots.copy(),
+            pools=heads,
+            exploration_epsilon=exploration_epsilon,
+            exploration_temperature=exploration_temperature,
+            exploration_seed=exploration_seed,
+            selection_method="reward-free-activity-dynamic-range",
+            calibration_sha256=calibration_hash,
+            calibration_stats=raw,
+        )
 
     @classmethod
     def round_robin(
@@ -144,7 +254,6 @@ class FixedMotorInterface:
 
     def __init__(self, mapping: MotorMapping) -> None:
         self.mapping = mapping
-        self._rng = np.random.default_rng(mapping.exploration_seed)
 
     def decode(
         self,
@@ -152,11 +261,17 @@ class FixedMotorInterface:
         masks: MaskDict,
         *,
         deterministic: bool = True,
+        learner_ids: NDArray[np.integer] | tuple[int, ...] | None = None,
+        decision_ids: NDArray[np.integer] | tuple[int, ...] | None = None,
     ) -> ActionDict:
         values = np.asarray(activity, dtype=np.float64)
         if values.ndim != 2 or values.shape[1] != len(self.mapping.output_root_ids):
             raise ValueError("motor activity has the wrong shape")
         batch = values.shape[0]
+        learner_keys = np.arange(batch) if learner_ids is None else np.asarray(learner_ids)
+        decision_keys = np.zeros(batch, dtype=np.int64) if decision_ids is None else np.asarray(decision_ids)
+        if learner_keys.shape != (batch,) or decision_keys.shape != (batch,):
+            raise ValueError("motor learner and decision IDs must match batch")
         validate_batch(
             {
                 key: value
@@ -181,10 +296,19 @@ class FixedMotorInterface:
         }
         actions = empty_action_batch(batch)
         for row in range(batch):
+            rng = np.random.default_rng(
+                derive_seed(
+                    "motor-exploration",
+                    self.mapping.exploration_seed,
+                    int(learner_keys[row]),
+                    int(decision_keys[row]),
+                )
+            )
             action_type = self._choose(
                 scores["action_type"][row],
                 masks["action_type_mask"][row],
                 deterministic,
+                rng,
             )
             actions["action_type"][row] = action_type
             if action_type in (
@@ -196,7 +320,7 @@ class FixedMotorInterface:
                 count_mask = np.arange(MAX_CARD_PICKS + 1) <= maximum
                 count_mask[0] = False
                 count = self._choose(
-                    scores["card_count"][row], count_mask, deterministic
+                    scores["card_count"][row], count_mask, deterministic, rng
                 )
                 card_scores = scores["card"][row].copy()
                 card_scores[~available] = -np.inf
@@ -208,7 +332,7 @@ class FixedMotorInterface:
                 maximum = min(MAX_CARD_PICKS, int(available.sum()))
                 count_mask = np.arange(MAX_CARD_PICKS + 1) <= maximum
                 count = self._choose(
-                    scores["card_count"][row], count_mask, deterministic
+                    scores["card_count"][row], count_mask, deterministic, rng
                 )
                 card_scores = scores["card"][row].copy()
                 card_scores[~available] = -np.inf
@@ -250,7 +374,7 @@ class FixedMotorInterface:
             for expected_type, field, head, mask_name in target_specs:
                 if action_type == expected_type:
                     actions[field][row] = self._choose(
-                        scores[head][row], masks[mask_name][row], deterministic
+                        scores[head][row], masks[mask_name][row], deterministic, rng
                     )
                     break
         validate_batch(ACTION_SPEC, actions, batch, "motor actions")
@@ -261,6 +385,7 @@ class FixedMotorInterface:
         scores: NDArray[np.float64],
         legal: NDArray[np.bool_],
         deterministic: bool,
+        rng: np.random.Generator,
     ) -> int:
         if not np.any(legal):
             raise ValueError("motor head has no legal output")
@@ -268,16 +393,17 @@ class FixedMotorInterface:
         legal_scores = scores[legal_indices]
         if deterministic:
             return int(legal_indices[int(np.argmax(legal_scores))])
-        if self._rng.random() < self.mapping.exploration_epsilon:
-            return int(self._rng.choice(legal_indices))
+        if rng.random() < self.mapping.exploration_epsilon:
+            return int(rng.choice(legal_indices))
         shifted = legal_scores / self.mapping.exploration_temperature
         shifted -= shifted.max()
         probabilities = np.exp(shifted)
         probabilities /= probabilities.sum()
-        return int(self._rng.choice(legal_indices, p=probabilities))
+        return int(rng.choice(legal_indices, p=probabilities))
 
     def rng_state(self) -> dict[str, object]:
-        return self._rng.bit_generator.state
+        return {"stateless": True, "version": "per-learner-decision-v1"}
 
     def load_rng_state(self, state: dict[str, object]) -> None:
-        self._rng.bit_generator.state = state
+        if not state:
+            raise ValueError("motor RNG checkpoint metadata is missing")

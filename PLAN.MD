@@ -14,7 +14,7 @@ and descending-neuron activity enough to change fixed action outputs.
 
 Flylatro is connectome-derived and biologically motivated. It is not a faithful
 biophysical model. Synthetic game sensing, simplified LIF dynamics, aggregate
-neuron-pair weights, eligibility traces, scalar dopamine pulses, and fixed game
+neuron-pair weights, eligibility traces, synthetic scalar reinforcement, and fixed game
 motor mappings are engineering abstractions and must be labelled as such.
 
 ## Primary architecture
@@ -28,13 +28,13 @@ observable Balatro state
   -> MBON-direct or downstream descending activity
   -> fixed, zero-parameter motor interface + legal mask
   -> Balatro action and outcome
-  -> fixed outcome-to-dopamine transform
+  -> fixed outcome-to-synthetic-reinforcement transform
   -> eligibility-gated KC->MBON update
 ```
 
 The only persistent trainable parameters in this path are efficacy values for
 existing KC->MBON edges. Membrane, conductance, spike, refractory, eligibility,
-and dopamine traces are dynamic state, not an external policy. There is no PPO
+and internal reinforcement traces are dynamic state, not an external policy. There is no PPO
 actor, trainable decoder, GAE, policy gradient, or external learned critic in
 the primary experiment.
 
@@ -62,16 +62,32 @@ MBON/DAN type names and must retain the unmodified source type; unknown values
 remain unknown. Neuron-pair edges do not establish synapse-level compartment
 location, so V1 must not claim they do.
 
+The builder also records unresolved neurotransmitter neurons, connections and
+synapses dropped for invalid endpoints or unresolved sign, their source-synapse
+fraction, and missing coordinates. Only the published exact 5,177-KC census is
+a hard biological count here; other named populations are fully reported and
+hashed unless a reliable reference justifies a hard gate. KC->MBON diagnostics
+report minimum pair-synapse thresholds 1/2/5/10. The primary default remains
+`minimum_synapse_count = 1`; changing it is an explicit sensitivity experiment
+and changes topology identity.
+
 ## Fixed sensory interface
 
-The encoder represents observable simulator fields only. It must not encode
-hand strength, recommended moves, expected value, or other strategy. Each
-feature drives a fixed-width sample of annotated ALPN projection neurons.
-Assignment is a deterministic random projection (sampling with replacement is
-allowed when channels outnumber inputs) controlled by `sensory_mapping_seed`; a mapping
-manifest stores feature names, neuron indices/root IDs, scaling, version, and
-SHA-256. Matched comparisons use the same mapping; mapping replicates change
-only this seed.
+The plastic encoder is `plastic-balatro-field-aware-v2`. Every pinned upstream
+position is classified as categorical/boolean, bounded ratio, raw count,
+already-log scalar, signed-log scalar, or reserved zero. Categorical and
+boolean values retain amplitude 0/1, raw counts use a documented log bound,
+signed values use dual rails, and already-log values are not divided again by
+a blanket group constant. It encodes observable simulator fields only: never
+hand strength, recommended moves, expected value, or strategy.
+
+Each feature drives a fixed-width sample of annotated ALPN projection neurons.
+Assignment is a seeded deterministic random projection. Collisions use clipped
+accumulation rather than division by total assignments, so unrelated channels
+cannot attenuate a sparse indicator. The mapping artifact stores every
+channel's source/class/transform, exact indices/root IDs, ALPN collision
+quantiles/class distribution, version and SHA-256. Matched comparisons reuse
+the mapping; mapping replicates change only `sensory_mapping_seed`.
 
 Synthetic Balatro features have no natural fly-stimulus interpretation. Using
 anatomical input routes constrains where artificial drive enters but does not
@@ -89,26 +105,30 @@ Per-fly plastic state contains:
 
 - initial and current efficacy;
 - eligibility trace per plastic edge;
-- dopamine trace for appetitive and aversive channels;
+- internal trace for synthetic appetitive and aversive channels;
 - update and bound-hit statistics;
 - decision/episode counters.
 
 Experiment checkpoints additionally carry the environment, motor, NumPy,
 Python and Torch RNG states that drive each learner.
 
-Fast neural state may reset at every decision (the default for V1), but plastic
-state persists across decisions and episodes. Evaluation freezes plasticity.
+Fast neural state resets at every decision by default. Eligibility and
+reinforcement traces persist within an episode, are used by its terminal
+update, and then reset only for the learner that terminated. Efficacy persists
+across episodes. Evaluation freezes plasticity and leaves all traces unchanged.
 
 ## Learning rule
 
-V1 uses a modular three-factor rule. Presynaptic KC activity and postsynaptic
-MBON activity create a decaying local eligibility trace. A later dopamine pulse
-updates only eligible anatomical connections:
+V1 uses the named `three-factor-global-v1` rule. KC and MBON activity are
+scaled by configured fixed `kc_reference_hz` and `mbon_reference_hz`, clipped,
+multiplied edge-wise, decayed and bounded by `max_eligibility`. There is no
+per-decision maximum normalization, so weak activity stays weak. A later
+synthetic reinforcement pulse updates only eligible anatomical connections:
 
 ```text
-e_ij <- lambda_e e_ij + normalized_KC_i * normalized_MBON_j
-D_c  <- lambda_D D_c + pulse_c
-dw_ij = eta * e_ij * (D_appetitive - D_aversive)
+e_ij <- clip(lambda_e e_ij + clip(KC_i/KC_ref) * clip(MBON_j/MBON_ref))
+R_c  <- lambda_R R_c + synthetic_pulse_c
+dw_ij = eta * e_ij * (R_appetitive - R_aversive)
 w_ij <- clip(w_ij + dw_ij, w_min, w_max)
 ```
 
@@ -116,7 +136,11 @@ The default engineering convention strengthens eligible pathways toward active
 MBONs after positive outcomes and weakens them after negative outcomes. It does
 not attempt to assign biological valence to individual MBON types; alternate
 compartment-specific or anti-Hebbian timing rules are separate versioned
-experiments.
+experiments. `EdgeModulationAssignment` supplies the extension contract for
+`compartmental-dan-v2`: compartment identity, edge-specific channel and
+edge-specific sign. V1 does not populate it without defensible annotated
+compartment-to-DAN assignments and never infers synapse locations from a
+neuron-pair edge.
 
 This captures the three-factor idea and the established role of compartmental
 dopamine-gated KC->MBON plasticity, but simplifies synaptic timing, receptor
@@ -138,9 +162,10 @@ Biological basis and modelling context:
 - Gerstner et al. (2018), DOI 10.3389/fncir.2018.00053: eligibility traces as a
   modelling bridge between activity and delayed neuromodulation.
 
-## Fixed reinforcement mapping
+## Fixed synthetic reinforcement mapping
 
-Reward components are transformed by a versioned, non-trainable mapping:
+Reward components are transformed by a versioned, non-trainable mapping into
+synthetic appetitive and aversive scalar channels:
 
 | Outcome | Default pulse |
 |---|---:|
@@ -150,9 +175,10 @@ Reward components are transformed by a versioned, non-trainable mapping:
 | failed run | aversive |
 | Ante-8 success | strongest appetitive |
 
-The transform clips and logs pulses. It never rewards pairs, flushes, Jokers,
+These are not simulated PAM/PPL1 spikes; genuine anatomical DAN activity is
+recorded separately. The transform clips and logs pulses. It never rewards pairs, flushes, Jokers,
 card identities, or a hand-authored action. The shuffled-reward control uses a
-pre-generated deterministic permutation/buffer so outcomes and dopamine have
+pre-generated deterministic permutation/buffer so outcomes and reinforcement have
 the same marginal stream but broken temporal causality.
 
 ## Fixed motor interface
@@ -163,7 +189,13 @@ action type, card count, card slots, and contextual target slots. Legal masks
 set illegal logits to negative infinity. Deterministic mode uses stable argmax
 with index tie-breaking; exploration is optional seeded softmax-temperature
 sampling with an epsilon-uniform branch and is recorded as non-learned
-interface state.
+interface state. Scientific mappings are selected by reward-free neural
+calibration, not consecutive round-robin or single-neuron defaults. Calibration
+rejects silent/high-rate-only outputs, ranks variance and dynamic range, and
+persists population pools (default width two where available), exact root IDs,
+sample seeds/state hashes, criteria and a mapping hash. Canonical output root
+IDs come from the real unshuffled artifact; every matched control reuses the
+same artifact.
 
 Two output modes share the same interface:
 
@@ -181,9 +213,12 @@ configuration, and hash are checkpointed.
 The default scientific unit is one plastic fly experiencing episodes
 sequentially. Environment vectorization may gather experience but must not mix
 independent eligibility or weight state. Parallel experiments use a controlled
-batch of independent flies with shared fixed topology and separate efficacy,
-trace, RNG, curriculum, and checkpoint state. Learned weights are never
-averaged or merged.
+batch of independent flies with one shared fixed sparse whole-brain matrix and
+a batched gather/scatter KC->MBON plastic contribution. No-autograd Torch
+efficacy, eligibility and reinforcement traces can remain on the simulation
+device and are separate per learner. Exploration derives from
+`(motor_seed, learner_id, decision_id)`, so row ordering cannot perturb another
+fly. Learned weights are never averaged or merged.
 
 ## Decision lifecycle
 
@@ -194,10 +229,11 @@ averaged or merged.
 5. Measure Mode A MBON or Mode B descending populations.
 6. Select a legal action with the fixed motor interface.
 7. Step Balatro and decompose strategy-neutral outcomes.
-8. Transform the outcome into fixed dopamine channels.
+8. Transform the outcome into fixed synthetic reinforcement channels.
 9. The just-completed decision's KC/MBON activity has already extended its
    eligibility trace; apply the resulting outcome pulse to that trace.
-10. Persist plastic state and diagnostics.
+10. If terminal, reset that learner's eligibility/reinforcement traces after
+    the update while preserving efficacy; persist state and diagnostics.
 
 This decision-scale eligibility ordering is versioned because it compresses
 within-trial biological timing into one game transition and is a material
@@ -205,11 +241,12 @@ experimental assumption.
 
 ## Training, curriculum, and evaluation
 
-Training retains the Ante ladder `1, 2, 3, 5, 8`, disjoint training,
-curriculum-validation, validation, final-test, and showcase seeds, and held-out
-promotion. Budgets are environment decisions and seed sequences, not optimiser
-updates. Evaluation loads the same fly and disables every plastic update while
-freezing the plastic-weight hash.
+Ante-1 uses a single-level `[1]` target with no promotion evaluation. Only
+after its acceptance does training enable the retained Ante ladder
+`1, 2, 3, 5, 8`, disjoint training, curriculum-validation, validation,
+final-test, and showcase seeds, and held-out promotion. Budgets are environment
+decisions and seed sequences, not optimiser updates. Evaluation loads the same
+fly and disables every plastic update while freezing the plastic-weight hash.
 
 Report win rate, Ante distribution, episode length, decisions, available score
 metrics, action entropy, neural activity, plasticity events, changed-synapse
@@ -221,11 +258,15 @@ Required conditions are:
 
 1. real topology + KC->MBON plasticity;
 2. identical real fly with learning rate zero;
-3. degree/weight-preserving shuffled topology + the same plasticity rule;
-4. real fly + deterministically shuffled reinforcement timing;
-5. deterministic sensory-mapping replicates;
-6. archived fixed-reservoir/PPO baseline;
-7. conventional ML and random-legal external references.
+3. `kc_mbon_shuffled`, changing only KC->MBON postsynaptic labels while
+   preserving all other edges, edge weights/count, KC out-degree and the MBON
+   in-degree distribution;
+4. `whole_brain_shuffled`, the distinct broader population-preserving label
+   permutation;
+5. real fly + deterministically shuffled synthetic reinforcement timing;
+6. deterministic sensory-mapping replicates;
+7. archived fixed-reservoir/PPO baseline;
+8. conventional ML and random-legal external references.
 
 Primary comparisons match environment decisions, seed order, curriculum,
 reinforcement map, motor map, and (except mapping replicates) sensory map.
@@ -234,28 +275,35 @@ Record wall time, hardware, episodes, plasticity events, and GPU usage.
 ## Checkpoints and replay
 
 A plastic checkpoint contains current and initial efficacy, eligibility and
-dopamine traces, optional fast neural state, counters, curriculum, all RNG
+internal reinforcement traces, optional fast neural state, counters, curriculum, all RNG
 states, environment snapshot where supported, fixed topology/artifact hash,
 population census/hash, plasticity rule/config hash, sensory/motor/reinforcement
 mapping payloads and hashes, experiment configuration, Git revision, and
 software/hardware metadata. Restore must reproduce future weight changes.
 
 Existing deterministic simulator/live replay remains. Selected recordings add
-KC, MBON, DAN and descending activity, dopamine pulses, and sparse plasticity
-events or periodic weight snapshots. Full plastic matrices are never recorded
+KC, MBON, genuine DAN anatomy and descending activity, honestly labelled
+synthetic reinforcement, and sparse plasticity events or periodic snapshots.
+The optional frozen showcase also records true simulated spike times and input
+stimulation. Parquet is streamed one decision per row group with dictionary
+roles/kinds, and visualization reads selected row groups. Full plastic matrices are never recorded
 per timestep. Visual coordinates use one persisted whole-artifact transform;
 frames may change activity but never rescale or move anatomy.
 
 ## Diagnostics and safety gates
 
-Cheap synthetic tests precede real-data runs. They measure KC sparsity/rates,
-MBON and descending activity, same-state variability, state separability,
-silent/saturated fractions, eligibility and dopamine magnitude, update sizes,
+Cheap synthetic tests precede real-data runs. Real representation metrics are
+explicit spike rates in Hz and include KC/MBON/descending distributions,
+within/between-state variance and distance, separation ratio, silent/high-rate
+fractions, motor option coverage/dynamic range, eligibility magnitude, update sizes,
 bound fractions, drift, action entropy, and dominance. Fail on non-finite
 state, zero updates despite eligible reinforcement, uncontrolled saturation,
 or a silent/constant motor interface.
 
-Full artifact builds, whole-brain simulations, long training, large recording,
+`flylatro-preflight` combines artifact/data quality, sensory collisions,
+representation, motor, plasticity, reward mapping, trace reset, checkpoint,
+benchmark, control and zero-external-policy evidence into PASS/WARN/FAIL with
+configured thresholds. Full artifact builds, whole-brain simulations, long training, large recording,
 and final tests require `--full`, `--heavy`, or the existing final-test unlock.
 Local completion is based on tiny circuits and short mock-environment runs;
 scientific claims remain gated on the dedicated GPU machine.

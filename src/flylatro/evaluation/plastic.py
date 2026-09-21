@@ -12,6 +12,7 @@ from flylatro.env.balatro_sim import ArrayBalatroEnv, action_batch_row_to_compos
 from flylatro.evaluation.state_hash import hash_observation_row, terminal_hash
 from flylatro.learning.agent import PlasticFlyAgent
 from flylatro.seeds import derive_seed
+from flylatro.fly.mushroom_body.state import state_numpy
 
 
 @dataclass(frozen=True, slots=True)
@@ -34,9 +35,17 @@ class PlasticEvaluationTransition:
     reward_components: dict[str, float]
     state_hash_before: str
     state_hash_after: str
-    dopamine_appetitive: float
-    dopamine_aversive: float
+    synthetic_appetitive_reinforcement: float
+    synthetic_aversive_reinforcement: float
     done: bool
+
+    @property
+    def dopamine_appetitive(self) -> float:
+        return self.synthetic_appetitive_reinforcement
+
+    @property
+    def dopamine_aversive(self) -> float:
+        return self.synthetic_aversive_reinforcement
 
 
 @dataclass(frozen=True, slots=True)
@@ -74,8 +83,8 @@ def evaluate_plastic_fly(
     if len(seeds) != env.num_envs or env.num_envs != agent.plasticity.state.learners:
         raise ValueError("evaluation needs one seed per independent frozen fly")
     before_hash = agent.plasticity.state.weight_sha256
-    before_eligibility = agent.plasticity.state.eligibility.copy()
-    before_dopamine = agent.plasticity.state.dopamine.copy()
+    before_eligibility = state_numpy(agent.plasticity.state.eligibility).copy()
+    before_dopamine = state_numpy(agent.plasticity.state.dopamine).copy()
     observations, masks = env.reset(seeds)
     run_seeds = tuple(
         str(env.run_seed(index)) if hasattr(env, "run_seed") else str(seeds[index])
@@ -97,6 +106,8 @@ def evaluate_plastic_fly(
             fly_seeds=fly_seeds,
             deterministic_motor=True,
             record_eligibility=False,
+            motor_learner_ids=seeds,
+            motor_decision_ids=tuple(int(value) for value in decisions),
         )
         hashes_before = [
             hash_observation_row(observations, row) for row in range(env.num_envs)
@@ -136,8 +147,8 @@ def evaluate_plastic_fly(
                         if done
                         else hash_observation_row(step.observations, row)
                     ),
-                    dopamine_appetitive=pulses[row].appetitive,
-                    dopamine_aversive=pulses[row].aversive,
+                    synthetic_appetitive_reinforcement=pulses[row].appetitive,
+                    synthetic_aversive_reinforcement=pulses[row].aversive,
                     done=done,
                 )
             )
@@ -166,8 +177,8 @@ def evaluate_plastic_fly(
         raise RuntimeError("frozen evaluation exceeded max_vector_steps")
     if agent.plasticity.state.weight_sha256 != before_hash:
         raise RuntimeError("evaluation changed frozen plastic weights")
-    np.testing.assert_array_equal(agent.plasticity.state.eligibility, before_eligibility)
-    np.testing.assert_array_equal(agent.plasticity.state.dopamine, before_dopamine)
+    np.testing.assert_array_equal(state_numpy(agent.plasticity.state.eligibility), before_eligibility)
+    np.testing.assert_array_equal(state_numpy(agent.plasticity.state.dopamine), before_dopamine)
     return PlasticEvaluationResult(
         episodes=tuple(episodes),
         transitions=tuple(transitions),
@@ -202,28 +213,38 @@ def _record_neural_state(
 
     record_population("kc_root_ids", neural.kc_activity, "kc")
     record_population("mbon_root_ids", neural.mbon_activity, "mbon")
-    record_population("dan_root_ids", neural.dan_activity, "dan")
+    record_population("dan_root_ids", neural.dan_activity, "dan_anatomy")
     record_population(
         "descending_root_ids", neural.descending_activity, "descending"
     )
-    for root_attr, magnitude in (
-        ("pam_root_ids", pulse.appetitive),
-        ("ppl1_root_ids", pulse.aversive),
+    if neural.stimulation_batch is not None:
+        selected_stimulation = neural.stimulation_batch == row
+        recorder.record(
+            decision_id=decision_id,
+            times_ms=np.zeros(int(np.count_nonzero(selected_stimulation)), dtype=np.float32),
+            neuron_ids=neural.stimulation_neuron_ids[selected_stimulation],
+            roles=np.full(int(np.count_nonzero(selected_stimulation)), "input", dtype=object),
+            activities=neural.stimulation_rates_hz[selected_stimulation],
+            event_kind="stimulation",
+        )
+    # These are scalar outcome channels supplied by the Balatro interface.
+    # They are not simulated spikes from anatomical PAM/PPL1 neurons.
+    for sentinel, role, magnitude in (
+        (-1, "synthetic_appetitive", pulse.appetitive),
+        (-2, "synthetic_aversive", pulse.aversive),
     ):
-        roots = np.asarray(getattr(processor, root_attr), dtype=np.int64)
-        if magnitude > 0 and len(roots):
+        if magnitude > 0:
             recorder.record(
                 decision_id=decision_id,
-                times_ms=np.full(len(roots), neural.duration_ms, dtype=np.float32),
-                neuron_ids=roots,
-                roles=np.full(len(roots), "dan", dtype=object),
-                activities=np.full(len(roots), magnitude, dtype=np.float32),
-                event_kind="dopamine",
+                times_ms=[neural.duration_ms],
+                neuron_ids=[sentinel],
+                roles=[role],
+                activities=[magnitude],
+                event_kind="synthetic_reinforcement",
             )
-    delta = (
-        agent.plasticity.state.efficacy[row]
-        - agent.plasticity.state.initial_efficacy[row]
-    )
+    efficacy = state_numpy(agent.plasticity.state.efficacy)
+    initial_efficacy = state_numpy(agent.plasticity.state.initial_efficacy)
+    delta = efficacy[row] - initial_efficacy[row]
     changed = np.flatnonzero(delta)
     if len(changed):
         selected = changed[np.argsort(np.abs(delta[changed]))[-256:]]
@@ -234,4 +255,26 @@ def _record_neural_state(
             roles=np.full(len(selected), "plasticity", dtype=object),
             activities=delta[selected].astype(np.float32),
             event_kind="weight_snapshot",
+            pre_root_ids=agent.plasticity.topology.pre_root_ids[selected],
+            post_root_ids=agent.plasticity.topology.post_root_ids[selected],
+            old_efficacy=initial_efficacy[row, selected],
+            new_efficacy=efficacy[row, selected],
+        )
+    if neural.event_batch is not None:
+        selected = neural.event_batch == row
+        roots = neural.event_neuron_ids[selected]
+        roles = np.full(len(roots), "internal", dtype=object)
+        for attr, role in (
+            ("kc_root_ids", "kc"),
+            ("mbon_root_ids", "mbon"),
+            ("dan_root_ids", "dan_anatomy"),
+            ("descending_root_ids", "descending"),
+        ):
+            roles[np.isin(roots, np.asarray(getattr(processor, attr)))] = role
+        recorder.record(
+            decision_id=decision_id,
+            times_ms=neural.event_times_ms[selected],
+            neuron_ids=roots,
+            roles=roles,
+            event_kind="spike",
         )

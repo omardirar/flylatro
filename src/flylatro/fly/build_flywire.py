@@ -114,6 +114,8 @@ def build(source_dir: Path, output_dir: Path) -> tuple[Path, Path]:
             "nt_type": "object",
         },
     )
+    n_connection_rows_source = len(connections)
+    n_synapses_raw_source = int(connections.syn_count.sum())
     root_ids = neurons.root_id.to_numpy(dtype=np.int64)
     pre = np.searchsorted(root_ids, connections.pre_root_id.to_numpy())
     post = np.searchsorted(root_ids, connections.post_root_id.to_numpy())
@@ -123,6 +125,8 @@ def build(source_dir: Path, output_dir: Path) -> tuple[Path, Path]:
         & (root_ids[np.clip(pre, 0, len(root_ids) - 1)] == connections.pre_root_id.to_numpy())
         & (root_ids[np.clip(post, 0, len(root_ids) - 1)] == connections.post_root_id.to_numpy())
     )
+    n_connection_rows_invalid_endpoint = int((~valid).sum())
+    n_synapses_invalid_endpoint = int(connections.loc[~valid, "syn_count"].sum())
     connections = connections.loc[valid].copy()
     connections["pre_idx"] = pre[valid]
     connections["post_idx"] = post[valid]
@@ -144,6 +148,7 @@ def build(source_dir: Path, output_dir: Path) -> tuple[Path, Path]:
         )
     neurons["nt_resolved"] = nt
     neuron_sign = nt.map(NT_SIGN).fillna(0).to_numpy(dtype=np.int8)
+    n_unresolved_nt_neurons = int(np.count_nonzero(neuron_sign == 0))
     neurons["sign"] = neuron_sign
 
     grouped = (
@@ -163,6 +168,8 @@ def build(source_dir: Path, output_dir: Path) -> tuple[Path, Path]:
         grouped.syn_count.to_numpy(dtype=np.float32) * neuron_sign[pre_indices]
     ).astype(np.float32)
     nonzero = signed != 0
+    n_connection_pairs_unresolved_sign = int(np.count_nonzero(~nonzero))
+    n_synapses_unresolved_sign = int(grouped.loc[~nonzero, "syn_count"].sum())
     pre_indices = pre_indices[nonzero]
     post_indices = post_indices[nonzero]
     signed = signed[nonzero]
@@ -275,8 +282,19 @@ def build(source_dir: Path, output_dir: Path) -> tuple[Path, Path]:
         "neuron_table_sha256": sha256_file(neuron_table_path),
         "n_neurons": len(root_ids),
         "n_connection_pairs_source": len(grouped),
+        "n_connection_rows_source": n_connection_rows_source,
+        "n_connection_rows_invalid_endpoint": n_connection_rows_invalid_endpoint,
         "n_connection_entries_nonzero": len(pre_indices),
         "n_synapses_source": int(grouped.syn_count.sum()),
+        "n_synapses_raw_source": n_synapses_raw_source,
+        "n_synapses_invalid_endpoint": n_synapses_invalid_endpoint,
+        "n_unresolved_nt_neurons": n_unresolved_nt_neurons,
+        "n_connection_pairs_unresolved_sign": n_connection_pairs_unresolved_sign,
+        "n_synapses_unresolved_sign": n_synapses_unresolved_sign,
+        "fraction_raw_synapses_dropped": (
+            (n_synapses_invalid_endpoint + n_synapses_unresolved_sign)
+            / max(n_synapses_raw_source, 1)
+        ),
         "n_sensory": len(sensory),
         "n_descending": len(descending),
         "n_kenyon": len(kenyon),

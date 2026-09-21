@@ -53,6 +53,11 @@ flylatro-analyze-synapses = "flylatro.analysis.cli:main"
 flylatro-verify-populations = "flylatro.analysis.populations_cli:main"
 flylatro-diagnose-representation = "flylatro.analysis.representation_cli:main"
 flylatro-shuffle-reward = "flylatro.learning.reward_schedule_cli:main"
+flylatro-create-sensory-mapping = "flylatro.analysis.sensory_cli:main"
+flylatro-calibrate-motor = "flylatro.analysis.motor_calibration_cli:main"
+flylatro-calibrate-plasticity = "flylatro.analysis.calibration_cli:main"
+flylatro-preflight = "flylatro.analysis.preflight_cli:main"
+flylatro-create-protocol = "flylatro.learning.protocol_cli:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]

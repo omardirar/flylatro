@@ -1,4 +1,4 @@
-"""Persisted dopamine schedules for deterministic shuffled-reward controls."""
+"""Persisted synthetic-reinforcement schedules for matched controls."""
 
 from __future__ import annotations
 
@@ -10,7 +10,7 @@ from typing import Any, Sequence, overload
 
 import numpy as np
 
-from flylatro.learning.reinforcement import DopaminePulse
+from flylatro.learning.reinforcement import ReinforcementPulse
 from flylatro.env.upstream_contract import ACTION_SPEC, ActionDict, validate_batch
 
 
@@ -61,11 +61,11 @@ class MatchedActionSchedule(Sequence[MatchedActionStep]):
 
 
 @dataclass(frozen=True, slots=True)
-class DopamineSchedule:
+class ReinforcementSchedule:
     version: str
     source_weight_hash: str
     shuffle_seed: int
-    pulses: tuple[DopaminePulse, ...]
+    pulses: tuple[ReinforcementPulse, ...]
 
     @property
     def payload(self) -> dict[str, Any]:
@@ -98,14 +98,14 @@ class DopamineSchedule:
         return path
 
     @classmethod
-    def load(cls, path: Path) -> "DopamineSchedule":
+    def load(cls, path: Path) -> "ReinforcementSchedule":
         payload = json.loads(path.read_text(encoding="utf-8"))
         schedule = cls(
             version=str(payload["version"]),
             source_weight_hash=str(payload["source_weight_hash"]),
             shuffle_seed=int(payload["shuffle_seed"]),
             pulses=tuple(
-                DopaminePulse(
+                ReinforcementPulse(
                     appetitive=float(item["appetitive"]),
                     aversive=float(item["aversive"]),
                     events=tuple(item.get("events", ())),
@@ -114,29 +114,32 @@ class DopamineSchedule:
             ),
         )
         if schedule.sha256 != payload["schedule_sha256"]:
-            raise ValueError("dopamine schedule hash mismatch")
+            raise ValueError("synthetic reinforcement schedule hash mismatch")
         return schedule
 
     @classmethod
     def shuffled(
         cls,
-        pulses: Sequence[DopaminePulse],
+        pulses: Sequence[ReinforcementPulse],
         *,
         source_weight_hash: str,
         seed: int,
-    ) -> "DopamineSchedule":
+    ) -> "ReinforcementSchedule":
         if len(pulses) < 2:
-            raise ValueError("at least two dopamine events are required")
+            raise ValueError("at least two synthetic reinforcement events are required")
         rng = np.random.default_rng(seed)
         order = rng.permutation(len(pulses))
         if np.array_equal(order, np.arange(len(pulses))):
             order = np.roll(order, 1)
         return cls(
-            version="deterministic-temporal-dopamine-shuffle-v1",
+            version="deterministic-temporal-synthetic-reinforcement-shuffle-v2",
             source_weight_hash=source_weight_hash,
             shuffle_seed=seed,
             pulses=tuple(pulses[int(index)] for index in order),
         )
+
+
+DopamineSchedule = ReinforcementSchedule
 
 
 def load_action_schedule(path: Path) -> tuple[MatchedActionSchedule, str]:

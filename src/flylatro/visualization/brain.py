@@ -18,8 +18,10 @@ ROLE_COLOURS = {
     "readout": "#ff5da2",
     "kc": "#8be28b",
     "mbon": "#ff9f43",
-    "dan": "#b980ff",
+    "dan_anatomy": "#b980ff",
     "descending": "#ff5da2",
+    "synthetic_appetitive": "#55ef72",
+    "synthetic_aversive": "#ff4d5d",
     "plasticity": "#ffffff",
 }
 
@@ -147,7 +149,7 @@ def render_activity_svg(
             f'<title>{int(ids[index])} {html.escape(role)}</title></circle>'
         )
     legend = " ".join(
-        f'<text x="{20 + i * 170}" y="{height - 18}" fill="{colour}">{role}</text>'
+        f'<text x="{20 + (i % 4) * 230}" y="{height - 18 - (i // 4) * 18}" fill="{colour}">{role}</text>'
         for i, (role, colour) in enumerate(ROLE_COLOURS.items())
     )
     svg = (

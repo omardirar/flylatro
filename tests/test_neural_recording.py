@@ -13,6 +13,7 @@ from flylatro.fly.flywire_artifact import EXPECTED_NEURONS, sha256_file
 from flylatro.replay.bundle import ReplayBundleWriter, ReplayIdentity
 from flylatro.replay.neural import NeuralEventRecorder
 from flylatro.visualization.cli import main as visualize_main
+from flylatro.visualization.cli import _read_selected_decisions
 
 
 def _identity() -> ReplayIdentity:
@@ -62,14 +63,24 @@ def test_neural_parquet_and_activity_driven_renderer_round_trip(tmp_path: Path) 
             roles=["internal", "readout"],
             event_kind="spike",
         )
+        recorder.record(
+            decision_id=0,
+            times_ms=[50.0],
+            neuron_ids=[-1],
+            roles=["synthetic_appetitive"],
+            activities=[0.4],
+            event_kind="synthetic_reinforcement",
+        )
         recorder.close()
         writer.attach_neural_file(neural_path)
 
     table = pq.read_table(neural_path)
-    assert table.num_rows == 3
+    assert table.num_rows == 4
     assert table.column("event_kind").to_pylist() == [
-        "stimulation", "spike", "spike"
+        "stimulation", "spike", "spike", "synthetic_reinforcement"
     ]
+    assert "dan" not in table.column("role").to_pylist()
+    assert pq.ParquetFile(neural_path).num_row_groups == 1
 
     artifact_path = _artifact(tmp_path)
     output = tmp_path / "visual"
@@ -112,3 +123,15 @@ def _artifact(tmp_path: Path) -> Path:
         json.dumps(manifest), encoding="utf-8"
     )
     return path
+
+
+def test_streaming_recorder_writes_decision_row_groups_and_filtered_reader(tmp_path: Path) -> None:
+    path = tmp_path / "events.parquet"
+    recorder = NeuralEventRecorder(path)
+    recorder.record(decision_id=0, times_ms=[1], neuron_ids=[10], roles=["kc"])
+    recorder.record(decision_id=1, times_ms=[2], neuron_ids=[11], roles=["mbon"])
+    recorder.close()
+    source = pq.ParquetFile(path)
+    assert source.num_row_groups == 2
+    selected = _read_selected_decisions(source, {1})
+    assert selected.column("decision_id").to_pylist() == [1]

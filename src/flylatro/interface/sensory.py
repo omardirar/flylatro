@@ -5,6 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 import hashlib
 import json
+from pathlib import Path
 
 import numpy as np
 from numpy.typing import NDArray
@@ -12,7 +13,12 @@ from numpy.typing import NDArray
 from flylatro.env.upstream_contract import OBS_SPEC, ObsDict, validate_batch
 from flylatro.fly.encoder import Stimulus
 from flylatro.fly.flywire_artifact import FlyWireArtifact
-from flylatro.fly.upstream_encoder import full_feature_names, observation_features
+from flylatro.fly.plastic_features import (
+    PLASTIC_FEATURE_CHANNELS,
+    channel_manifest,
+    feature_names,
+    observation_features,
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -23,8 +29,10 @@ class SensoryMapping:
     feature_names: tuple[str, ...]
     population_indices: NDArray[np.int64]
     population_root_ids: NDArray[np.int64]
+    available_alpn_root_ids: NDArray[np.int64]
     max_rate_hz: float = 150.0
     input_population_rule: str = "classification.class == ALPN"
+    collision_policy: str = "clipped_sum_preserve_sparse_indicators"
 
     def __post_init__(self) -> None:
         shape = self.population_indices.shape
@@ -32,6 +40,8 @@ class SensoryMapping:
             raise ValueError("population_indices must have shape [features, width]")
         if self.population_root_ids.shape != shape:
             raise ValueError("population root IDs do not match mapping indices")
+        if self.available_alpn_root_ids.ndim != 1 or not len(self.available_alpn_root_ids):
+            raise ValueError("available ALPN root IDs must be a non-empty vector")
         if self.population_indices.size and (
             self.population_indices.min() < 0
             or self.population_indices.max() >= self.neuron_count
@@ -52,12 +62,14 @@ class SensoryMapping:
                     "feature_names": self.feature_names,
                     "max_rate_hz": self.max_rate_hz,
                     "input_population_rule": self.input_population_rule,
+                    "collision_policy": self.collision_policy,
                 },
                 sort_keys=True,
                 separators=(",", ":"),
             ).encode("utf-8")
         )
         digest.update(self.population_root_ids.astype("<i8", copy=False).tobytes())
+        digest.update(self.available_alpn_root_ids.astype("<i8", copy=False).tobytes())
         return digest.hexdigest()
 
     def to_manifest(self) -> dict[str, object]:
@@ -70,8 +82,12 @@ class SensoryMapping:
             "feature_names": list(self.feature_names),
             "population_indices": self.population_indices.tolist(),
             "population_root_ids": self.population_root_ids.tolist(),
+            "available_alpn_root_ids": self.available_alpn_root_ids.tolist(),
             "max_rate_hz": self.max_rate_hz,
             "input_population_rule": self.input_population_rule,
+            "collision_policy": self.collision_policy,
+            "feature_contract": channel_manifest(),
+            "collision_audit": self.collision_audit(),
             "sha256": self.sha256,
         }
 
@@ -92,7 +108,7 @@ class SensoryMapping:
             raise ValueError(
                 "plastic-brain sensory mapping requires annotated ALPN inputs"
             )
-        names = full_feature_names()
+        names = feature_names()
         rng = np.random.default_rng(mapping_seed)
         # More Balatro features exist than ALPNs. Sampling with replacement is
         # an explicit fixed random projection, not a learned encoder.
@@ -104,28 +120,80 @@ class SensoryMapping:
         )
         indices = inputs[positions]
         return cls(
-            version="plastic-balatro-alpn-random-projection-v1",
+            version="plastic-balatro-alpn-random-projection-v2",
             mapping_seed=mapping_seed,
             neuron_count=artifact.neuron_count,
             feature_names=names,
             population_indices=indices,
             population_root_ids=artifact.root_ids[indices],
+            available_alpn_root_ids=artifact.root_ids[inputs].copy(),
             max_rate_hz=max_rate_hz,
             input_population_rule=rule,
         )
 
+    def collision_audit(self) -> dict[str, object]:
+        unique, used_counts = np.unique(self.population_root_ids, return_counts=True)
+        lookup = {int(root): int(count) for root, count in zip(unique, used_counts, strict=True)}
+        counts = np.asarray(
+            [lookup.get(int(root), 0) for root in self.available_alpn_root_ids],
+            dtype=np.int64,
+        )
+        by_class: dict[str, dict[str, object]] = {}
+        for semantic_class in sorted({channel.semantic_class for channel in PLASTIC_FEATURE_CHANNELS}):
+            rows = np.asarray(
+                [index for index, channel in enumerate(PLASTIC_FEATURE_CHANNELS) if channel.semantic_class == semantic_class],
+                dtype=np.int64,
+            )
+            roots = self.population_root_ids[rows].ravel()
+            _, class_counts = np.unique(roots, return_counts=True)
+            by_class[semantic_class] = {
+                "feature_channels": int(len(rows)),
+                "assignments": int(len(roots)),
+                "unique_alpns": int(len(np.unique(roots))),
+                "collision_assignments": int(np.sum(np.maximum(class_counts - 1, 0))),
+                "maximum_same_class_assignments_per_alpn": int(class_counts.max(initial=0)),
+            }
+        percentiles = {
+            name: float(np.quantile(counts, quantile))
+            for name, quantile in (("min", 0), ("median", 0.5), ("p90", 0.9), ("p95", 0.95), ("p99", 0.99), ("max", 1.0))
+        }
+        return {
+            "assignments": int(self.population_root_ids.size),
+            "feature_channels": len(self.feature_names),
+            "population_width": int(self.population_indices.shape[1]),
+            "available_alpns": int(len(self.available_alpn_root_ids)),
+            "unique_alpns": int(len(unique)),
+            "fraction_alpns_used": float(len(unique) / len(self.available_alpn_root_ids)),
+            "colliding_alpns": int(np.count_nonzero(counts > 1)),
+            "collision_assignments": int(np.sum(counts[counts > 1] - 1)),
+            "maximum_features_per_alpn": int(counts.max(initial=0)),
+            "assignments_per_alpn": percentiles,
+            "features_per_alpn_histogram": {
+                str(value): int(np.count_nonzero(counts == value))
+                for value in np.unique(counts)
+            },
+            "collisions_by_feature_class": by_class,
+            "isolated_feature_effective_rates_hz": {
+                "binary_one": {"min": self.max_rate_hz, "median": self.max_rate_hz, "max": self.max_rate_hz},
+                "representative_scalar_0_25": {"min": 0.25 * self.max_rate_hz, "median": 0.25 * self.max_rate_hz, "max": 0.25 * self.max_rate_hz},
+                "note": "clipped-sum policy; values describe one active feature in isolation",
+            },
+            "policy": self.collision_policy,
+        }
+
+    def save(self, path: Path) -> Path:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(self.to_manifest(), indent=2, sort_keys=True) + "\n")
+        return path
+
 
 class FixedPlasticSensoryEncoder:
-    """Averaging collision-safe synthetic drive over fixed input neurons."""
+    """Clipped-sum drive: collisions cannot attenuate an active indicator."""
 
     trainable_parameter_count = 0
 
     def __init__(self, mapping: SensoryMapping) -> None:
         self.mapping = mapping
-        counts = np.zeros(mapping.neuron_count, dtype=np.float32)
-        np.add.at(counts, mapping.population_indices.ravel(), 1.0)
-        counts[counts == 0] = 1.0
-        self._assignment_counts = counts
 
     def encode(self, observations: ObsDict) -> Stimulus:
         if not observations:
@@ -142,7 +210,6 @@ class FixedPlasticSensoryEncoder:
             indices = self.mapping.population_indices[:, width]
             for row in range(batch_size):
                 np.add.at(rates[row], indices, features[row])
-        rates /= self._assignment_counts[None, :]
         rates *= self.mapping.max_rate_hz
         np.clip(rates, 0.0, self.mapping.max_rate_hz, out=rates)
         rates.setflags(write=False)

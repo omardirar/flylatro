@@ -140,10 +140,15 @@ def test_changing_internal_synapses_can_change_fixed_motor_behaviour() -> None:
     alternative = 1 - original_action  # mock exposes only PLAY=0 and DISCARD=1
     topology = stack.agent.plasticity.topology
     state = stack.agent.plasticity.state
-    target_post = stack.agent.processor.spec.kenyon_count + alternative
-    original_post = stack.agent.processor.spec.kenyon_count + original_action
-    state.efficacy[0, topology.post_indices == target_post] = 2.0
-    state.efficacy[0, topology.post_indices == original_post] = 0.2
+    mapping = stack.agent.motor.mapping
+    target_outputs = mapping.pools["action_type"][alternative]
+    original_outputs = mapping.pools["action_type"][original_action]
+    for output in target_outputs:
+        target_post = stack.agent.processor.spec.kenyon_count + output
+        state.efficacy[0, topology.post_indices == target_post] = 2.0
+    for output in original_outputs:
+        original_post = stack.agent.processor.spec.kenyon_count + output
+        state.efficacy[0, topology.post_indices == original_post] = 0.2
 
     changed = stack.agent.act(
         observations,

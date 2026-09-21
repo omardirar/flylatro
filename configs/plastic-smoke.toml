@@ -25,6 +25,9 @@ eligibility_decay = 0.90
 dopamine_decay = 0.0
 min_efficacy = 0.20
 max_efficacy = 2.0
+kc_reference_hz = 20.0
+mbon_reference_hz = 20.0
+max_eligibility = 4.0
 
 [reinforcement]
 progress_scale = 0.05

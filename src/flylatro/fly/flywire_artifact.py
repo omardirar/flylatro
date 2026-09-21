@@ -208,6 +208,7 @@ class FlyWireArtifact:
         *,
         shuffle_seed: int | None = None,
         preserve_populations: bool = False,
+        shuffle_scope: str = "whole_brain",
     ) -> tuple[NDArray[np.int64], NDArray[np.int64], NDArray[np.float32], str]:
         if shuffle_seed is None:
             return (
@@ -216,7 +217,24 @@ class FlyWireArtifact:
                 self.signed_synapse_counts,
                 "real-topology",
             )
+        if shuffle_scope not in {"whole_brain", "kc_mbon"}:
+            raise ValueError("shuffle_scope must be whole_brain or kc_mbon")
         rng = np.random.default_rng(shuffle_seed)
+        if shuffle_scope == "kc_mbon":
+            shuffled_post = self.post_indices.copy()
+            shuffled_mbons = self.mbon_indices.copy()
+            rng.shuffle(shuffled_mbons)
+            remap = np.arange(self.neuron_count, dtype=np.int64)
+            remap[self.mbon_indices] = shuffled_mbons
+            selected = self.kc_mbon_edge_indices
+            shuffled_post[selected] = remap[self.post_indices[selected]]
+            procedure = (
+                "kc-mbon-postsynaptic-label-permutation-v1; changes only "
+                "identified KC->MBON pairs; preserves edge entries, KC out-degree, "
+                "MBON in-degree distribution, weights and all non-KC->MBON edges; "
+                f"seed={shuffle_seed}"
+            )
+            return self.pre_indices, shuffled_post, self.signed_synapse_counts, procedure
         post_label_permutation = np.arange(self.neuron_count, dtype=np.int64)
         if preserve_populations:
             groups = np.zeros(self.neuron_count, dtype=np.int8)

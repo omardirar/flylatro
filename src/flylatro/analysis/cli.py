@@ -25,13 +25,17 @@ def main(argv: Sequence[str] | None = None) -> int:
         choices=(
             "plastic_real",
             "no_plasticity",
-            "shuffled_topology",
+            "kc_mbon_shuffled",
+            "whole_brain_shuffled",
             "shuffled_reward",
         ),
         default="plastic_real",
     )
     parser.add_argument("--sensory-mapping-seed", type=int)
-    parser.add_argument("--dopamine-schedule", type=Path)
+    parser.add_argument(
+        "--reinforcement-schedule", "--dopamine-schedule",
+        dest="reinforcement_schedule", metavar="REINFORCEMENT_SCHEDULE", type=Path,
+    )
     parser.add_argument("--action-schedule", type=Path)
     parser.add_argument("--heavy", action="store_true")
     args = parser.parse_args(argv)
@@ -57,14 +61,14 @@ def main(argv: Sequence[str] | None = None) -> int:
                 action_schedule_path=str(args.action_schedule),
             ),
         )
-    elif args.condition == "shuffled_topology":
+    elif args.condition in {"kc_mbon_shuffled", "whole_brain_shuffled"}:
         config = replace(
             config,
-            fly=replace(config.fly, topology="shuffled"),
-            training=replace(config.training, condition="shuffled_topology"),
+            fly=replace(config.fly, topology=args.condition),
+            training=replace(config.training, condition=args.condition),
         )
     elif args.condition == "shuffled_reward":
-        if args.dopamine_schedule is None or args.action_schedule is None:
+        if args.reinforcement_schedule is None or args.action_schedule is None:
             raise ValueError(
                 "shuffled_reward analysis requires both schedule paths"
             )
@@ -74,7 +78,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 config.training,
                 condition="shuffled_reward",
                 reinforcement_mode="shuffled_schedule",
-                dopamine_schedule_path=str(args.dopamine_schedule),
+                reinforcement_schedule_path=str(args.reinforcement_schedule),
                 action_schedule_path=str(args.action_schedule),
             ),
         )

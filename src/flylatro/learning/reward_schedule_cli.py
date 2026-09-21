@@ -1,4 +1,4 @@
-"""Create a deterministic shuffled-dopamine schedule from a matched real run."""
+"""Create a deterministic shuffled synthetic-reinforcement schedule."""
 
 from __future__ import annotations
 
@@ -8,8 +8,8 @@ from pathlib import Path
 from typing import Sequence
 
 from flylatro.learning.checkpoints import load_plastic_manifest
-from flylatro.learning.reinforcement import DopaminePulse
-from flylatro.learning.reward_schedule import DopamineSchedule
+from flylatro.learning.reinforcement import ReinforcementPulse
+from flylatro.learning.reward_schedule import ReinforcementSchedule
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -23,16 +23,17 @@ def main(argv: Sequence[str] | None = None) -> int:
     with args.events.open(encoding="utf-8") as stream:
         for line in stream:
             row = json.loads(line)
+            items = row.get("synthetic_reinforcement_channels", row.get("pulses", ()))
             pulses.extend(
-                DopaminePulse(
-                    appetitive=float(item["appetitive"]),
-                    aversive=float(item["aversive"]),
+                ReinforcementPulse(
+                    appetitive=float(item.get("synthetic_appetitive", item.get("appetitive", 0.0))),
+                    aversive=float(item.get("synthetic_aversive", item.get("aversive", 0.0))),
                     events=tuple(item.get("events", ())),
                 )
                 for item in row["pulses"]
             )
     manifest = load_plastic_manifest(args.source_checkpoint)
-    schedule = DopamineSchedule.shuffled(
+    schedule = ReinforcementSchedule.shuffled(
         pulses,
         source_weight_hash=manifest["plastic_weight_sha256"],
         seed=args.seed,

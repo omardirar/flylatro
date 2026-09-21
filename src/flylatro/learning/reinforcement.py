@@ -1,4 +1,4 @@
-"""Fixed strategy-neutral outcome to dopamine mapping and reward controls."""
+"""Fixed strategy-neutral synthetic reinforcement mapping and controls."""
 
 from __future__ import annotations
 
@@ -11,21 +11,21 @@ import numpy as np
 
 
 @dataclass(frozen=True, slots=True)
-class DopaminePulse:
+class ReinforcementPulse:
     appetitive: float
     aversive: float
     events: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         if self.appetitive < 0 or self.aversive < 0:
-            raise ValueError("dopamine pulse magnitudes cannot be negative")
+            raise ValueError("synthetic reinforcement magnitudes cannot be negative")
         if not np.isfinite((self.appetitive, self.aversive)).all():
-            raise ValueError("dopamine pulse magnitudes must be finite")
+            raise ValueError("synthetic reinforcement magnitudes must be finite")
 
 
 @dataclass(frozen=True, slots=True)
 class ReinforcementConfig:
-    version: str = "balatro-outcome-dopamine-v1"
+    version: str = "balatro-outcome-synthetic-reinforcement-v2"
     progress_scale: float = 0.05
     blind_clear_pulse: float = 0.40
     ante_clear_pulse: float = 0.80
@@ -64,7 +64,7 @@ class ReinforcementMapper:
         self,
         reward_components: dict[str, float],
         info: dict[str, Any] | None = None,
-    ) -> DopaminePulse:
+    ) -> ReinforcementPulse:
         """Map only generic outcome components, never action/hand strategy."""
 
         info = info or {}
@@ -120,7 +120,7 @@ class ReinforcementMapper:
         negative = self.config.run_failure_pulse if failed else 0.0
         if failed:
             events.append("run_failure")
-        return DopaminePulse(
+        return ReinforcementPulse(
             appetitive=min(positive, self.config.max_total_pulse),
             aversive=min(negative, self.config.max_total_pulse),
             events=tuple(events),
@@ -128,8 +128,8 @@ class ReinforcementMapper:
 
 
 def shuffled_pulse_schedule(
-    pulses: Sequence[DopaminePulse], *, seed: int
-) -> tuple[DopaminePulse, ...]:
+    pulses: Sequence[ReinforcementPulse], *, seed: int
+) -> tuple[ReinforcementPulse, ...]:
     """Offline deterministic temporal shuffle preserving the exact pulse multiset."""
 
     if len(pulses) < 2:
@@ -139,3 +139,8 @@ def shuffled_pulse_schedule(
     if np.array_equal(permutation, np.arange(len(pulses))):
         permutation = np.roll(permutation, 1)
     return tuple(pulses[int(index)] for index in permutation)
+
+
+# Compatibility import for older local checkpoints/tests. Public logs and
+# manifests use the honest synthetic-reinforcement terminology.
+DopaminePulse = ReinforcementPulse

@@ -60,12 +60,18 @@ class PlasticEdgeState:
             self.efficacy.astype("<f4", copy=False).tobytes()
         ).hexdigest()
 
-    def reset_fast_traces(self, *, eligibility: bool = False) -> None:
-        """Dopamine is fast; eligibility is retained unless explicitly reset."""
+    def reset_fast_traces(
+        self,
+        *,
+        learners: NDArray[np.integer] | list[int] | tuple[int, ...] | None = None,
+        eligibility: bool = False,
+    ) -> None:
+        """Reset selected learners' fast traces while preserving efficacy."""
 
-        self.dopamine.fill(0.0)
+        selected = slice(None) if learners is None else np.asarray(learners, dtype=np.int64)
+        self.dopamine[selected] = 0.0
         if eligibility:
-            self.eligibility.fill(0.0)
+            self.eligibility[selected] = 0.0
 
     def state_dict(self) -> dict[str, Any]:
         return {
@@ -102,3 +108,112 @@ class PlasticEdgeState:
         if state.dopamine.shape != (shape[0], 2):
             raise ValueError("checkpoint dopamine state is inconsistent")
         return state
+
+
+class TorchPlasticEdgeState:
+    """No-autograd plastic state resident on the real simulation device."""
+
+    is_torch = True
+
+    def __init__(self, **values: Any) -> None:
+        for name, value in values.items():
+            setattr(self, name, value)
+
+    @classmethod
+    def initialize(
+        cls,
+        edge_count: int,
+        *,
+        learners: int = 1,
+        initial_efficacy: float = 1.0,
+        device: str = "cpu",
+    ) -> "TorchPlasticEdgeState":
+        import torch
+
+        if edge_count < 1 or learners < 1:
+            raise ValueError("edge_count and learners must be positive")
+        shape = (learners, edge_count)
+        initial = torch.full(shape, initial_efficacy, dtype=torch.float32, device=device)
+        return cls(
+            initial_efficacy=initial.clone(),
+            efficacy=initial.clone(),
+            eligibility=torch.zeros(shape, dtype=torch.float32, device=device),
+            dopamine=torch.zeros((learners, 2), dtype=torch.float32, device=device),
+            update_count=torch.zeros(learners, dtype=torch.int64, device=device),
+            decision_count=torch.zeros(learners, dtype=torch.int64, device=device),
+            episode_count=torch.zeros(learners, dtype=torch.int64, device=device),
+            lower_bound_hits=torch.zeros(learners, dtype=torch.int64, device=device),
+            upper_bound_hits=torch.zeros(learners, dtype=torch.int64, device=device),
+        )
+
+    @property
+    def device(self) -> Any:
+        return self.efficacy.device
+
+    @property
+    def learners(self) -> int:
+        return int(self.efficacy.shape[0])
+
+    @property
+    def edge_count(self) -> int:
+        return int(self.efficacy.shape[1])
+
+    @property
+    def weight_sha256(self) -> str:
+        return hashlib.sha256(
+            self.efficacy.detach().cpu().numpy().astype("<f4", copy=False).tobytes()
+        ).hexdigest()
+
+    def reset_fast_traces(
+        self,
+        *,
+        learners: NDArray[np.integer] | list[int] | tuple[int, ...] | None = None,
+        eligibility: bool = False,
+    ) -> None:
+        import torch
+
+        selected: Any = slice(None)
+        if learners is not None:
+            selected = torch.as_tensor(learners, dtype=torch.int64, device=self.device)
+        with torch.no_grad():
+            self.dopamine[selected] = 0.0
+            if eligibility:
+                self.eligibility[selected] = 0.0
+
+    def state_dict(self) -> dict[str, Any]:
+        return {
+            name: getattr(self, name).detach().cpu().numpy()
+            for name in (
+                "initial_efficacy", "efficacy", "eligibility", "dopamine",
+                "update_count", "decision_count", "episode_count",
+                "lower_bound_hits", "upper_bound_hits",
+            )
+        }
+
+    @classmethod
+    def from_state_dict(
+        cls, values: dict[str, Any], *, device: str = "cpu"
+    ) -> "TorchPlasticEdgeState":
+        import torch
+
+        float_names = {"initial_efficacy", "efficacy", "eligibility", "dopamine"}
+        tensors = {
+            name: torch.as_tensor(
+                value,
+                dtype=torch.float32 if name in float_names else torch.int64,
+                device=device,
+            ).clone()
+            for name, value in values.items()
+        }
+        state = cls(**tensors)
+        if state.efficacy.ndim != 2 or state.dopamine.shape != (state.learners, 2):
+            raise ValueError("checkpoint torch plastic state is inconsistent")
+        return state
+
+
+def state_numpy(value: Any) -> np.ndarray:
+    """Convert a state tensor/array only at diagnostics or serialization edges."""
+
+    if hasattr(value, "detach"):
+        return value.detach().cpu().numpy()
+    return np.asarray(value)

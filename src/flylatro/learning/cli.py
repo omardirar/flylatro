@@ -11,6 +11,8 @@ import resource
 import time
 from typing import Sequence
 
+import numpy as np
+
 from flylatro.learning.checkpoints import (
     load_plastic_checkpoint,
     save_plastic_checkpoint,
@@ -22,6 +24,9 @@ from flylatro.learning.curriculum import (
 )
 from flylatro.evaluation.plastic import evaluate_plastic_fly
 from flylatro.telemetry.metrics import MetricLogger
+from flylatro.replay.neural import NeuralEventRecorder
+from flylatro.fly.mushroom_body.state import state_numpy
+from flylatro.fly.flywire_artifact import sha256_file
 
 
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
@@ -36,15 +41,23 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         choices=(
             "plastic_real",
             "no_plasticity",
-            "shuffled_topology",
+            "kc_mbon_shuffled",
+            "whole_brain_shuffled",
             "shuffled_reward",
         ),
     )
     parser.add_argument("--sensory-mapping-seed", type=int)
     parser.add_argument("--output-mode", choices=("mbon_direct", "whole_brain"))
-    parser.add_argument("--dopamine-schedule", type=Path)
+    parser.add_argument(
+        "--reinforcement-schedule", "--dopamine-schedule",
+        dest="reinforcement_schedule", metavar="REINFORCEMENT_SCHEDULE", type=Path,
+    )
     parser.add_argument("--action-schedule", type=Path)
     parser.add_argument("--max-environment-decisions", type=int)
+    parser.add_argument(
+        "--budget-basis",
+        help="measured benchmark or gate name justifying the exposure budget",
+    )
     parser.add_argument("--checkpoint-every-decisions", type=int)
     parser.add_argument(
         "--record-plasticity-events",
@@ -53,7 +66,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument(
         "--curriculum-ladder",
-        help="comma-separated increasing Antes ending at 8, e.g. 1,2,3,5,8",
+        help="one fixed Ante or increasing Antes ending at 8, e.g. 1 or 1,2,3,5,8",
     )
     parser.add_argument("--curriculum-evaluation-every-decisions", type=int)
     parser.add_argument("--curriculum-evaluation-episodes", type=int)
@@ -64,6 +77,10 @@ def main(argv: Sequence[str] | None = None) -> int:
     args = parse_args(argv)
     config = PlasticExperimentConfig.load(args.config)
     config = _apply_overrides(config, args)
+    if config.fly.backend == "flywire" and "PLACEHOLDER" in config.training.budget_basis:
+        raise ValueError(
+            "real training budget is an explicit placeholder; provide --budget-basis and a measured --max-environment-decisions"
+        )
     config.require_heavy_opt_in(args.heavy)
     run_dir = (args.run_dir or _default_run_dir(config)).resolve()
     if run_dir.exists() and args.resume is None and any(run_dir.iterdir()):
@@ -109,10 +126,15 @@ def main(argv: Sequence[str] | None = None) -> int:
         run_id=config.name,
         tensorboard=config.runtime.tensorboard and not args.no_tensorboard,
     ) as metrics:
-        dopamine_stream = (run_dir / "dopamine-events.jsonl").open("a", encoding="utf-8")
+        dopamine_stream = (run_dir / "synthetic-reinforcement-events.jsonl").open("a", encoding="utf-8")
         action_stream = (run_dir / "training-actions.jsonl").open("a", encoding="utf-8")
         plasticity_stream = (
             (run_dir / "plasticity-events.jsonl").open("a", encoding="utf-8")
+            if args.record_plasticity_events
+            else None
+        )
+        plasticity_parquet = (
+            NeuralEventRecorder(run_dir / "plasticity-events.parquet")
             if args.record_plasticity_events
             else None
         )
@@ -152,10 +174,10 @@ def main(argv: Sequence[str] | None = None) -> int:
                     json.dumps(
                         {
                             "environment_decisions": stack.trainer.state.environment_decisions,
-                            "pulses": [
+                            "synthetic_reinforcement_channels": [
                                 {
-                                    "appetitive": pulse.appetitive,
-                                    "aversive": pulse.aversive,
+                                    "synthetic_appetitive": pulse.appetitive,
+                                    "synthetic_aversive": pulse.aversive,
                                     "events": pulse.events,
                                 }
                                 for pulse in stack.trainer.last_learning.pulses
@@ -168,6 +190,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 dopamine_stream.flush()
                 if plasticity_stream is not None:
                     topology = stack.agent.plasticity.topology
+                    efficacy = state_numpy(stack.agent.plasticity.state.efficacy)
                     for event in stack.trainer.last_learning.events:
                         indices = event.changed_edge_indices
                         plasticity_stream.write(
@@ -197,6 +220,37 @@ def main(argv: Sequence[str] | None = None) -> int:
                             )
                             + "\n"
                         )
+                        if plasticity_parquet is not None and indices:
+                            edge_indices = np.asarray(indices, dtype=np.int64)
+                            changes = np.asarray(event.efficacy_changes, dtype=np.float32)
+                            new_values = efficacy[event.learner, edge_indices]
+                            plasticity_parquet.record(
+                                decision_id=stack.trainer.state.vector_steps - 1,
+                                times_ms=np.full(len(edge_indices), stack.agent.processor.duration_ms, dtype=np.float32),
+                                neuron_ids=topology.post_root_ids[edge_indices],
+                                roles=np.full(len(edge_indices), "plasticity", dtype=object),
+                                activities=changes,
+                                event_kind="plasticity",
+                                pre_root_ids=topology.pre_root_ids[edge_indices],
+                                post_root_ids=topology.post_root_ids[edge_indices],
+                                old_efficacy=new_values - changes,
+                                new_efficacy=new_values,
+                            )
+                    if plasticity_parquet is not None:
+                        for pulse in stack.trainer.last_learning.pulses:
+                            for root, role, magnitude in (
+                                (-1, "synthetic_appetitive", pulse.appetitive),
+                                (-2, "synthetic_aversive", pulse.aversive),
+                            ):
+                                if magnitude:
+                                    plasticity_parquet.record(
+                                        decision_id=stack.trainer.state.vector_steps - 1,
+                                        times_ms=[stack.agent.processor.duration_ms],
+                                        neuron_ids=[root],
+                                        roles=[role],
+                                        activities=[magnitude],
+                                        event_kind="synthetic_reinforcement",
+                                    )
                     plasticity_stream.flush()
             if stack.trainer.last_executed_actions is not None:
                 action_stream.write(
@@ -240,12 +294,31 @@ def main(argv: Sequence[str] | None = None) -> int:
             action_stream.close()
             if plasticity_stream is not None:
                 plasticity_stream.close()
+            if plasticity_parquet is not None:
+                plasticity_parquet.close()
+    generated_action_hash = sha256_file(run_dir / "training-actions.jsonl")
+    completed_components = dict(stack.components)
+    if completed_components.get("action_schedule_sha256") is None:
+        completed_components["action_schedule_sha256"] = generated_action_hash
+        completed_components["state_hash_schedule_sha256"] = generated_action_hash
+    elif completed_components["action_schedule_sha256"] != generated_action_hash:
+        raise RuntimeError(
+            "executed matched action schedule bytes differ from the source schedule"
+        )
+    manifest["components"] = completed_components
+    manifest["completed_at"] = datetime.now(timezone.utc).isoformat()
+    (run_dir / "run-manifest.json").write_text(
+        json.dumps(manifest, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+    )
     final_path = run_dir / "plastic-checkpoint-final.pkl"
     save_plastic_checkpoint(
         final_path,
         stack.trainer,
         experiment_config=config.to_dict(),
-        component_metadata=stack.components,
+        component_metadata={
+            **stack.components,
+            "executed_action_schedule_sha256": generated_action_hash,
+        },
         curriculum_state=(curriculum.state_dict() if curriculum is not None else None),
     )
     summary = {
@@ -305,6 +378,8 @@ def _apply_overrides(
         training = replace(
             training, max_environment_decisions=args.max_environment_decisions
         )
+    if args.budget_basis is not None:
+        training = replace(training, budget_basis=args.budget_basis)
     if args.checkpoint_every_decisions is not None:
         training = replace(
             training,
@@ -340,20 +415,20 @@ def _apply_overrides(
                 args.action_schedule or training.action_schedule_path
             ),
         )
-    elif condition == "shuffled_topology":
-        fly = replace(fly, topology="shuffled")
+    elif condition in {"kc_mbon_shuffled", "whole_brain_shuffled"}:
+        fly = replace(fly, topology=condition)
         training = replace(training, condition=condition)
     elif condition == "shuffled_reward":
-        if args.dopamine_schedule is None and not training.dopamine_schedule_path:
-            raise ValueError("shuffled_reward requires --dopamine-schedule")
+        if args.reinforcement_schedule is None and not training.reinforcement_schedule_path:
+            raise ValueError("shuffled_reward requires --reinforcement-schedule")
         if args.action_schedule is None and not training.action_schedule_path:
             raise ValueError("shuffled_reward requires --action-schedule")
         training = replace(
             training,
             condition=condition,
             reinforcement_mode="shuffled_schedule",
-            dopamine_schedule_path=str(
-                args.dopamine_schedule or training.dopamine_schedule_path
+            reinforcement_schedule_path=str(
+                args.reinforcement_schedule or training.reinforcement_schedule_path
             ),
             action_schedule_path=str(
                 args.action_schedule or training.action_schedule_path

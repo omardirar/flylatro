@@ -16,6 +16,7 @@ from flylatro.learning.agent import LearningResult, PlasticDecision, PlasticFlyA
 from flylatro.learning.reinforcement import DopaminePulse
 from flylatro.learning.reward_schedule import MatchedActionStep
 from flylatro.seeds import derive_seed
+from flylatro.fly.mushroom_body.state import state_numpy
 
 
 @dataclass(frozen=True, slots=True)
@@ -117,6 +118,10 @@ class PlasticTrainer:
             self.masks,
             fly_seeds=fly_seeds,
             deterministic_motor=self.config.deterministic_motor,
+            motor_learner_ids=self.training_seeds,
+            motor_decision_ids=tuple(
+                int(value) for value in self.agent.plasticity.state.decision_count
+            ),
         )
         executed_actions = (
             scheduled.actions
@@ -170,9 +175,10 @@ class PlasticTrainer:
             self.state.episode_returns.append(float(episode.get("r", 0.0)))
             self.state.episode_antes.append(int(episode.get("ante", 0)))
             self.state.wins += bool(episode.get("won", False))
-        efficacy = self.agent.plasticity.state.efficacy
-        eligibility = self.agent.plasticity.state.eligibility
-        dopamine = self.agent.plasticity.state.dopamine
+        efficacy = state_numpy(self.agent.plasticity.state.efficacy)
+        eligibility = state_numpy(self.agent.plasticity.state.eligibility)
+        dopamine = state_numpy(self.agent.plasticity.state.dopamine)
+        initial_efficacy = state_numpy(self.agent.plasticity.state.initial_efficacy)
         action_probabilities = np.asarray(
             self.state.action_type_counts, dtype=np.float64
         )
@@ -193,7 +199,7 @@ class PlasticTrainer:
             ),
             "plasticity/mean_efficacy": float(efficacy.mean()),
             "plasticity/absolute_change": float(
-                np.abs(efficacy - self.agent.plasticity.state.initial_efficacy).sum()
+                np.abs(efficacy - initial_efficacy).sum()
             ),
             "plasticity/eligibility_mean": float(np.abs(eligibility).mean()),
             "plasticity/dopamine_trace_mean_absolute": float(
@@ -288,8 +294,13 @@ class PlasticTrainer:
     def load_state_dict(self, values: dict[str, Any]) -> None:
         if tuple(values["training_seeds"]) != self.training_seeds:
             raise ValueError("checkpoint training seeds differ")
-        restored = type(self.agent.plasticity.state).from_state_dict(
-            values["plastic_state"]
+        state_type = type(self.agent.plasticity.state)
+        restored = (
+            state_type.from_state_dict(
+                values["plastic_state"], device=str(self.agent.plasticity.state.device)
+            )
+            if getattr(self.agent.plasticity.state, "is_torch", False)
+            else state_type.from_state_dict(values["plastic_state"])
         )
         if restored.efficacy.shape != self.agent.plasticity.state.efficacy.shape:
             raise ValueError("checkpoint plastic state shape differs")

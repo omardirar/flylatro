@@ -38,6 +38,7 @@ class PlasticEdgeTopology:
     kc_types: NDArray[np.str_]
     mbon_types: NDArray[np.str_]
     compartments: NDArray[np.str_]
+    minimum_synapse_count: int = 1
 
     def __post_init__(self) -> None:
         arrays = (
@@ -59,6 +60,8 @@ class PlasticEdgeTopology:
             raise ValueError("anatomical weights must be finite")
         if np.any(self.anatomical_weights <= 0):
             raise ValueError("KC->MBON anatomical weights must be excitatory")
+        if self.minimum_synapse_count < 1:
+            raise ValueError("minimum_synapse_count must be at least one")
 
     @property
     def edge_count(self) -> int:
@@ -68,6 +71,7 @@ class PlasticEdgeTopology:
     def sha256(self) -> str:
         digest = hashlib.sha256()
         digest.update(self.version.encode("utf-8"))
+        digest.update(str(self.minimum_synapse_count).encode("ascii"))
         for array in (
             self.edge_indices.astype("<i8", copy=False),
             self.pre_indices.astype("<i8", copy=False),
@@ -97,6 +101,7 @@ class PlasticEdgeTopology:
         *,
         post_indices: NDArray[np.int64] | None = None,
         version: str = "flywire-v783-kc-mbon-neuron-pairs-v1",
+        minimum_synapse_count: int = 1,
     ) -> "PlasticEdgeTopology":
         edges = artifact.kc_mbon_edges
         posts = (
@@ -110,16 +115,23 @@ class PlasticEdgeTopology:
                 "pinned KC->MBON edges include non-excitatory weights; "
                 "inspect neurotransmitter resolution before plastic training"
             )
-        kc_types = artifact.primary_types[edges.pre_indices].astype(np.str_, copy=True)
+        keep = weights >= minimum_synapse_count
+        if not np.any(keep):
+            raise ValueError("minimum synapse threshold removed every KC->MBON edge")
+        edge_indices = edges.edge_indices[keep]
+        pres = edges.pre_indices[keep]
+        posts = posts[keep]
+        weights = weights[keep]
+        kc_types = artifact.primary_types[pres].astype(np.str_, copy=True)
         mbon_types = artifact.primary_types[posts].astype(
             np.str_, copy=True
         )
         return cls(
             version=version,
-            edge_indices=edges.edge_indices.copy(),
-            pre_indices=edges.pre_indices.copy(),
+            edge_indices=edge_indices.copy(),
+            pre_indices=pres.copy(),
             post_indices=posts.copy(),
-            pre_root_ids=artifact.root_ids[edges.pre_indices].copy(),
+            pre_root_ids=artifact.root_ids[pres].copy(),
             post_root_ids=artifact.root_ids[posts].copy(),
             anatomical_weights=weights,
             kc_types=kc_types,
@@ -127,6 +139,7 @@ class PlasticEdgeTopology:
             compartments=np.asarray(
                 [_compartment(value) for value in mbon_types], dtype=np.str_
             ),
+            minimum_synapse_count=minimum_synapse_count,
         )
 
     @classmethod
@@ -149,4 +162,28 @@ class PlasticEdgeTopology:
             kc_types=np.full(count, "KC-synthetic", dtype=np.str_),
             mbon_types=np.full(count, "MBON-synthetic", dtype=np.str_),
             compartments=np.full(count, "synthetic", dtype=np.str_),
+            minimum_synapse_count=1,
         )
+
+
+def weak_edge_diagnostics(artifact: FlyWireArtifact) -> dict[str, object]:
+    """Report calibration-sensitive KC->MBON edge counts at fixed thresholds."""
+
+    weights = artifact.kc_mbon_edges.signed_synapse_counts
+    positive = weights[weights > 0]
+    total_edges = max(len(positive), 1)
+    total_synapses = max(float(positive.sum()), 1.0)
+    thresholds = (1, 2, 5, 10)
+    return {
+        "total_positive_kc_mbon_edges": int(len(positive)),
+        "total_positive_kc_mbon_synapses": float(positive.sum()),
+        "thresholds": {
+            str(threshold): {
+                "retained_edges": int(np.count_nonzero(weights >= threshold)),
+                "fraction_of_plastic_edge_count": float(np.count_nonzero(positive >= threshold) / total_edges),
+                "retained_synapses": float(weights[weights >= threshold].sum()),
+                "fraction_of_total_kc_mbon_synapses": float(weights[weights >= threshold].sum() / total_synapses),
+            }
+            for threshold in thresholds
+        },
+    }

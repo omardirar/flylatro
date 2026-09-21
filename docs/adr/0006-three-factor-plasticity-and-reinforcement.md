@@ -1,36 +1,44 @@
-# ADR 0006: three-factor plasticity, dopamine, and reset timing
+# ADR 0006: fixed-reference three-factor plasticity and reinforcement semantics
 
-Status: accepted for V1; parameters need experimental calibration.
+Status: accepted and locally validated; numerical parameters need real calibration.
 
 ## Decision
 
-Active KC and MBON pairs create a decaying edge-local eligibility trace.
-Fixed appetitive and aversive dopamine channels gate bounded efficacy changes
-on those traces. The implementation is modular, versioned, and exposes exact
-decay, learning rate, bounds, event ordering and the
-appetitive-minus-aversive sign convention.
+The primary rule is named `three-factor-global-v1`. KC and MBON firing rates
+are divided by configured fixed `kc_reference_hz` and `mbon_reference_hz`,
+clipped, multiplied edge-wise, decayed, and clipped to `max_eligibility`.
+Decision-relative maximum normalization is prohibited because it promotes
+arbitrarily weak noise to full eligibility.
 
-Outcome components map to dopamine through a fixed table: bounded progress,
-blind clear, Ante clear and final success are appetitive at increasing scales;
-run failure is aversive. Strategy concepts and action labels do not enter the
-reinforcement value. V1 uses no learned critic. A deterministic shuffled-event
-buffer implements the causal reward control.
+At a terminal transition the ordering is: record the last activity, apply its
+outcome reinforcement and efficacy update, then clear eligibility and the two
+reinforcement traces for that learner only. Efficacy persists. Cross-episode
+trace carryover is not a V1 mode.
 
-Fast LIF state resets before each decision by default. Plastic efficacy and
-eligibility persist across decisions and episodes. Evaluation freezes updates.
+Balatro outcomes drive fixed **synthetic appetitive reinforcement** and
+**synthetic aversive reinforcement** scalar channels. They are not simulated
+PAM/PPL1 spikes. Logs, Parquet roles, replay metadata and visualization say so;
+genuine DAN anatomy/activity remains distinct. No strategy labels enter the
+mapping and no critic is learned.
 
-## Biological basis and simplification
+`EdgeModulationAssignment` defines a versioned `compartmental-dan-v2` extension
+with edge compartment, channel index, and plasticity sign. It refuses missing
+assignments. V1 retains the global channel because v783 neuron-pair edges do
+not by themselves establish synapse-level compartments or a complete
+compartment-to-DAN rule.
 
-KC->MBON connections are a principal site of compartmental dopamine-gated
-associative plasticity, with experimentally observed timing-dependent and
-bidirectional effects. Eligibility-gated scalar pulses are a modelling
-convention that bridges delayed game outcomes; they omit receptor kinetics,
-heterogeneous consolidation, feedback-computed prediction error and detailed
-compartment dynamics. The default update sign is selected for an interpretable
-action-learning experiment, not presented as a universal fly synaptic law.
+## Evidence and assumptions
 
-## Alternatives
+- Biological evidence: KC->MBON synapses are compartmentally modulated by DAN
+  systems and can exhibit timing-dependent plasticity.
+- Computational modelling assumption: a decision-scale eligibility trace and
+  signed global scalar reinforcement approximate delayed game outcomes.
+- Engineering choice: fixed rate references, explicit bounds, terminal reset,
+  and configurable safety gates make magnitude and lifecycle reproducible.
 
-PPO, a learned value baseline and gradient descent through the brain were
-rejected from core V1. A more detailed anti-Hebbian timing kernel remains an
-alternate rule once basic learning and real-data dynamics are measured.
+## Consequences
+
+Plasticity calibration must report drift, update magnitude, eligibility and
+bound occupancy before training. Changing reference rates, trace bounds, rule
+version, compartment assignment, or minimum anatomical edge threshold changes
+the experiment manifest.

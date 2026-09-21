@@ -52,7 +52,10 @@ def main(argv: Sequence[str] | None = None) -> int:
             bundle.manifest.get("metadata", {}).get("neural_duration_ms", 50.0)
         )
     )
-    table = pq.read_table(bundle.neural_path)
+    table = _read_selected_decisions(
+        pq.ParquetFile(bundle.neural_path),
+        {int(row["decision_id"]) for row in bundle.decisions},
+    )
     events = table.to_pydict()
     timeline = build_timeline(
         bundle.decisions,
@@ -81,6 +84,10 @@ def main(argv: Sequence[str] | None = None) -> int:
     kinds = np.asarray(
         events.get("event_kind", ["spike"] * len(decisions)), dtype=object
     )
+    pre_roots = np.asarray(events.get("pre_root_id", [-1] * len(decisions)), dtype=np.int64)
+    post_roots = np.asarray(events.get("post_root_id", [-1] * len(decisions)), dtype=np.int64)
+    old_efficacy = np.asarray(events.get("old_efficacy", [np.nan] * len(decisions)), dtype=np.float32)
+    new_efficacy = np.asarray(events.get("new_efficacy", [np.nan] * len(decisions)), dtype=np.float32)
     lines = ["ffconcat version 1.0"]
     frame_index = 0
     frame_duration = 1.0 / args.fps
@@ -101,12 +108,19 @@ def main(argv: Sequence[str] | None = None) -> int:
             visual_activity = activity[selected].copy()
             selected_kinds = kinds[selected]
             visual_activity[selected_kinds == "stimulation"] /= 150.0
+            anatomical = roots[selected] >= 0
             ids, values, selected_roles = _aggregate(
-                roots[selected], visual_activity, roles[selected],
+                roots[selected][anatomical], visual_activity[anatomical], roles[selected][anatomical],
                 args.max_neurons_per_frame,
             )
             coordinates = coordinate_lookup(
                 artifact.root_ids, artifact.coordinates_nm, ids
+            )
+            plastic_rows = np.flatnonzero(in_decision & np.isin(kinds, ("plasticity", "weight_snapshot")) & (pre_roots >= 0))
+            plastic_rows = plastic_rows[np.argsort(np.abs(new_efficacy[plastic_rows] - old_efficacy[plastic_rows]))[::-1][:3]]
+            edge_label = "; ".join(
+                f"{pre_roots[index]}->{post_roots[index]} {old_efficacy[index]:.3g}->{new_efficacy[index]:.3g} d={new_efficacy[index] - old_efficacy[index]:+.3g}"
+                for index in plastic_rows
             )
             name = f"frame-{frame_index:07d}.svg"
             render_activity_svg(
@@ -118,10 +132,11 @@ def main(argv: Sequence[str] | None = None) -> int:
                 title=(
                     f"Decision {entry.decision_id} | {entry.action_type} | "
                     f"reward={entry.reward:g} | "
-                    f"DA+={entry.dopamine_appetitive:g} "
-                    f"DA-={entry.dopamine_aversive:g} | "
+                    f"synthetic appetitive={entry.dopamine_appetitive:g} "
+                    f"synthetic aversive={entry.dopamine_aversive:g} | "
                     f"{start_ms:.1f}-{stop_ms:.1f} ms | "
                     f"neural time slowed {timeline.config.slowdown:g}x"
+                    + (f" | plastic {edge_label}" if edge_label else "")
                 ),
                 transform=transform,
                 background_coordinates_nm=background,
@@ -156,7 +171,9 @@ def _aggregate(
         "input": 1,
         "kc": 2,
         "mbon": 3,
-        "dan": 4,
+        "dan_anatomy": 4,
+        "synthetic_appetitive": 4,
+        "synthetic_aversive": 4,
         "descending": 5,
         "readout": 5,
         "plasticity": 6,
@@ -170,6 +187,24 @@ def _aggregate(
             chosen_priority[index] = candidate
     order = np.argsort(np.abs(values))[::-1][:limit]
     return unique[order], values[order].astype(np.float32), chosen_roles[order]
+
+
+def _read_selected_decisions(parquet_file: object, decision_ids: set[int]) -> object:
+    """Read only row groups whose decision statistics intersect the request."""
+
+    groups = []
+    schema = parquet_file.schema_arrow
+    column = schema.get_field_index("decision_id")
+    for group_index in range(parquet_file.num_row_groups):
+        metadata = parquet_file.metadata.row_group(group_index).column(column)
+        statistics = metadata.statistics
+        if statistics is None:
+            groups.append(group_index)
+            continue
+        low, high = int(statistics.min), int(statistics.max)
+        if any(low <= decision <= high for decision in decision_ids):
+            groups.append(group_index)
+    return parquet_file.read_row_groups(groups)
 
 
 if __name__ == "__main__":

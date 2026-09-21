@@ -7,7 +7,8 @@ import json
 from pathlib import Path
 from typing import Sequence
 
-from flylatro.fly.flywire_artifact import FlyWireArtifact
+from flylatro.fly.flywire_artifact import FlyWireArtifact, population_sha256
+from flylatro.fly.mushroom_body.topology import weak_edge_diagnostics
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -20,12 +21,41 @@ def main(argv: Sequence[str] | None = None) -> int:
         parser.error("full population validation requires explicit --full")
     artifact = FlyWireArtifact.load(args.artifact)
     artifact.validate()
+    populations = {
+        "kenyon": artifact.kenyon_indices,
+        "mbon": artifact.mbon_indices,
+        "dan": artifact.dan_indices,
+        "pam": artifact.pam_indices,
+        "ppl1": artifact.ppl1_indices,
+        "projection": artifact.projection_indices,
+        "apl": artifact.apl_indices,
+        "dpm": artifact.dpm_indices,
+        "descending": artifact.descending_indices,
+    }
+    rules = {
+        **artifact.manifest["mushroom_body_population_rules"],
+        "descending": artifact.manifest.get(
+            "readout_population_rule", "super_class == descending"
+        ),
+    }
     payload = {
         "dataset": artifact.manifest["dataset"],
         "version": artifact.manifest["version"],
         "artifact_sha256": artifact.manifest["artifact_sha256"],
         "population_sha256": artifact.population_hash,
         "population_rules": artifact.manifest["mushroom_body_population_rules"],
+        "data_quality": {
+            key: artifact.manifest.get(key)
+            for key in (
+                "n_unresolved_nt_neurons",
+                "n_connection_pairs_unresolved_sign",
+                "n_synapses_unresolved_sign",
+                "n_connection_rows_invalid_endpoint",
+                "n_synapses_invalid_endpoint",
+                "fraction_raw_synapses_dropped",
+                "n_missing_coordinates",
+            )
+        },
         "counts": {
             "neurons": artifact.neuron_count,
             "kenyon": len(artifact.kenyon_indices),
@@ -50,6 +80,23 @@ def main(argv: Sequence[str] | None = None) -> int:
             "dpm": artifact.root_ids[artifact.dpm_indices].tolist(),
             "descending": artifact.root_ids[artifact.descending_indices].tolist(),
         },
+        "populations": {
+            name: {
+                "count": int(len(indices)),
+                "root_ids": artifact.root_ids[indices].tolist(),
+                "classification_rule": rules.get(
+                    name, "reported; no hard reference census asserted"
+                ),
+                "primary_types": sorted(
+                    set(artifact.primary_types[indices].tolist())
+                ),
+                "sha256": population_sha256(
+                    {name: artifact.root_ids[indices]}
+                ),
+            }
+            for name, indices in populations.items()
+        },
+        "weak_edge_diagnostics": weak_edge_diagnostics(artifact),
     }
     encoded = json.dumps(payload, indent=2, sort_keys=True) + "\n"
     if args.output is not None:

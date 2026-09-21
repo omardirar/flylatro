@@ -34,8 +34,16 @@ class TimelineEntry:
     selected_action_probability: float | None
     action_type_probabilities: tuple[float, ...]
     reward: float
-    dopamine_appetitive: float
-    dopamine_aversive: float
+    synthetic_appetitive_reinforcement: float
+    synthetic_aversive_reinforcement: float
+
+    @property
+    def dopamine_appetitive(self) -> float:
+        return self.synthetic_appetitive_reinforcement
+
+    @property
+    def dopamine_aversive(self) -> float:
+        return self.synthetic_aversive_reinforcement
 
 
 @dataclass(frozen=True, slots=True)
@@ -67,8 +75,8 @@ class Timeline:
                     "selected_action_probability": item.selected_action_probability,
                     "action_type_probabilities": item.action_type_probabilities,
                     "reward": item.reward,
-                    "dopamine_appetitive": item.dopamine_appetitive,
-                    "dopamine_aversive": item.dopamine_aversive,
+                    "synthetic_appetitive_reinforcement": item.synthetic_appetitive_reinforcement,
+                    "synthetic_aversive_reinforcement": item.synthetic_aversive_reinforcement,
                 }
                 for item in self.entries
             ],
@@ -106,11 +114,11 @@ def build_timeline(
                     for value in decision.get("action_type_probabilities", ())
                 ),
                 reward=float(decision.get("reward", 0.0)),
-                dopamine_appetitive=float(
-                    decision.get("dopamine_appetitive", 0.0)
+                synthetic_appetitive_reinforcement=float(
+                    decision.get("synthetic_appetitive_reinforcement", decision.get("dopamine_appetitive", 0.0))
                 ),
-                dopamine_aversive=float(
-                    decision.get("dopamine_aversive", 0.0)
+                synthetic_aversive_reinforcement=float(
+                    decision.get("synthetic_aversive_reinforcement", decision.get("dopamine_aversive", 0.0))
                 ),
             )
         )

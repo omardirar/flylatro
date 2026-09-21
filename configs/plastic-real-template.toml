@@ -16,7 +16,8 @@ reset_fast_state_each_decision = true
 sensory_mapping_seed = 0
 sensory_population_width = 3
 max_rate_hz = 150.0
-motor_pool_width = 1
+motor_pool_width = 2
+motor_mapping_path = "artefacts/motor-map-v783.json"
 
 [motor]
 deterministic_training = false
@@ -30,6 +31,9 @@ eligibility_decay = 0.90
 dopamine_decay = 0.0
 min_efficacy = 0.20
 max_efficacy = 2.0
+kc_reference_hz = 20.0
+mbon_reference_hz = 20.0
+max_eligibility = 4.0
 
 [reinforcement]
 progress_scale = 0.05
@@ -39,18 +43,23 @@ run_failure_pulse = 0.60
 ante8_success_pulse = 1.50
 
 [training]
-# Placeholder only. Choose this budget after the dedicated-machine benchmarks.
-max_environment_decisions = 1000
-checkpoint_every_decisions = 100
+# Non-scientific parser/calibration placeholder. flylatro-train refuses it;
+# pass measured --max-environment-decisions and --budget-basis.
+max_environment_decisions = 2
+checkpoint_every_decisions = 2
+budget_basis = "PLACEHOLDER_NOT_FOR_TRAINING"
 base_fly_seed = 2001
 plasticity_enabled = true
 
 [curriculum]
+# A single-level ladder is a fixed Ante-1 target, not a promotion curriculum.
 enabled = true
-ladder = [1, 2, 3, 5, 8]
+ladder = [1]
 promotion_win_rate = 0.70
-evaluation_every_decisions = 10000
-evaluation_episodes = 256
+# Unused for a single fixed level. Supply measured values when enabling the
+# multi-Ante ladder after Ante-1 acceptance.
+evaluation_every_decisions = 1
+evaluation_episodes = 1
 
 [runtime]
 output_root = "runs"

@@ -36,18 +36,27 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--unlock-final-test", action="store_true")
     parser.add_argument("--record-neural", action="store_true")
     parser.add_argument(
+        "--record-spikes",
+        action="store_true",
+        help="persist real time-resolved spike events for one frozen showcase",
+    )
+    parser.add_argument(
         "--condition",
         choices=(
             "plastic_real",
             "no_plasticity",
-            "shuffled_topology",
+            "kc_mbon_shuffled",
+            "whole_brain_shuffled",
             "shuffled_reward",
         ),
         default="plastic_real",
     )
     parser.add_argument("--sensory-mapping-seed", type=int)
     parser.add_argument("--output-mode", choices=("mbon_direct", "whole_brain"))
-    parser.add_argument("--dopamine-schedule", type=Path)
+    parser.add_argument(
+        "--reinforcement-schedule", "--dopamine-schedule",
+        dest="reinforcement_schedule", metavar="REINFORCEMENT_SCHEDULE", type=Path,
+    )
     parser.add_argument("--action-schedule", type=Path)
     return parser.parse_args(argv)
 
@@ -62,6 +71,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         raise ValueError("final-test seeds require --unlock-final-test")
     if args.record_neural and args.episodes != 1:
         raise ValueError("detailed neural recording requires exactly one episode")
+    if args.record_spikes and (not args.record_neural or args.seed_stream != "showcase"):
+        raise ValueError("--record-spikes requires --record-neural and seed-stream=showcase")
     config = PlasticExperimentConfig.load(args.config)
     config = _apply_evaluation_condition(config, args)
     config.require_heavy_opt_in(args.heavy)
@@ -70,6 +81,10 @@ def main(argv: Sequence[str] | None = None) -> int:
             "primary frozen evaluation currently requires the recommended one-fly config"
         )
     stack = build_plastic_stack(config)
+    if args.record_spikes:
+        if config.fly.backend != "flywire":
+            raise ValueError("time-resolved showcase spikes require the real FlyWire backend")
+        stack.agent.processor.backend.record_events = True
     load_plastic_checkpoint(
         args.checkpoint,
         stack.trainer,
@@ -118,6 +133,15 @@ def main(argv: Sequence[str] | None = None) -> int:
         "metrics": combined.metrics(),
         "components": stack.components,
         "neural_recording": str(neural_path) if args.record_neural else None,
+        "neural_recording_mode": (
+            "time_resolved_real_spikes" if args.record_spikes else "decision_aggregate" if args.record_neural else None
+        ),
+        "reinforcement_semantics": "synthetic appetitive/aversive outcome channels; not simulated PAM/PPL1 spikes",
+        "neural_activity_unit": (
+            "spikes_per_second_hz"
+            if config.fly.backend == "flywire"
+            else "synthetic_rate_hz_proxy"
+        ),
     }
     (args.output_dir / "summary.json").write_text(
         json.dumps(summary, indent=2, sort_keys=True) + "\n", encoding="utf-8"
@@ -170,6 +194,8 @@ def main(argv: Sequence[str] | None = None) -> int:
                 "episode": asdict(episode),
                 "learning_disabled": True,
                 "neural_duration_ms": float(stack.agent.processor.duration_ms),
+                "neural_recording_mode": summary["neural_recording_mode"],
+                "reinforcement_semantics": summary["reinforcement_semantics"],
             },
         ) as writer:
             for transition in combined.transitions:
@@ -212,19 +238,19 @@ def _apply_evaluation_condition(
                 args.action_schedule or training.action_schedule_path
             ),
         )
-    elif args.condition == "shuffled_topology":
-        fly = replace(fly, topology="shuffled")
-        training = replace(training, condition="shuffled_topology")
+    elif args.condition in {"kc_mbon_shuffled", "whole_brain_shuffled"}:
+        fly = replace(fly, topology=args.condition)
+        training = replace(training, condition=args.condition)
     elif args.condition == "shuffled_reward":
-        if args.dopamine_schedule is None:
-            raise ValueError("shuffled_reward evaluation requires --dopamine-schedule")
+        if args.reinforcement_schedule is None:
+            raise ValueError("shuffled_reward evaluation requires --reinforcement-schedule")
         if args.action_schedule is None:
             raise ValueError("shuffled_reward evaluation requires --action-schedule")
         training = replace(
             training,
             condition="shuffled_reward",
             reinforcement_mode="shuffled_schedule",
-            dopamine_schedule_path=str(args.dopamine_schedule),
+            reinforcement_schedule_path=str(args.reinforcement_schedule),
             action_schedule_path=str(args.action_schedule),
         )
     else:

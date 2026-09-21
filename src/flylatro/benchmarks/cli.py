@@ -213,6 +213,11 @@ def plastic_end_to_end_main(argv: Sequence[str] | None = None) -> int:
     )
     parser.add_argument("--steps", type=int, default=10)
     parser.add_argument("--output-mode", choices=("mbon_direct", "whole_brain"))
+    parser.add_argument(
+        "--compare-sequential",
+        action="store_true",
+        help="measure one shared batched simulation against row-by-row execution",
+    )
     args = parser.parse_args(argv)
     from flylatro.learning.config import PlasticExperimentConfig, build_plastic_stack
 
@@ -236,6 +241,39 @@ def plastic_end_to_end_main(argv: Sequence[str] | None = None) -> int:
         torch.cuda.synchronize()
     seconds = time.perf_counter() - start
     decisions = args.steps * stack.env.num_envs
+    comparison = None
+    if args.compare_sequential:
+        from flylatro.fly.mushroom_body.state import state_numpy
+
+        observations = stack.trainer.observations
+        efficacy = state_numpy(stack.agent.plasticity.state.efficacy)
+        fly_seeds = tuple(91_000_000 + row for row in range(stack.env.num_envs))
+        if config.fly.device.startswith("cuda"):
+            torch.cuda.synchronize()
+        batch_started = time.perf_counter()
+        stack.agent.processor.process(observations, fly_seeds=fly_seeds, efficacy=efficacy)
+        if config.fly.device.startswith("cuda"):
+            torch.cuda.synchronize()
+        batch_seconds = time.perf_counter() - batch_started
+        if config.fly.device.startswith("cuda"):
+            torch.cuda.synchronize()
+        sequential_started = time.perf_counter()
+        for row in range(stack.env.num_envs):
+            stack.agent.processor.process(
+                {key: value[row:row + 1] for key, value in observations.items()},
+                fly_seeds=(fly_seeds[row],),
+                efficacy=efficacy[row:row + 1],
+            )
+        if config.fly.device.startswith("cuda"):
+            torch.cuda.synchronize()
+        sequential_seconds = time.perf_counter() - sequential_started
+        comparison = {
+            "batch_size": stack.env.num_envs,
+            "batched_seconds": batch_seconds,
+            "sequential_seconds": sequential_seconds,
+            "measured_speedup": sequential_seconds / max(batch_seconds, 1e-12),
+            "memory_model": "one shared fixed sparse graph plus batched plastic KC-MBON edge contribution",
+        }
     _emit(
         "plastic_end_to_end",
         config.fly.backend,
@@ -245,6 +283,9 @@ def plastic_end_to_end_main(argv: Sequence[str] | None = None) -> int:
             "output_mode": config.fly.mode,
             "plastic_edges": stack.agent.plasticity.topology.edge_count,
             "learners": stack.agent.plasticity.state.learners,
+            "batch_size": stack.env.num_envs,
+            "execution_mode": "shared-fixed-sparse-plus-batched-plastic",
+            "neural_execution_comparison": comparison,
             "external_trainable_parameters": 0,
             "last_metrics": last,
         },
@@ -278,6 +319,7 @@ def _metrics(decisions: int, seconds: float) -> dict[str, float]:
         "wall_seconds": seconds,
         "decisions_per_second": decisions / seconds,
         "process_peak_rss_mb": _peak_rss_mb(),
+        "peak_memory_bytes": int(_peak_rss_mb() * 1024**2),
     }
     try:
         import torch

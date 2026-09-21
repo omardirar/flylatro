@@ -59,6 +59,7 @@ class TorchFlyWireBackend:
         shuffle_seed: int | None = None,
         shuffle_preserve_populations: bool = False,
         record_events: bool = False,
+        shuffle_scope: str = "whole_brain",
     ) -> None:
         try:
             import torch
@@ -86,6 +87,7 @@ class TorchFlyWireBackend:
         pre, post, weights, procedure = artifact.edge_arrays(
             shuffle_seed=shuffle_seed,
             preserve_populations=shuffle_preserve_populations,
+            shuffle_scope=shuffle_scope,
         )
         sparse_indices = torch.from_numpy(np.stack((post, pre))).to(
             device=self.device, dtype=torch.int64
@@ -183,7 +185,7 @@ class TorchFlyWireBackend:
                     for row, generator in enumerate(self._generators)
                 ]
                 poisson = torch.stack(poisson_rows) * p.poisson_scale
-                recurrent = torch.sparse.mm(self.weights, spikes.T).T
+                recurrent = self._recurrent(spikes)
                 incoming = p.synapse_scale_mv * (poisson + recurrent)
 
                 refractory = refractory * (1 - spikes.to(torch.int16)) + 1
@@ -240,6 +242,9 @@ class TorchFlyWireBackend:
             ),
             event_times_ms=torch.cat(event_time) if event_time else None,
         )
+
+    def _recurrent(self, spikes: Any) -> Any:
+        return self.torch.sparse.mm(self.weights, spikes.T).T
 
     def simulate(self, stimulus: Stimulus, duration_ms: float) -> FlyActivity:
         activity = self.simulate_tensor(stimulus, duration_ms)
