@@ -7,8 +7,25 @@ import json
 from pathlib import Path
 from typing import Sequence
 
+from flylatro.analysis.provenance import EvidenceIdentity
 from flylatro.fly.flywire_artifact import FlyWireArtifact, population_sha256
 from flylatro.fly.mushroom_body.topology import weak_edge_diagnostics
+
+
+POPULATION_REPORT_VERSION = "population-and-data-quality-v2"
+
+
+def _git() -> dict[str, object]:
+    from flylatro.analysis.provenance import git_identity
+
+    values = git_identity()
+    return {"git_commit": values["commit"], "git_dirty": values["dirty"]}
+
+
+def _now() -> str:
+    from datetime import datetime, timezone
+
+    return datetime.now(timezone.utc).isoformat()
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -38,7 +55,18 @@ def main(argv: Sequence[str] | None = None) -> int:
             "readout_population_rule", "super_class == descending"
         ),
     }
+    identity = EvidenceIdentity(
+        report_kind="population_census",
+        report_version=POPULATION_REPORT_VERSION,
+        generated_at=_now(),
+        artifact_sha256=str(artifact.manifest["artifact_sha256"]),
+        population_sha256=artifact.population_hash,
+        fly_connectivity_sha256=artifact.connectivity_hash,
+        **_git(),
+    )
     payload = {
+        "version": POPULATION_REPORT_VERSION,
+        "evidence_identity": identity.to_dict(),
         "dataset": artifact.manifest["dataset"],
         "version": artifact.manifest["version"],
         "artifact_sha256": artifact.manifest["artifact_sha256"],

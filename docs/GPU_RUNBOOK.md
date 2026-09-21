@@ -1,10 +1,15 @@
 # Dedicated GPU runbook: plastic-brain V1
 
-This sequence is mandatory. Do not choose an Ante-1 or curriculum exposure
-budget before measuring the dedicated machine. `plastic-real-template.toml`
-contains a parser/calibration placeholder and `flylatro-train` refuses it.
-Record every command, report, mapping hash, hardware description and chosen
-threshold file in the experiment group.
+This sequence is mandatory and its order is a dependency order, not a
+preference. Calibration of the motor interface depends on a frozen reward-free
+state corpus and on a chosen neural duration; the motor readiness claim depends
+on the motor interface actually existing. Running these out of order produces
+evidence that `flylatro-preflight` will refuse, because every report records the
+exact configuration it was measured under.
+
+`plastic-real-template.toml` contains a parser/calibration placeholder and
+`flylatro-train` refuses it. Record every command, report, mapping hash,
+hardware description and threshold file in the experiment group.
 
 Set paths only; do not set decision budgets yet:
 
@@ -13,6 +18,17 @@ export FLYLATRO_FLYWIRE_SOURCE=/absolute/path/to/flywire-v783-codex
 mkdir -p data/flywire artefacts runs evaluations
 ```
 
+At any point, ask what remains:
+
+```bash
+.venv/bin/flylatro-readiness --config configs/plastic-real-template.toml
+```
+
+It prints one of `READY_FOR_ARTIFACT_BUILD`, `READY_FOR_CALIBRATION`,
+`READY_FOR_TINY_REAL_RUN` or `READY_FOR_ANTE1`, the blocking reason for each
+stage, and the next command. It never reports `READY_FOR_ANTE1` from synthetic
+or mock evidence.
+
 ## 1. Build and verify the v783 artifact
 
 ```bash
@@ -20,7 +36,11 @@ mkdir -p data/flywire artefacts runs evaluations
   --source-dir "$FLYLATRO_FLYWIRE_SOURCE" \
   --output-dir data/flywire \
   --full
+```
 
+## 2. Inspect the population census and weak-edge statistics
+
+```bash
 .venv/bin/flylatro-verify-populations \
   --artifact data/flywire/flywire_fafb_v783.npz \
   --output artefacts/populations-and-data-quality.json \
@@ -30,16 +50,36 @@ mkdir -p data/flywire artefacts runs evaluations
 Accept only the exact 5,177-KC census, valid source/artifact hashes, non-empty
 MBON/DAN/PAM/PPL1/ALPN populations, explicit APL/DPM/descending reports, and
 explicit unresolved-neurotransmitter, dropped-synapse and missing-coordinate
-counters. Counts without a reliable reference are reported, not guessed.
+counters. The same report carries KC->MBON thresholds `1`, `2`, `5` and `10`.
+Keep `minimum_synapse_count = 1` for the primary model; any other threshold is a
+separately named sensitivity experiment and changes the topology hash.
 
-## 2. Inspect population and weak-edge sensitivity
+## 3. Generate the frozen reward-free calibration state corpus
 
-The preceding report contains KC->MBON thresholds `1`, `2`, `5`, and `10` with
-retained neuron-pair edges, synapses, and both fractions. Keep
-`minimum_synapse_count = 1` for the primary model. Any alternative threshold is
-a separately named sensitivity experiment and changes the topology hash.
+Every later calibration reads these exact states. The corpus contains
+observable states and legal masks only: no reward, no best action, no expected
+value, no strategy annotation. Scripted legal navigation is used only to reach
+diverse states and its actions are discarded.
 
-## 3. Create and audit the field-aware sensory map
+```bash
+.venv/bin/flylatro-build-calibration-corpus \
+  --config configs/plastic-real-template.toml \
+  --environment-seeds 9000001,9000002,9000003,9000004,9000005,9000006,9000007,9000008 \
+  --states-per-seed 8 \
+  --sample-every 3 \
+  --navigation-seed 770001 \
+  --store-snapshots \
+  --output artefacts/calibration-corpus-v783.npz \
+  --heavy
+```
+
+Inspect `phases_observed` and `phases_missing` in the printed coverage. Deeper
+phases (`SHOP`, `PACK`, `ROUND_EVAL`) need longer navigation: raise
+`--maximum-decisions-per-seed` and `--sample-every` until they appear, and
+record which phases the corpus does and does not reach. The corpus SHA-256 is
+part of experimental provenance and is recorded in every downstream report.
+
+## 4. Create the field-aware sensory mapping
 
 ```bash
 .venv/bin/flylatro-create-sensory-mapping \
@@ -47,68 +87,146 @@ a separately named sensitivity experiment and changes the topology hash.
   --mapping-seed 0 \
   --population-width 3 \
   --max-rate-hz 150 \
+  --calibration-corpus artefacts/calibration-corpus-v783.npz \
   --output artefacts/sensory-map-v783-seed0.json \
+  --health-report artefacts/sensory-health-v783.json \
   --full
 ```
 
-Accept only the versioned field-aware feature contract and clipped-sum
-collision policy. Inspect ALPN use, assignment min/median/p90/p95/p99/max,
-feature-class collisions, and isolated binary/scalar effective rates. Mapping
-replicates change only `sensory_mapping_seed`.
+## 5. Audit the sensory mapping on the actual calibration corpus
 
-## 4. Calibrate neural activity at multiple durations
+The command above writes both artifacts. Structural assignment counts
+(`assignments_per_alpn`, class collisions, ALPN use) are **informational**: they
+count every feature channel that *could* share an ALPN across the whole pinned
+contract. Readiness comes from the state-conditioned report, which counts only
+the channels that are simultaneously non-zero in an observed state:
 
-The motor artifact intentionally does not exist yet; this command uses a
-clearly marked bootstrap decoder only to traverse reward-free observable
-states. Its decoder output is not an experiment result.
+- `fraction_state_alpn_at_max_rate` — is the input population saturating?
+- `fraction_state_alpn_saturated_by_collision` — is saturation caused by
+  simultaneous collisions rather than a single full-amplitude channel?
+- `active_contributors_per_active_alpn` — median/p90/p95/p99/max simultaneous
+  contributors per driven ALPN;
+- `distinct_state_pairs_with_identical_vector_fraction` — the decisive number.
+  If two different observable states produce the same ALPN vector, collisions
+  have destroyed the information the experiment depends on.
+
+If the state-conditioned gate fails, lower `--max-rate-hz`, lower
+`--population-width`, or re-examine the feature contract. Do **not** relax it by
+raising a structural threshold. Mapping replicates change only
+`--mapping-seed`.
+
+## 6. Run neural representation PRE diagnostics at candidate durations
+
+No motor artifact exists yet, and this stage makes no motor readiness claim.
 
 ```bash
 for duration in 10 25 50 100; do
   .venv/bin/flylatro-diagnose-representation \
     --config configs/plastic-real-template.toml \
+    --stage pre \
     --duration-ms "$duration" \
-    --samples 16 \
     --repeats 3 \
+    --batch-size 1 \
     --high-rate-hz 200 \
     --maximum-silent-fraction 0.95 \
     --minimum-separation-ratio 1.10 \
-    --minimum-motor-dynamic-range-hz 1 \
-    --output "artefacts/representation-${duration}ms.json" \
+    --output "artefacts/representation-pre-${duration}ms.json" \
+    --reachability-output "artefacts/kc-reachability-${duration}ms.json" \
     --heavy
 done
 ```
 
-Choose a duration and thresholds from these measured Hz distributions. Require
-finite activity, non-silent KC/MBON/descending populations, repeatable
-same-state responses, useful different-state separation, and non-constant
-candidate outputs. Phase, Ante, hands-remaining, blind-progress,
-rank-presence and shop-presence probes are diagnostics only and never policy
-inputs.
+Both reports are measured over the frozen corpus. The representation report
+names the population the motor interface will consume
+(`motor_activity_population` is `mbon` in `mbon_direct` and `descending` in
+`whole_brain`) and measures exactly that population.
 
-## 5. Calibrate and persist canonical motor pools
+The reachability report answers whether ALPN-only drive at this duration
+actually reaches the plastic pool: per KC subtype it reports neuron count,
+active fraction, mean/median/p95 Hz, ever-active fraction, plastic-edge counts,
+ever-eligible edges and eligibility mass; plus the fraction of plastic MBONs and
+of selected motor outputs that are ever active.
 
-After selecting the duration in the config, run:
+## 7. Choose the neural duration from measured representation evidence
+
+Require finite activity, non-silent KC/MBON/descending populations, repeatable
+same-state responses, and useful different-state separation. Set the chosen
+`duration_ms` in the configuration. If a large plastic subpopulation is
+unreachable, that is a documented model decision for the experimenter —
+restrict the primary plastic population, or add another anatomically legitimate
+sensory route as a separate versioned model change. Do not silently retune the
+biology to make a gate pass.
+
+## 8. Calibrate canonical reward-free motor candidates and pools
+
+Candidates are the MBONs that are postsynaptic in the **real unshuffled**
+KC->MBON topology at the canonical minimum synapse count, so every motor output
+is plastic-reachable and the universe cannot move when a control shuffles
+topology. Permanently reserved action slots receive no neural population at all.
 
 ```bash
 .venv/bin/flylatro-calibrate-motor \
   --config configs/plastic-real-template.toml \
-  --samples 64 \
+  --calibration-corpus artefacts/calibration-corpus-v783.npz \
   --calibration-seed 91001 \
   --high-rate-hz 200 \
+  --minimum-candidate-robust-scale-hz 0.5 \
+  --maximum-within-group-correlation 0.95 \
+  --minimum-effective-signal-fraction 0.50 \
+  --minimum-normalized-option-range 0.25 \
   --output artefacts/motor-map-v783.json \
+  --report artefacts/motor-map-v783-report.json \
   --heavy
 ```
 
-Accept only reward-free calibration (`reward_used=false`), pool width at least
-two, sufficient option dynamic range, the exact state seed/hash set, canonical
-root IDs, and a stable mapping hash. The same artifact is mandatory for real,
-no-plasticity, both topology controls, shuffled reinforcement and sensory-map
-replicates.
+The artifact is written only when the quality gates pass. Review the report:
+candidate/selected counts, pool width, pool reuse structure, baseline firing
+distribution, dynamic range, variance, normalized dynamic range, silent and
+high-rate fractions, pairwise correlation between competing pools, and the
+effective number of distinct signals per competition group. A group that cannot
+obtain enough usable neural diversity fails loudly rather than quietly assigning
+near-identical populations to competing alternatives.
 
-## 6. Calibrate eligibility and plasticity stability
+Set `[fly].motor_mapping_path = "artefacts/motor-map-v783.json"`. The same
+artifact is mandatory for real, no-plasticity, both topology controls, shuffled
+reinforcement and sensory-map replicates. Record its `structure_sha256`: that is
+the motor identity every matched condition must share, and the value the
+replicate protocol binds.
 
-Choose a deliberately small decision count; it is a calibration exposure, not
-a training recommendation:
+## 9. Confirm the persisted motor normalization
+
+The artifact stores a fixed reward-free baseline and scale per pool
+(`reward-free-median-iqr-v1`: baseline = median, scale = IQR/1.349 floored at
+`--minimum-scale-hz`). `FixedMotorInterface.decode` subtracts the baseline and
+divides by the scale before comparing alternatives, so two pools with very
+different absolute firing rates but equivalent relative modulation compete
+fairly. Check `normalization.statistics` for pools whose scale was floored:
+those pools have little usable dynamic range.
+
+## 10. Run representation POST diagnostics with the final motor mapping
+
+Only this report may satisfy motor-related preflight gates.
+
+```bash
+.venv/bin/flylatro-diagnose-representation \
+  --config configs/plastic-real-template.toml \
+  --stage post \
+  --repeats 3 \
+  --minimum-normalized-option-range 0.25 \
+  --minimum-action-coverage-fraction 0.50 \
+  --maximum-competing-pool-correlation 0.99 \
+  --output artefacts/representation-post-50ms.json \
+  --heavy
+```
+
+It reports normalized motor-pool activity, per-head option dynamic ranges,
+action-option coverage, pairwise competition behaviour and motor score
+distributions for the exact persisted mapping.
+
+## 11. Calibrate eligibility and plasticity stability
+
+A deliberately small decision count; this is a calibration exposure, not a
+training recommendation.
 
 ```bash
 .venv/bin/flylatro-calibrate-plasticity \
@@ -126,26 +244,28 @@ mean/max update size, changed/positive/negative fractions and both bound
 fractions. Tune configured reference rates, learning rate, decay or bounds;
 never derive them from win rate or reward performance.
 
-## 7. Run initial formal preflight
+## 12. Run the initial preflight
 
-Store threshold choices in `artefacts/preflight-thresholds.json`; omitted
-benchmark/control evidence is a WARN at this stage because those measurements
-occur later in this sequence.
+`flylatro-preflight` reads the evidence paths declared in the config's
+`[calibration]` section, so the explicit flags below are only needed to override
+them. It verifies that every report's recorded provenance matches this
+configuration — duration, sensory mapping, motor mapping, artifact, topology,
+plasticity rule and calibration corpus — and fails with an exact mismatch
+message if a report belongs to another configuration.
 
 ```bash
 .venv/bin/flylatro-preflight \
   --config configs/plastic-real-template.toml \
-  --representation-report artefacts/representation-50ms.json \
-  --plasticity-report artefacts/plasticity-calibration.json \
+  --profile initial \
   --thresholds artefacts/preflight-thresholds.json \
   --output artefacts/preflight-initial.json
 ```
 
-Proceed only with no FAIL. Artifact, sensory, representation, motor,
-plasticity, reward mapping, learner-local reset, checkpoint and zero-external-
-policy gates must be PASS; explain any tooling-only WARN.
+Proceed only with no FAIL. At this profile the benchmark, matched-control,
+tiny-run, protocol and specificity gates are WARN because those measurements
+happen later in this sequence.
 
-## 8. Run a tiny real plastic experiment
+## 13. Run a tiny real plastic experiment
 
 Choose this tiny gate explicitly, not from the template:
 
@@ -170,9 +290,27 @@ Choose this tiny gate explicitly, not from the template:
 
 Require legal actions, finite state, at least one eligible update, sparse
 Parquet changes with pre/post/old/new/delta, low bound occupancy, exact resume,
-and `external_trainable_parameter_count = 0`.
+and `external_trainable_parameter_count = 0`. `--record-plasticity-events` turns
+on detailed per-edge events and weight hashes; routine training leaves them off
+so a CUDA step never copies a full plastic vector to the host.
 
-## 9. Compare the matched no-plasticity gate
+Also measure how action-specific the global rule actually is:
+
+```bash
+.venv/bin/flylatro-diagnose-specificity \
+  --config configs/plastic-real-template.toml \
+  --decisions 20 \
+  --output artefacts/chosen-action-specificity.json \
+  --heavy
+```
+
+This reports the fraction of eligibility and of weight change attributable to
+the chosen motor pool, to the competing pools in the same comparison, to motor
+pools the chosen action never consulted, and to non-motor MBONs. It is a
+measurement of whether `three-factor-global-v1` is sufficiently action-specific.
+It is not a licence to bias plasticity toward the chosen output in V1.
+
+## 14. Run the exact matched no-plasticity control
 
 ```bash
 .venv/bin/flylatro-train \
@@ -187,10 +325,28 @@ and `external_trainable_parameter_count = 0`.
   --heavy
 ```
 
-Require identical action schedule hash, before/after state hashes, curriculum
-Ante, seed order, sensory/motor mappings and exposure; weights must not change.
+## 15. Validate the control manifests
 
-## 10. Benchmark throughput and memory
+```bash
+.venv/bin/flylatro-validate-controls \
+  --manifest runs/tiny-real-plastic/run-manifest.json \
+  --manifest runs/tiny-no-plasticity/run-manifest.json \
+  --output artefacts/control-validation-tiny.json
+```
+
+The report states each arm's matching rule explicitly:
+
+- `no_plasticity` and `shuffled_reward` are **exact action/state matched**: the
+  executed action schedule, before/after state hashes, seed stream, Ante,
+  sensory map, motor map and environment budget must agree;
+- `kc_mbon_shuffled` and `whole_brain_shuffled` are **behaviourally independent
+  topology controls**: a shuffled topology changes behaviour, so they cannot
+  share the real fly's future trajectory. They are matched on the initial seed
+  sequence, exposure budget, curriculum, sensory map, canonical motor map,
+  reinforcement rule, simulation duration and hardware protocol — and their
+  plastic topology hash must actually differ from the real one.
+
+## 16. Benchmark throughput, memory and synchronization cost
 
 ```bash
 .venv/bin/bench-fly \
@@ -199,24 +355,42 @@ Ante, seed order, sensory/motor mappings and exposure; weights must not change.
   --device cuda \
   --batch-sizes 1,2,4,8 \
   --durations-ms 10,25,50,100 \
+  --profile-components \
   --heavy | tee artefacts/bench-fly.json
 
 .venv/bin/bench-plastic-end-to-end \
   --config configs/plastic-real-template.toml \
   --steps 10 \
   --compare-sequential \
-  --heavy | tee artefacts/bench-plastic-end-to-end.json
+  --profile-components \
+  --output artefacts/bench-plastic-end-to-end.json \
+  --heavy
 ```
 
-Record measured decisions/sec, peak CPU/GPU memory, batch size, duration and
-the measured sequential-versus-batched comparison. The memory model is one
-shared fixed sparse graph plus per-learner neural state and batched KC->MBON
-efficacy/eligibility/reinforcement traces; do not infer speedups before this.
+`component_seconds` attributes wall time to Poisson input generation, fixed
+sparse recurrence, the plastic KC->MBON contribution, the LIF state update and
+device synchronization (`recurrent` is the total; `recurrent_fixed` and
+`recurrent_plastic` are its nested parts). Record measured decisions/sec, peak
+CPU/GPU memory, batch size, duration and the sequential-versus-batched
+comparison.
 
-## 11. Choose budgets and create the paired replicate protocol
+## 17. Tune implementation performance only where measured necessary
+
+If and only if Poisson generation is a materially dominant component, switch
+`fly.poisson_method` to `chunked-per-row-v2`, which draws each fly's own stream
+in timestep blocks. It preserves independent per-learner streams,
+reproducibility and row-order independence, but it **changes
+`fly_dynamics_sha256`** and therefore invalidates every report measured under
+the previous method. Re-run steps 6-12 if you switch it. Make no performance
+claim that is not in a recorded benchmark.
+
+## 18. Choose exposure, checkpoint and evaluation budgets from the measurements
 
 Derive environment decisions, checkpoint cadence and evaluation sizes from the
-measurements and available wall-clock/storage budget. Record the rationale:
+benchmark and the available wall-clock/storage budget. Record the rationale as
+the `--budget-basis`.
+
+## 19. Create the paired replicate protocol
 
 ```bash
 .venv/bin/flylatro-create-protocol \
@@ -226,63 +400,95 @@ measurements and available wall-clock/storage budget. Record the rationale:
   --conditions plastic_real,no_plasticity,kc_mbon_shuffled,whole_brain_shuffled,shuffled_reward \
   --exposure-budget-decisions REPLACE_WITH_MEASURED_ANTE1_BUDGET \
   --curriculum-ladder 1 \
-  --motor-mapping-id REPLACE_WITH_MOTOR_MAPPING_SHA256 \
+  --reinforcement-condition primary-progress \
+  --motor-mapping-id REPLACE_WITH_MOTOR_STRUCTURE_SHA256 \
   --output artefacts/ante1-protocol.json
 ```
 
-Do not proceed while any `REPLACE_WITH_...` remains.
+`REPLACE_WITH_MOTOR_STRUCTURE_SHA256` is the `structure_sha256` field of
+`artefacts/motor-map-v783.json`, not its `sha256`. The structure hash covers the
+candidate universe, pool structure, routing and normalization; the artifact hash
+additionally covers the exploration settings, which legitimately differ per
+replicate. Matched conditions must share the structure hash, and a run whose
+loaded motor artifact does not match its protocol arm refuses to start.
 
-## 12. Rerun strict preflight with measured evidence
+Do not proceed while any `REPLACE_WITH_...` remains. Every seed the protocol
+stores controls a named stochastic mechanism; the manifest carries that audit
+table in `seed_effects`.
 
-Prepare two tiny run manifests flattened or retaining their `components`
-objects, then require benchmark and control evidence in the threshold JSON:
+## 20. Materialize the protocol arms
 
-```json
-{
-  "require_benchmark_report": true,
-  "require_control_manifest_check": true
-}
+```bash
+.venv/bin/flylatro-materialize-protocol \
+  --protocol artefacts/ante1-protocol.json \
+  --base-config configs/plastic-real-template.toml \
+  --output-dir artefacts/ante1-arms \
+  --run-root runs/ante1 \
+  --budget-basis artefacts/bench-plastic-end-to-end.json \
+  --checkpoint-every-decisions REPLACE_WITH_MEASURED_CHECKPOINT_CADENCE
 ```
+
+This writes one complete, already-validated configuration per arm plus
+`protocol-plan.json` with the exact command and dependency order for each. No
+JSON seed has to be translated into a CLI flag by hand, and every generated run
+re-validates its configuration against the protocol arm before it starts.
+
+## 21. Run the strict Ante-1 preflight
 
 ```bash
 .venv/bin/flylatro-preflight \
   --config configs/plastic-real-template.toml \
-  --representation-report artefacts/representation-50ms.json \
-  --plasticity-report artefacts/plasticity-calibration.json \
+  --profile ante1 \
   --benchmark-report artefacts/bench-plastic-end-to-end.json \
+  --protocol artefacts/ante1-protocol.json \
   --control-manifest runs/tiny-real-plastic/run-manifest.json \
   --control-manifest runs/tiny-no-plasticity/run-manifest.json \
   --thresholds artefacts/preflight-thresholds.json \
-  --output artefacts/preflight-before-ante1.json
+  --output artefacts/preflight-ante1.json
 ```
 
 All scientific/readiness gates must PASS before Ante-1. A visualization-only
 WARN is acceptable if final media is not being produced on this machine.
 
-## 13. Run the paired Ante-1 experiment
+## 22. Run the paired Ante-1 experiments
 
-For every protocol replicate, run the real condition and matched controls with
-its recorded seeds. Example real arm after substituting measured values:
+Execute `protocol-plan.json` in dependency order: every `plastic_real` arm
+first, then its matched controls. `shuffled_reward` additionally needs
 
 ```bash
-.venv/bin/flylatro-train \
-  --config configs/plastic-real-template.toml \
-  --run-dir runs/ante1-replicate-000-real \
-  --condition plastic_real \
-  --budget-basis artefacts/bench-plastic-end-to-end.json \
-  --max-environment-decisions REPLACE_WITH_MEASURED_ANTE1_BUDGET \
-  --checkpoint-every-decisions REPLACE_WITH_MEASURED_CHECKPOINT_CADENCE \
+.venv/bin/flylatro-shuffle-reward \
+  --events runs/ante1/ante1-v1/replicate-000-plastic_real/synthetic-reinforcement-events.jsonl \
+  --seed REPLACE_WITH_REPLICATE_REWARD_SEED \
+  --output runs/ante1/ante1-v1/replicate-000-plastic_real/shuffled-reinforcement.jsonl
+```
+
+before its arm can start. Compare paired replicates; never report only the best
+seed.
+
+## 23. Analyze behaviour, plasticity specificity and stability
+
+```bash
+.venv/bin/flylatro-validate-controls \
+  --manifest runs/ante1/ante1-v1/replicate-000-plastic_real/run-manifest.json \
+  --manifest runs/ante1/ante1-v1/replicate-000-no_plasticity/run-manifest.json \
+  --manifest runs/ante1/ante1-v1/replicate-000-kc_mbon_shuffled/run-manifest.json \
+  --output artefacts/control-validation-ante1-000.json
+
+.venv/bin/flylatro-analyze-synapses \
+  --config artefacts/ante1-arms/replicate-000-plastic_real.toml \
+  --checkpoint runs/ante1/ante1-v1/replicate-000-plastic_real/plastic-checkpoint-final.pkl \
+  --output artefacts/ante1-000-synapses.json \
   --heavy
 ```
 
-Primary topology control is `--condition kc_mbon_shuffled`; the distinct
-wider control is `--condition whole_brain_shuffled`. Both must reuse the same
-motor artifact. Shuffled reinforcement is created from
-`synthetic-reinforcement-events.jsonl` and passed with
-`--reinforcement-schedule`. Compare paired replicates; never report only the
-best seed.
+The predeclared reinforcement-shaping sensitivity conditions in
+`configs/reinforcement-sensitivity/` answer whether apparent learning depends on
+dense blind-progress shaping. They do not all need to run before the first tiny
+gate, but they must be run as a controlled comparison before any claim that
+learning is driven by outcomes rather than by shaping. Choosing among them by
+whichever scores best would invalidate them.
 
-## 14. Proceed to curriculum only after Ante-1 acceptance
+## 24. Only then decide whether to proceed to curriculum
 
 The real template's single-level `[1]` ladder fixes the target at Ante 1 and
 performs no promotion evaluations. Advance to `1,2,3,5,8` only if Ante-1 runs
@@ -290,13 +496,12 @@ preserve all matched hashes, show stable finite plasticity away from widespread
 bounds, exhibit non-degenerate actions/neural activity, resume exactly, and
 complete within measured resource budgets. Supply measured
 `--curriculum-evaluation-every-decisions` and
-`--curriculum-evaluation-episodes` values when enabling the multi-level ladder;
-the template values are explicitly unused for its fixed target. Behavioural
-improvement is an experimental result, not a software gate.
+`--curriculum-evaluation-episodes` when enabling the multi-level ladder.
+Behavioural improvement is an experimental result, not a software gate.
 
 ## Optional frozen time-resolved showcase
 
-This is never enabled during routine training:
+Never enabled during routine training:
 
 ```bash
 .venv/bin/flylatro-evaluate \
@@ -313,5 +518,20 @@ This is never enabled during routine training:
 The Parquet file has one row group per decision and distinguishes input
 stimulation, real KC/MBON/DAN-anatomy/descending spikes, synthetic appetitive
 and aversive outcome channels, and selected plastic changes. The synthetic
-channels are not PAM/PPL1 spikes. Visualization reads only requested decision
-row groups and shows strongest edge pre/post/old/new/delta details.
+channels are not PAM/PPL1 spikes.
+
+## Stop conditions
+
+Stop and investigate rather than relaxing a threshold if:
+
+- the sensory state-conditioned gate shows distinct observable states producing
+  identical ALPN vectors;
+- reachability shows that most plastic edges can never become eligible at the
+  chosen duration;
+- motor calibration cannot find enough usable neural diversity for a head;
+- preflight reports an evidence provenance mismatch (the evidence is stale:
+  regenerate it, do not override the gate);
+- the tiny real run produces zero eligible updates, non-finite state, or
+  widespread bound saturation;
+- a matched control's action schedule or state hashes diverge;
+- a topology control reports the same plastic topology hash as the real arm.

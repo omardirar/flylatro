@@ -19,6 +19,22 @@ from flylatro.learning.trainer import PlasticTrainer
 
 PLASTIC_CHECKPOINT_FORMAT = 1
 
+#: Fields a completed run fills in at the end. A final checkpoint carries the
+#: canonical completed identity, so these are present there but absent from a
+#: freshly built stack. They are compared only when the current configuration
+#: actually declares a value — which is exactly the matched-control case, where
+#: the run is bound to a source action schedule that must still agree.
+COMPLETION_DERIVED_COMPONENT_FIELDS: frozenset[str] = frozenset(
+    {
+        "action_schedule_sha256",
+        "state_hash_schedule_sha256",
+        "executed_action_schedule_sha256",
+        "reserved_action_legal_observations",
+        "component_identity_version",
+        "completed_at",
+    }
+)
+
 
 def save_plastic_checkpoint(
     path: Path,
@@ -92,6 +108,7 @@ def load_plastic_checkpoint(
             key: {"checkpoint": payload["components"].get(key), "current": value}
             for key, value in expected_components.items()
             if payload["components"].get(key) != value
+            and not (value is None and key in COMPLETION_DERIVED_COMPONENT_FIELDS)
         }
         if differences:
             raise ValueError(

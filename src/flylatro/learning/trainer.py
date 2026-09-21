@@ -16,7 +16,6 @@ from flylatro.learning.agent import LearningResult, PlasticDecision, PlasticFlyA
 from flylatro.learning.reinforcement import DopaminePulse
 from flylatro.learning.reward_schedule import MatchedActionStep
 from flylatro.seeds import derive_seed
-from flylatro.fly.mushroom_body.state import state_numpy
 
 
 @dataclass(frozen=True, slots=True)
@@ -85,7 +84,7 @@ class PlasticTrainer:
         self.last_state_hashes_before: tuple[str, ...] = ()
         self.last_state_hashes_after: tuple[str, ...] = ()
         self.last_scheduled_ante: int | None = None
-        self.record_sparse_changes = False
+        self.record_detailed_plasticity = False
 
     def step(self) -> dict[str, float]:
         scheduled = (
@@ -147,7 +146,7 @@ class PlasticTrainer:
             step.infos,
             plasticity_enabled=self.config.plasticity_enabled,
             override_pulses=override,
-            include_sparse_changes=self.record_sparse_changes,
+            detail=self.record_detailed_plasticity,
         )
         self.last_decision = decision
         self.last_learning = learning
@@ -175,10 +174,9 @@ class PlasticTrainer:
             self.state.episode_returns.append(float(episode.get("r", 0.0)))
             self.state.episode_antes.append(int(episode.get("ante", 0)))
             self.state.wins += bool(episode.get("won", False))
-        efficacy = state_numpy(self.agent.plasticity.state.efficacy)
-        eligibility = state_numpy(self.agent.plasticity.state.eligibility)
-        dopamine = state_numpy(self.agent.plasticity.state.dopamine)
-        initial_efficacy = state_numpy(self.agent.plasticity.state.initial_efficacy)
+        # Device-resident reductions: routine training never copies a full
+        # efficacy, eligibility or reinforcement-trace vector to the host.
+        plastic = self.agent.plasticity.routine_metrics()
         action_probabilities = np.asarray(
             self.state.action_type_counts, dtype=np.float64
         )
@@ -197,13 +195,26 @@ class PlasticTrainer:
             "plasticity/event_absolute_change": float(
                 sum(event.absolute_change for event in learning.events)
             ),
-            "plasticity/mean_efficacy": float(efficacy.mean()),
-            "plasticity/absolute_change": float(
-                np.abs(efficacy - initial_efficacy).sum()
+            "plasticity/mean_efficacy": plastic["mean_efficacy"],
+            "plasticity/absolute_change": plastic["absolute_change"],
+            "plasticity/mean_absolute_drift": plastic["mean_absolute_drift"],
+            "plasticity/max_absolute_drift": plastic["max_absolute_drift"],
+            "plasticity/eligibility_mean": plastic["eligibility_mean_absolute"],
+            "plasticity/eligibility_max": plastic["eligibility_max_absolute"],
+            "plasticity/dopamine_trace_mean_absolute": plastic[
+                "reinforcement_trace_mean_absolute"
+            ],
+            "plasticity/event_changed_synapses": float(
+                sum(event.changed_synapses for event in learning.events)
             ),
-            "plasticity/eligibility_mean": float(np.abs(eligibility).mean()),
-            "plasticity/dopamine_trace_mean_absolute": float(
-                np.abs(dopamine).mean()
+            "plasticity/event_max_absolute_change": float(
+                max(
+                    (event.maximum_absolute_change for event in learning.events),
+                    default=0.0,
+                )
+            ),
+            "plasticity/eligible_synapses": float(
+                sum(event.eligible_synapses for event in learning.events)
             ),
             "reinforcement/appetitive_mean": float(
                 np.mean([pulse.appetitive for pulse in learning.pulses])
@@ -211,12 +222,8 @@ class PlasticTrainer:
             "reinforcement/aversive_mean": float(
                 np.mean([pulse.aversive for pulse in learning.pulses])
             ),
-            "plasticity/lower_bound_fraction": float(
-                np.mean(efficacy <= self.agent.plasticity.config.min_efficacy)
-            ),
-            "plasticity/upper_bound_fraction": float(
-                np.mean(efficacy >= self.agent.plasticity.config.max_efficacy)
-            ),
+            "plasticity/lower_bound_fraction": plastic["lower_bound_fraction"],
+            "plasticity/upper_bound_fraction": plastic["upper_bound_fraction"],
             "behaviour/action_type_entropy": action_entropy,
             "behaviour/action_types_observed": float(len(observed)),
             "behaviour/dominant_action_fraction": float(

@@ -89,9 +89,34 @@ channel's source/class/transform, exact indices/root IDs, ALPN collision
 quantiles/class distribution, version and SHA-256. Matched comparisons reuse
 the mapping; mapping replicates change only `sensory_mapping_seed`.
 
+Structural assignment counts are informational. They count every feature channel
+that could share an ALPN across the whole pinned contract, active or not.
+Readiness is decided instead by state-conditioned sensory health measured on the
+frozen calibration corpus: silent/active/saturated ALPN fractions, simultaneous
+active contributors per driven ALPN, the fraction of saturation actually caused
+by simultaneous collisions, same-state vector equality, and above all whether
+two distinct observable states ever produce the same ALPN vector. Structural
+collision load and simultaneous active collision load are different quantities
+and only the second can destroy observable-state information.
+
 Synthetic Balatro features have no natural fly-stimulus interpretation. Using
 anatomical input routes constrains where artificial drive enters but does not
 make a card rank biologically meaningful.
+
+## Frozen reward-free calibration corpus
+
+Calibration must not depend on trajectories produced by whatever bootstrap
+decoder happened to exist. A first-class, versioned, SHA-256-hashed corpus holds
+observable Balatro states and legal masks only. It contains no reward label, best
+action, heuristic recommendation, expected value or strategy annotation.
+Deterministic scripted legal navigation from fixed simulator seeds reaches
+diverse observable phases; those actions are discarded and are never training
+labels or policy targets. The corpus persists its version, the Balatro simulator
+version, per-state hashes, seeds, phase labels, generation method, coverage and
+optional exact environment snapshots, and is reused by sensory-health
+diagnostics, representation diagnostics, reward-free motor calibration, mapping
+replicates and neural-duration comparisons. It is part of experimental
+provenance.
 
 ## Plastic edges and state
 
@@ -111,6 +136,15 @@ Per-fly plastic state contains:
 
 Experiment checkpoints additionally carry the environment, motor, NumPy,
 Python and Torch RNG states that drive each learner.
+
+Routine training keeps efficacy, eligibility and reinforcement traces resident on
+the simulation device. Per-decision metrics are device reductions delivered as one
+small scalar block, so a normal CUDA step never copies a full plastic vector to
+the host. Per-edge detail — before/after weight hashes, changed edge IDs and
+per-edge deltas — is opt-in and belongs to short gate runs, audits, selected
+recordings and diagnostics; weight hashing is checkpoint, periodic-audit or
+end-of-run work. The scientific semantics are unchanged and no autograd graph or
+optimizer exists anywhere in this path.
 
 Fast neural state resets at every decision by default. Eligibility and
 reinforcement traces persist within an episode, are used by its terminal
@@ -167,6 +201,12 @@ Biological basis and modelling context:
 Reward components are transformed by a versioned, non-trainable mapping into
 synthetic appetitive and aversive scalar channels:
 
+Three shaping conditions are predeclared: `primary-progress` (the V1 default),
+`reduced-progress` and `terminal-or-clear-only`. They differ only in the
+blind-progress magnitude and exist to determine whether apparent learning depends
+on dense progress reinforcement. They are named before any result is seen and are
+never selected by whichever eventually scores best.
+
 | Outcome | Default pulse |
 |---|---:|
 | bounded blind progress | weak appetitive |
@@ -189,13 +229,49 @@ action type, card count, card slots, and contextual target slots. Legal masks
 set illegal logits to negative infinity. Deterministic mode uses stable argmax
 with index tie-breaking; exploration is optional seeded softmax-temperature
 sampling with an epsilon-uniform branch and is recorded as non-learned
-interface state. Scientific mappings are selected by reward-free neural
-calibration, not consecutive round-robin or single-neuron defaults. Calibration
-rejects silent/high-rate-only outputs, ranks variance and dynamic range, and
-persists population pools (default width two where available), exact root IDs,
-sample seeds/state hashes, criteria and a mapping hash. Canonical output root
-IDs come from the real unshuffled artifact; every matched control reuses the
-same artifact.
+interface state.
+
+Pools are distinct only where options compete inside one comparison. The fixed
+`contextual-motor-routing-v1` scheme defines four competition groups — supported
+action types, exact card counts, hand card slots, and one shared contextual
+target slot group. Joker, consumable, shop and pack slots share the contextual
+group because the already-selected action type makes them mutually exclusive;
+card slots stay separate because a consumable reads both at once. The routing is
+zero-parameter, non-trainable, deterministic, versioned and hashed. It needs 35
+pools rather than the 61 that summing every head width would demand.
+
+Action types 0-12 are the scientifically represented set. `MOVE_JOKER` needs a
+source and destination the pinned action contract cannot carry, and 14-24 are
+index-stability placeholders. Reserved slots own no neural population, score
+negative infinity, are counted whenever the contract reports one legal, and can
+never be selected; the serialized artifact still spans the full mask/action
+contract and records full width, represented actions and reserved slots.
+
+Motor candidates are the MBONs that are postsynaptic in the real unshuffled
+KC->MBON plastic topology at the canonical minimum synapse count, so every motor
+output is plastic-reachable. The universe does not move because topology was
+shuffled, a weak-edge threshold changed or the control condition changed; its
+hash is persisted and checked when a configuration loads a motor artifact. Each
+candidate records root ID, KC plastic input edge count, total KC->MBON
+anatomical synapse weight, MBON type and compartment label where known.
+
+Scientific mappings are selected by reward-free neural calibration over the
+frozen corpus, not round-robin or single-neuron defaults. Calibration rejects
+silent and high-rate-only outputs, ranks robust scale and dynamic range, and
+applies a within-group correlation ceiling so near-identical populations are not
+assigned to competing alternatives. It reports candidate/selected counts, pool
+width, pool reuse, baseline firing distribution, dynamic range, variance,
+normalized dynamic range, silent and high-rate fractions, competing-pool
+correlation and the effective number of distinct signals, and fails clearly when
+a head cannot obtain enough usable diversity.
+
+Each pool also stores fixed reward-free normalization
+(`reward-free-median-iqr-v1`): baseline is the corpus median and scale is
+`max(IQR / 1.349, minimum_scale_hz)`. `decode` subtracts the baseline and divides
+by the scale before comparing alternatives, so two pools with different absolute
+firing rates but equivalent relative modulation compete fairly. Both vectors are
+frozen after calibration, contain no Balatro outcome information, have zero
+trainable parameters, and are versioned, hashed and persisted.
 
 Two output modes share the same interface:
 
@@ -268,6 +344,25 @@ Required conditions are:
 7. archived fixed-reservoir/PPO baseline;
 8. conventional ML and random-legal external references.
 
+Controls fall into two kinds that must not be confused. `no_plasticity` and
+`shuffled_reward` are **exact action/state matched**: they replay the real fly's
+executed action schedule and must reproduce its before/after state hashes, seed
+stream, Ante, sensory map, motor map and environment budget. `kc_mbon_shuffled`
+and `whole_brain_shuffled` are **behaviourally independent topology controls**:
+changing topology changes policy behaviour, so they cannot share the real fly's
+future trajectory. They are matched instead on the initial environment seed
+sequence, exposure budget, curriculum, sensory map, canonical motor map,
+reinforcement rule, simulation duration and hardware protocol — and their plastic
+topology hash must actually differ from the real one. The canonical motor root
+IDs, pool structure and normalization parameters are identical across every
+matched condition.
+
+Replicate protocols are executable, not descriptive: every arm materializes into
+one exact validated configuration plus its command and dependency order, and each
+run re-validates its configuration against its protocol arm before starting.
+Every stored protocol seed controls a named stochastic mechanism; a seed with no
+effect is removed rather than implied.
+
 Primary comparisons match environment decisions, seed order, curriculum,
 reinforcement map, motor map, and (except mapping replicates) sensory map.
 Record wall time, hardware, episodes, plasticity events, and GPU usage.
@@ -300,13 +395,79 @@ bound fractions, drift, action entropy, and dominance. Fail on non-finite
 state, zero updates despite eligible reinforcement, uncontrolled saturation,
 or a silent/constant motor interface.
 
-`flylatro-preflight` combines artifact/data quality, sensory collisions,
-representation, motor, plasticity, reward mapping, trace reset, checkpoint,
-benchmark, control and zero-external-policy evidence into PASS/WARN/FAIL with
-configured thresholds. Full artifact builds, whole-brain simulations, long training, large recording,
+Representation calibration has two stages. `representation-pre` measures neural
+representation only and makes no claim about the final motor interface.
+`representation-post` re-runs with the persisted final motor mapping and reports
+normalized motor-pool activity, per-head option dynamic ranges, action-option
+coverage, competition behaviour and motor score distributions. Only the
+post-motor report may satisfy a motor-related readiness gate. The motor
+diagnostic always measures the exact population the motor interface consumes:
+MBON output activity in `mbon_direct`, descending output activity in
+`whole_brain`.
+
+Three further diagnostics are measurements, never policy components. KC-subtype
+reachability asks whether ALPN-only drive and the configured window actually
+reach the plastic population. Chosen-action specificity attributes eligibility
+and weight change to the chosen motor pool, the competing pools, motor pools the
+chosen action never consulted, and non-motor MBONs; it determines whether
+`three-factor-global-v1` is sufficiently action-specific and is never a reason to
+bias the rule in V1. Observable-category probes exclude singleton classes so a
+held-out sample cannot be its own centroid.
+
+Every generated evidence artifact carries an explicit experiment identity: git
+commit and dirty state, config SHA, Balatro simulator version, FlyWire artifact,
+population and connectivity SHAs, plastic topology SHA, minimum synapse
+threshold, sensory feature-contract and mapping SHAs, calibration corpus SHA,
+motor candidate-set and mapping SHAs, reinforcement and plasticity rule SHAs, fly
+dynamics SHA, decision duration, output mode, backend and device.
+
+`flylatro-preflight` combines artifact/data quality, calibration corpus identity,
+sensory contract and state-conditioned sensory health, representation pre/post,
+KC reachability, motor artifact/candidate/normalization validity, reserved-slot
+safety, fixed-reference eligibility, episode-boundary reset, plasticity stability
+and bound occupancy, chosen-action specificity availability, checkpoint/resume,
+device-state consistency, benchmark provenance, matched-control readiness,
+protocol identity and zero-external-policy evidence into PASS/WARN/FAIL with
+configured thresholds. It never trusts a report's own status: each gate verifies
+that the report's recorded identity matches the current configuration and fails
+with an exact mismatch otherwise. Two profiles exist — `initial` authorises the
+first tiny real experiments and downgrades measurements that can only happen
+later; `ante1` is strict. Every threshold is a documented engineering gate, not a
+biological fact. Full artifact builds, whole-brain simulations, long training, large recording,
 and final tests require `--full`, `--heavy`, or the existing final-test unlock.
 Local completion is based on tiny circuits and short mock-environment runs;
 scientific claims remain gated on the dedicated GPU machine.
+
+## Scientific distinctions that must never be blurred
+
+Three categories are kept separate throughout the code, the reports and the
+documentation: **biological evidence**, **computational modelling assumptions**
+and **engineering interface choices**. The following statements are load-bearing
+and must survive every future change:
+
+- The Balatro-to-ALPN mapping is **synthetic**. Using an anatomical input route
+  constrains where artificial drive enters; it does not make a card rank a
+  biologically meaningful stimulus.
+- Motor action semantics are **synthetic**. Which MBON drives "shop slot 2", and
+  the convention that the same pool also means "pack slot 2" in a different
+  context, are fixed interface choices with no fly-behavioural claim.
+- Synthetic appetitive and aversive reinforcement is **not** simulated PAM/PPL1
+  spiking. Genuine annotated DAN anatomy and activity are recorded separately
+  and labelled differently everywhere.
+- The global three-factor rule is a **modelling convention**. It compresses
+  within-trial biological timing into one game transition and uses one global
+  scalar difference rather than evidence-derived compartmental DAN signals.
+- KC->MBON anatomy is **connectome-derived**. The edge set, its endpoints and
+  its aggregate synapse counts come from the pinned v783 export.
+- Learning resides in **KC->MBON efficacy**. That vector is the entire
+  persistent learned behavioural state; the external trainable parameter count
+  is zero.
+- Legal action masks are **environment constraints**, not learned strategy. The
+  interface never adds preferences to a mask and never treats a mask as advice.
+- Diagnostic classifiers and probes — observable-category centroid probes,
+  reachability, specificity attribution, representation geometry — are
+  **measurements only**. None of them feeds the policy, and none of them may be
+  optimised against.
 
 ## Implementation sequence and completion gates
 

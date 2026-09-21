@@ -36,6 +36,10 @@ mbon_reference_hz = 20.0
 max_eligibility = 4.0
 
 [reinforcement]
+# Predeclared sensitivity condition. Alternatives live in
+# configs/reinforcement-sensitivity/ and are separate named experiments, never
+# a parameter to retune until the score improves.
+condition = "primary-progress"
 progress_scale = 0.05
 blind_clear_pulse = 0.40
 ante_clear_pulse = 0.80
@@ -60,6 +64,20 @@ promotion_win_rate = 0.70
 # multi-Ante ladder after Ante-1 acceptance.
 evaluation_every_decisions = 1
 evaluation_episodes = 1
+
+[calibration]
+# Frozen reward-free evidence this experiment is authorized against.
+# flylatro-preflight and flylatro-readiness read these paths directly and refuse
+# a report whose recorded provenance belongs to another configuration.
+corpus_path = "artefacts/calibration-corpus-v783.npz"
+sensory_health_report = "artefacts/sensory-health-v783.json"
+representation_pre_report = "artefacts/representation-pre-50ms.json"
+representation_post_report = "artefacts/representation-post-50ms.json"
+motor_calibration_report = "artefacts/motor-map-v783-report.json"
+reachability_report = "artefacts/kc-reachability-50ms.json"
+plasticity_report = "artefacts/plasticity-calibration.json"
+specificity_report = "artefacts/chosen-action-specificity.json"
+benchmark_report = "artefacts/bench-plastic-end-to-end.json"
 
 [runtime]
 output_root = "runs"

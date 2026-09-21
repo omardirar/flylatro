@@ -32,8 +32,11 @@ def test_primary_training_path_changes_only_internal_plastic_state() -> None:
     assert stack.components["learned_state"] == "kc-mbon-efficacy"
     assert stack.components["external_trainable_parameter_count"] == 0
     assert stack.components["sensory_mapping"]["version"]
-    assert stack.components["motor_mapping"]["sha256"] == stack.components[
+    assert stack.components["motor_mapping"]["structure_sha256"] == stack.components[
         "motor_mapping_sha256"
+    ]
+    assert stack.components["motor_mapping"]["sha256"] == stack.components[
+        "motor_artifact_sha256"
     ]
     assert stack.components["reinforcement_mapping"]["version"]
 
@@ -239,7 +242,7 @@ def test_matched_experience_schedule_fails_fast_on_state_divergence() -> None:
 
 def test_training_reports_behaviour_diversity_and_can_emit_sparse_changes() -> None:
     stack = build_plastic_stack(smoke_config())
-    stack.trainer.record_sparse_changes = True
+    stack.trainer.record_detailed_plasticity = True
 
     metrics = stack.trainer.step()
     event = stack.trainer.last_learning.events[0]

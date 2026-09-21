@@ -40,12 +40,16 @@ def test_diagnostics_expose_silence_sparsity_and_failure_flags() -> None:
     assert plastic["finite"]
     assert plastic["no_synaptic_change"]
 
+    mbon = np.asarray([[0.2, 0.0], [0.3, 0.0]])
     representation = representation_diagnostics(
         np.asarray([[1.0, 0.0], [0.0, 1.0]]),
-        np.asarray([[0.2, 0.0], [0.3, 0.0]]),
+        mbon,
         np.asarray([[0.1], [0.2]]),
+        motor_activity=mbon,
+        motor_activity_population="mbon",
         state_labels=np.asarray([0, 1]),
     )
+    assert representation["motor_activity_population"] == "mbon"
     assert representation["kc_active_fraction"] == 0.5
     assert representation["mbon_silent_fraction"] == 0.5
     assert representation["different_state_separability"] is not None
@@ -54,21 +58,28 @@ def test_diagnostics_expose_silence_sparsity_and_failure_flags() -> None:
 def test_representation_cli_measures_repeated_identical_states(tmp_path) -> None:
     import json
 
-    output = tmp_path / "representation.json"
+    from helpers import build_mock_corpus, write_config
+
+    corpus = tmp_path / "corpus.npz"
+    build_mock_corpus(corpus, seeds=(11, 12), states_per_seed=2)
+    config = write_config(tmp_path, corpus_path=corpus)
+    output = tmp_path / "representation-pre.json"
+    reachability = tmp_path / "reachability.json"
     assert representation_main(
         [
-            "--config",
-            "configs/plastic-smoke.toml",
-            "--samples",
-            "2",
-            "--repeats",
-            "2",
-            "--output",
-            str(output),
+            "--config", str(config),
+            "--stage", "pre",
+            "--repeats", "2",
+            "--output", str(output),
+            "--reachability-output", str(reachability),
         ]
-    ) == 0
+    ) in (0, 2)
 
     report = json.loads(output.read_text(encoding="utf-8"))
-    assert report["samples"] == 4
+    assert report["stage"] == "pre"
+    assert report["samples"] == 8
     assert report["same_state_variability"] is not None
     assert report["different_state_separability"] is not None
+    assert report["final_motor_interface_evaluated"] is False
+    assert report["evidence_identity"]["calibration_corpus_sha256"]
+    assert json.loads(reachability.read_text(encoding="utf-8"))["by_kc_subtype"]

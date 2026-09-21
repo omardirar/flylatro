@@ -115,7 +115,7 @@ class PlasticFlyAgent:
         *,
         plasticity_enabled: bool,
         override_pulses: Sequence[DopaminePulse] | None = None,
-        include_sparse_changes: bool = False,
+        detail: bool = False,
     ) -> LearningResult:
         if len(infos) != self.plasticity.state.learners:
             raise ValueError("one outcome is required per independent fly")
@@ -131,7 +131,7 @@ class PlasticFlyAgent:
             np.asarray([pulse.appetitive for pulse in pulses], dtype=np.float32),
             np.asarray([pulse.aversive for pulse in pulses], dtype=np.float32),
             plasticity_enabled=plasticity_enabled,
-            include_sparse_changes=include_sparse_changes,
+            detail=detail,
         )
         for index, info in enumerate(infos):
             if isinstance(info.get("episode"), dict):

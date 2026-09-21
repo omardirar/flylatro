@@ -57,6 +57,16 @@ def fly_main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--batch-sizes", default="1,2,4")
     parser.add_argument("--durations-ms", default="1,5,10")
     parser.add_argument("--readout-size", type=int, default=32)
+    parser.add_argument(
+        "--profile-components",
+        action="store_true",
+        help="attribute wall time to Poisson input, recurrence, LIF update and sync",
+    )
+    parser.add_argument(
+        "--poisson-method",
+        default=None,
+        help="per-step-per-row-v1 (default) or chunked-per-row-v2",
+    )
     args = parser.parse_args(argv)
     batches = _csv_ints(args.batch_sizes)
     durations = _csv_floats(args.durations_ms)
@@ -79,8 +89,14 @@ def fly_main(argv: Sequence[str] | None = None) -> int:
 
                 artifact = FlyWireArtifact.load(args.artifact)
                 readout = artifact.descending_indices[: args.readout_size]
+                from flylatro.fly.torch_backend import POISSON_METHOD
+
                 backend = TorchFlyWireBackend(
-                    artifact, device=args.device, readout_indices=readout
+                    artifact,
+                    device=args.device,
+                    readout_indices=readout,
+                    poisson_method=args.poisson_method or POISSON_METHOD,
+                    profile_components=args.profile_components,
                 )
                 neuron_count = artifact.neuron_count
             rates = np.zeros((batch, neuron_count), dtype=np.float32)
@@ -99,6 +115,18 @@ def fly_main(argv: Sequence[str] | None = None) -> int:
             seconds = time.perf_counter() - start
             row = _metrics(batch, seconds)
             row.update(batch_size=batch, duration_ms=duration)
+            components = dict(getattr(backend, "component_seconds", {}) or {})
+            if components:
+                row["component_seconds"] = components
+                row["component_fraction"] = {
+                    name: value / max(seconds, 1e-12)
+                    for name, value in components.items()
+                }
+                row["component_note"] = (
+                    "recurrent is the total; recurrent_fixed and recurrent_plastic "
+                    "are its nested parts and are not added again"
+                )
+                row["poisson_method"] = getattr(backend, "poisson_method", None)
             rows.append(row)
     print(json.dumps({"benchmark": "fly", "backend": args.backend, "results": rows}))
     return 0
@@ -218,6 +246,13 @@ def plastic_end_to_end_main(argv: Sequence[str] | None = None) -> int:
         action="store_true",
         help="measure one shared batched simulation against row-by-row execution",
     )
+    parser.add_argument(
+        "--profile-components",
+        action="store_true",
+        help="attribute wall time to Poisson input, fixed/plastic recurrence, "
+        "LIF update and device synchronization",
+    )
+    parser.add_argument("--output", type=Path)
     args = parser.parse_args(argv)
     from flylatro.learning.config import PlasticExperimentConfig, build_plastic_stack
 
@@ -228,6 +263,10 @@ def plastic_end_to_end_main(argv: Sequence[str] | None = None) -> int:
         config = replace(config, fly=replace(config.fly, mode=args.output_mode))
     config.require_heavy_opt_in(args.heavy)
     stack = build_plastic_stack(config)
+    backend = getattr(stack.agent.processor, "backend", None)
+    if args.profile_components and backend is not None:
+        backend.profile_components = True
+        backend.component_seconds = {}
     if config.fly.device.startswith("cuda"):
         import torch
 
@@ -274,22 +313,50 @@ def plastic_end_to_end_main(argv: Sequence[str] | None = None) -> int:
             "measured_speedup": sequential_seconds / max(batch_seconds, 1e-12),
             "memory_model": "one shared fixed sparse graph plus batched plastic KC-MBON edge contribution",
         }
-    _emit(
-        "plastic_end_to_end",
-        config.fly.backend,
-        decisions,
-        seconds,
-        {
-            "output_mode": config.fly.mode,
-            "plastic_edges": stack.agent.plasticity.topology.edge_count,
-            "learners": stack.agent.plasticity.state.learners,
-            "batch_size": stack.env.num_envs,
-            "execution_mode": "shared-fixed-sparse-plus-batched-plastic",
-            "neural_execution_comparison": comparison,
-            "external_trainable_parameters": 0,
-            "last_metrics": last,
-        },
-    )
+    from flylatro.analysis.evidence import experiment_identity
+
+    components = dict(getattr(backend, "component_seconds", {}) or {})
+    details = {
+        "output_mode": config.fly.mode,
+        "plastic_edges": stack.agent.plasticity.topology.edge_count,
+        "learners": stack.agent.plasticity.state.learners,
+        "batch_size": stack.env.num_envs,
+        "execution_mode": "shared-fixed-sparse-plus-batched-plastic",
+        "neural_execution_comparison": comparison,
+        "external_trainable_parameters": 0,
+        "detailed_plasticity_events": stack.trainer.record_detailed_plasticity,
+        "last_metrics": last,
+    }
+    if components:
+        details["component_seconds"] = components
+        details["component_fraction"] = {
+            name: value / max(seconds, 1e-12) for name, value in components.items()
+        }
+        details["component_note"] = (
+            "recurrent is the total; recurrent_fixed and recurrent_plastic are "
+            "its nested parts. Poisson dominance justifies switching "
+            "fly.poisson_method, which is a versioned dynamics change"
+        )
+        details["poisson_method"] = getattr(backend, "poisson_method", None)
+    payload = {
+        "benchmark": "plastic_end_to_end",
+        "backend": config.fly.backend,
+        **details,
+        **_metrics(decisions, seconds),
+        "evidence_identity": experiment_identity(
+            config,
+            stack.components,
+            report_kind="benchmark",
+            report_version="plastic-end-to-end-benchmark-v2",
+        ).to_dict(),
+    }
+    if args.output is not None:
+        args.output.parent.mkdir(parents=True, exist_ok=True)
+        args.output.write_text(
+            json.dumps(payload, indent=2, sort_keys=True, default=str) + "\n",
+            encoding="utf-8",
+        )
+    print(json.dumps(payload, sort_keys=True, default=str))
     return 0
 
 

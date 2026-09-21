@@ -13,6 +13,7 @@ from flylatro.analysis.plasticity import (
     plasticity_calibration_report,
     run_controlled_plasticity_sequence,
 )
+from flylatro.analysis.evidence import experiment_identity, write_report
 from flylatro.learning.config import PlasticExperimentConfig, build_plastic_stack
 
 
@@ -60,7 +61,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             if decision % 4 in {1, 2, 3}
         ) * stack.agent.plasticity.state.learners
     else:
-        stack.trainer.record_sparse_changes = True
+        stack.trainer.record_detailed_plasticity = True
 
         def collect_updates(trainer: object, values: dict[str, float]) -> None:
             nonlocal eligible_reinforcement_events
@@ -91,6 +92,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         update_magnitudes=updates,
         eligible_reinforcement_events=eligible_reinforcement_events,
     )
+    report["version"] = "plasticity-calibration-v2"
     report["calibration"] = {
         "config_sha256": config.sha256,
         "decisions": args.decisions,
@@ -104,8 +106,16 @@ def main(argv: Sequence[str] | None = None) -> int:
         "plasticity_rule_sha256": stack.components["plasticity_rule_sha256"],
         "synthetic_development_only": config.fly.backend == "synthetic",
     }
-    args.output.parent.mkdir(parents=True, exist_ok=True)
-    args.output.write_text(json.dumps(report, indent=2, sort_keys=True) + "\n")
+    write_report(
+        args.output,
+        report,
+        experiment_identity(
+            config,
+            stack.components,
+            report_kind="plasticity_calibration",
+            report_version=report["version"],
+        ),
+    )
     print(json.dumps({"output": str(args.output), "status": report["gates"]["status"]}))
     return 0 if report["gates"]["status"] == "PASS" else 2
 

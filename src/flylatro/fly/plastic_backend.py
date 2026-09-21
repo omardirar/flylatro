@@ -12,6 +12,7 @@ from flylatro.fly.encoder import Stimulus
 from flylatro.fly.flywire_artifact import FlyWireArtifact
 from flylatro.fly.mushroom_body.topology import PlasticEdgeTopology
 from flylatro.fly.torch_backend import (
+    POISSON_METHOD,
     ShiuLIFParameters,
     TorchFlyActivity,
     TorchFlyWireBackend,
@@ -39,6 +40,9 @@ class PlasticTorchFlyWireBackend(TorchFlyWireBackend):
         record_events: bool = False,
         shuffle_seed: int | None = None,
         shuffle_scope: str = "whole_brain",
+        poisson_method: str = POISSON_METHOD,
+        poisson_chunk_steps: int = 32,
+        profile_components: bool = False,
     ) -> None:
         super().__init__(
             artifact,
@@ -49,6 +53,9 @@ class PlasticTorchFlyWireBackend(TorchFlyWireBackend):
             shuffle_seed=shuffle_seed,
             shuffle_preserve_populations=shuffle_seed is not None,
             shuffle_scope=shuffle_scope,
+            poisson_method=poisson_method,
+            poisson_chunk_steps=poisson_chunk_steps,
+            profile_components=profile_components,
         )
         self.plastic_topology = topology
         torch = self.torch
@@ -108,7 +115,8 @@ class PlasticTorchFlyWireBackend(TorchFlyWireBackend):
 
     def _recurrent(self, spikes: object) -> object:
         torch = self.torch
-        fixed = torch.sparse.mm(self.weights, spikes.T).T
+        with self._timed("recurrent_fixed"):
+            fixed = torch.sparse.mm(self.weights, spikes.T).T
         if self._efficacy.shape[0] != spikes.shape[0]:
             if self._efficacy.shape[0] == 1:
                 efficacy = self._efficacy.expand(spikes.shape[0], -1)
@@ -116,16 +124,18 @@ class PlasticTorchFlyWireBackend(TorchFlyWireBackend):
                 raise ValueError("plastic efficacy batch differs from neural batch")
         else:
             efficacy = self._efficacy
-        contribution = (
-            spikes.index_select(1, self._plastic_pre)
-            * efficacy
-            * self._plastic_anatomical[None, :]
-        )
-        plastic = torch.zeros_like(fixed)
-        plastic.scatter_add_(
-            1, self._plastic_post[None, :].expand(spikes.shape[0], -1), contribution
-        )
-        return fixed + plastic
+        with self._timed("recurrent_plastic"):
+            contribution = (
+                spikes.index_select(1, self._plastic_pre)
+                * efficacy
+                * self._plastic_anatomical[None, :]
+            )
+            plastic = torch.zeros_like(fixed)
+            plastic.scatter_add_(
+                1, self._plastic_post[None, :].expand(spikes.shape[0], -1), contribution
+            )
+            result = fixed + plastic
+        return result
 
     def propagate_once(
         self, activity: NDArray[np.floating]
@@ -221,6 +231,13 @@ class PlasticFlyProcessor:
         self._mbon_indices = np.unique(topology.post_indices)
         self._dan_indices = backend.artifact.dan_indices
         self.kc_root_ids = backend.artifact.root_ids[self._kc_indices].copy()
+        self.kc_indices = self._kc_indices
+        self.mbon_indices = self._mbon_indices
+        self.kc_types = (
+            backend.artifact.primary_types[self._kc_indices].astype(np.str_, copy=True)
+            if len(backend.artifact.primary_types) == backend.artifact.neuron_count
+            else np.asarray(["unknown"] * len(self._kc_indices), dtype=np.str_)
+        )
         self.mbon_root_ids = backend.artifact.root_ids[self._mbon_indices].copy()
         self.dan_root_ids = backend.artifact.root_ids[self._dan_indices].copy()
         self.descending_root_ids = backend.artifact.root_ids[

@@ -218,7 +218,7 @@ def run_controlled_plasticity_sequence(
         events = rule.apply_dopamine(
             appetitive,
             aversive,
-            include_sparse_changes=True,
+            detail=True,
         )
         updates.extend(abs(value) for event in events for value in event.efficacy_changes)
     return tuple(updates)

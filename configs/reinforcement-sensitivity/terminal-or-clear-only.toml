@@ -1,0 +1,17 @@
+# Predeclared reinforcement-shaping sensitivity condition: terminal-or-clear-only.
+#
+# These conditions exist to answer whether apparent learning depends on dense
+# blind-progress shaping. They were declared before any Ante-1 result was seen
+# and must never be selected by whichever one eventually scores best. Only the
+# blind-progress magnitude differs; every other pulse is identical.
+#
+# Merge this section into a materialized protocol arm, or pass it through
+# flylatro-create-protocol --reinforcement-condition terminal-or-clear-only.
+
+[reinforcement]
+condition = "terminal-or-clear-only"
+progress_scale = 0.0
+blind_clear_pulse = 0.40
+ante_clear_pulse = 0.80
+run_failure_pulse = 0.60
+ante8_success_pulse = 1.50

@@ -23,9 +23,22 @@ class ReinforcementPulse:
             raise ValueError("synthetic reinforcement magnitudes must be finite")
 
 
+#: Predeclared reinforcement-shaping sensitivity conditions.
+#:
+#: These exist so the experiment can answer whether apparent learning depends
+#: on dense blind-progress shaping.  They are declared **before** any result is
+#: seen and must never be selected by whichever one eventually scores best.
+SENSITIVITY_CONDITIONS: dict[str, dict[str, float]] = {
+    "primary-progress": {"progress_scale": 0.05},
+    "reduced-progress": {"progress_scale": 0.01},
+    "terminal-or-clear-only": {"progress_scale": 0.0},
+}
+
+
 @dataclass(frozen=True, slots=True)
 class ReinforcementConfig:
     version: str = "balatro-outcome-synthetic-reinforcement-v2"
+    condition: str = "primary-progress"
     progress_scale: float = 0.05
     blind_clear_pulse: float = 0.40
     ante_clear_pulse: float = 0.80
@@ -46,6 +59,23 @@ class ReinforcementConfig:
         )
         if any(value < 0 or not np.isfinite(value) for value in numeric):
             raise ValueError("reinforcement parameters must be finite and non-negative")
+        expected = SENSITIVITY_CONDITIONS.get(self.condition)
+        if expected is None:
+            raise ValueError(
+                "reinforcement.condition must be one of "
+                f"{sorted(SENSITIVITY_CONDITIONS)}; ad-hoc shaping magnitudes are "
+                "not predeclared experiments"
+            )
+        mismatched = {
+            name: (getattr(self, name), value)
+            for name, value in expected.items()
+            if getattr(self, name) != value
+        }
+        if mismatched:
+            raise ValueError(
+                f"reinforcement condition {self.condition!r} fixes {mismatched}; "
+                "declare a new named sensitivity condition instead of retuning it"
+            )
 
     @property
     def sha256(self) -> str:
@@ -125,6 +155,16 @@ class ReinforcementMapper:
             aversive=min(negative, self.config.max_total_pulse),
             events=tuple(events),
         )
+
+
+def sensitivity_condition(name: str, **overrides: float) -> ReinforcementConfig:
+    """Build one predeclared reinforcement-shaping sensitivity condition."""
+
+    if name not in SENSITIVITY_CONDITIONS:
+        raise ValueError(f"unknown predeclared sensitivity condition: {name}")
+    return ReinforcementConfig(
+        condition=name, **SENSITIVITY_CONDITIONS[name], **overrides
+    )
 
 
 def shuffled_pulse_schedule(

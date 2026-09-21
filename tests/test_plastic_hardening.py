@@ -19,7 +19,15 @@ from flylatro.fly.mushroom_body.plasticity import PlasticityConfig, ThreeFactorP
 from flylatro.fly.mushroom_body.state import PlasticEdgeState
 from flylatro.fly.mushroom_body.topology import PlasticEdgeTopology, weak_edge_diagnostics
 from flylatro.fly.plastic_features import feature_names, observation_features
-from flylatro.interface.motor import HEAD_SIZES, FixedMotorInterface, MotorMapping
+from flylatro.interface.motor import (
+    MOTOR_POOL_COUNT,
+    FixedMotorInterface,
+    MotorMapping,
+)
+from flylatro.interface.motor_calibration import (
+    MotorCalibrationThresholds,
+    calibrate_reward_free_motor,
+)
 from flylatro.interface.sensory import FixedPlasticSensoryEncoder, SensoryMapping
 from flylatro.learning.config import PlasticExperimentConfig, build_plastic_stack
 from flylatro.learning.protocol import ExperimentProtocol, assert_matched_control_manifests
@@ -160,10 +168,13 @@ def test_terminal_reset_is_per_learner_after_update_and_efficacy_persists() -> N
 
 
 def test_representation_units_and_thresholds_are_explicit() -> None:
+    mbon = np.asarray([[0, 50], [0, 250]], dtype=float)
     report = representation_diagnostics(
         np.asarray([[0, 10], [0, 20]], dtype=float),
-        np.asarray([[0, 50], [0, 250]], dtype=float),
+        mbon,
         np.asarray([[1, 2], [3, 8]], dtype=float),
+        motor_activity=mbon,
+        motor_activity_population="mbon",
         state_labels=np.asarray([0, 1]),
         thresholds=RepresentationThresholds(high_rate_hz=200),
     )
@@ -173,18 +184,19 @@ def test_representation_units_and_thresholds_are_explicit() -> None:
 
 
 def test_motor_calibration_and_per_learner_rng_are_order_independent() -> None:
-    roots = np.arange(sum(HEAD_SIZES.values()) * 2, dtype=np.int64)
-    activity = np.stack([(roots + 1) * scale for scale in (0.0, 0.1, 0.2, 0.3)])
-    first = MotorMapping.from_reward_free_calibration(
-        roots, activity, mode="mbon_direct", pool_width=2, high_rate_hz=1_000,
-        exploration_epsilon=1.0, exploration_seed=44,
-    )
-    second = MotorMapping.from_reward_free_calibration(
-        roots, activity, mode="mbon_direct", pool_width=2, high_rate_hz=1_000,
-        exploration_epsilon=1.0, exploration_seed=44,
-    )
+    roots = np.arange(MOTOR_POOL_COUNT * 3, dtype=np.int64)
+    activity = np.stack([(roots + 1) * scale for scale in (0.0, 0.4, 0.8, 1.2, 1.6)])
+    thresholds = MotorCalibrationThresholds(high_rate_hz=1_000)
+    first = calibrate_reward_free_motor(
+        roots, activity, mode="mbon_direct", pool_width=2,
+        thresholds=thresholds, exploration_epsilon=1.0, exploration_seed=44,
+    ).mapping
+    second = calibrate_reward_free_motor(
+        roots, activity, mode="mbon_direct", pool_width=2,
+        thresholds=thresholds, exploration_epsilon=1.0, exploration_seed=44,
+    ).mapping
     assert first.sha256 == second.sha256
-    assert min(len(pool) for pools in first.pools.values() for pool in pools) == 2
+    assert first.pool_width == 2
     interface = FixedMotorInterface(first)
     values = np.ones((2, len(roots)), dtype=np.float32)
     masks = {key: np.ones((2, *shape), dtype=dtype) for key, (shape, dtype) in MASK_SPEC.items()}
@@ -245,9 +257,14 @@ def test_matched_control_assertions_require_same_canonical_motor_and_budget() ->
         "sensory_mapping_sha256": "x",
         "motor_mapping_sha256": "m",
         "canonical_motor_root_ids_sha256": "r",
+        "canonical_motor_candidate_set_sha256": "candidates",
         "reinforcement_mapping_sha256": "reinforcement",
+        "reinforcement_mode": "outcome",
+        "plasticity_rule_sha256": "rule",
+        "fly_dynamics_sha256": "dynamics",
         "artifact_sha256": "artifact",
         "population_sha256": "population",
+        "plastic_topology_sha256": "real-topology",
     }
     assert_matched_control_manifests(
         [
@@ -256,6 +273,9 @@ def test_matched_control_assertions_require_same_canonical_motor_and_budget() ->
                 **shared,
                 "condition": "kc_mbon_shuffled",
                 "topology_condition": "kc_mbon_shuffled",
+                "plastic_topology_sha256": "shuffled-topology",
+                # A topology control cannot replay the real fly's behaviour, so
+                # its own actions and states are expected to differ.
                 "action_schedule_sha256": "independent-actions",
                 "state_hash_schedule_sha256": "independent-states",
             },
@@ -269,6 +289,7 @@ def test_matched_control_assertions_require_same_canonical_motor_and_budget() ->
                     **shared,
                     "condition": "kc_mbon_shuffled",
                     "topology_condition": "kc_mbon_shuffled",
+                    "plastic_topology_sha256": "shuffled-topology",
                     "motor_mapping_sha256": "different",
                 },
             ]

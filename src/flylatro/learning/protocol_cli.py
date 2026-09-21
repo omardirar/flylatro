@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Sequence
 
 from flylatro.learning.protocol import CONTROL_CONDITIONS, ExperimentProtocol
+from flylatro.learning.reinforcement import SENSITIVITY_CONDITIONS
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -19,6 +20,12 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--exposure-budget-decisions", type=int, required=True)
     parser.add_argument("--curriculum-ladder", default="1,2,3,5,8")
     parser.add_argument("--motor-mapping-id", required=True)
+    parser.add_argument(
+        "--reinforcement-condition",
+        choices=tuple(SENSITIVITY_CONDITIONS),
+        default="primary-progress",
+        help="predeclared reinforcement-shaping sensitivity condition",
+    )
     parser.add_argument("--output", type=Path, required=True)
     args = parser.parse_args(argv)
     protocol = ExperimentProtocol.create(
@@ -29,6 +36,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         exposure_budget_decisions=args.exposure_budget_decisions,
         curriculum_ladder=tuple(int(value) for value in args.curriculum_ladder.split(",")),
         motor_mapping_id=args.motor_mapping_id,
+        reinforcement_condition=args.reinforcement_condition,
     )
     protocol.save(args.output)
     print(json.dumps({"output": str(args.output), "sha256": protocol.sha256}))

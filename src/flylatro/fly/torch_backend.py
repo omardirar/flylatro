@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+from contextlib import contextmanager
 from dataclasses import asdict, dataclass
 import hashlib
 import json
+import time
 from typing import Any, Sequence
 
 import numpy as np
@@ -12,6 +14,17 @@ import numpy as np
 from flylatro.fly.backend import FlyActivity
 from flylatro.fly.encoder import Stimulus
 from flylatro.fly.flywire_artifact import FlyWireArtifact, connectivity_sha256
+
+
+#: How independent per-fly Poisson input is generated. `per-step-per-row-v1`
+#: draws one vector per fly per timestep. `chunked-per-row-v2` draws the same
+#: per-fly stream in timestep blocks, which cuts kernel launches without
+#: changing the statistical process or making rows depend on each other.
+#: Switching it changes `fly_dynamics_sha256`, so it is an explicit, versioned
+#: model decision taken only after the component benchmark shows Poisson
+#: generation dominates.
+POISSON_METHOD = "per-step-per-row-v1"
+POISSON_METHODS = ("per-step-per-row-v1", "chunked-per-row-v2")
 
 
 @dataclass(frozen=True, slots=True)
@@ -60,6 +73,9 @@ class TorchFlyWireBackend:
         shuffle_preserve_populations: bool = False,
         record_events: bool = False,
         shuffle_scope: str = "whole_brain",
+        poisson_method: str = POISSON_METHOD,
+        poisson_chunk_steps: int = 32,
+        profile_components: bool = False,
     ) -> None:
         try:
             import torch
@@ -76,6 +92,14 @@ class TorchFlyWireBackend:
             raise RuntimeError("CUDA was requested but is not available")
         self.parameters = parameters or ShiuLIFParameters()
         self.record_events = record_events
+        if poisson_method not in POISSON_METHODS:
+            raise ValueError(f"unknown poisson_method: {poisson_method}")
+        if poisson_chunk_steps < 1:
+            raise ValueError("poisson_chunk_steps must be positive")
+        self.poisson_method = poisson_method
+        self.poisson_chunk_steps = poisson_chunk_steps
+        self.profile_components = profile_components
+        self.component_seconds: dict[str, float] = {}
         selected = np.asarray(
             artifact.descending_indices if readout_indices is None else readout_indices,
             dtype=np.int64,
@@ -113,6 +137,7 @@ class TorchFlyWireBackend:
         payload = {
             "backend_version": self.backend_version,
             "parameters": asdict(self.parameters),
+            "poisson_method": self.poisson_method,
         }
         return hashlib.sha256(
             json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
@@ -171,44 +196,45 @@ class TorchFlyWireBackend:
         event_time: list[Any] = []
         refractory_steps = int(round(p.refractory_ms / p.dt_ms))
 
+        # The per-step spike probability is fixed for the whole decision, so it
+        # is computed once instead of once per row per timestep.
+        probability = (rates * (p.dt_ms / 1000.0)).clamp(0.0, 1.0)
+        chunk = self._PoissonSource(self, probability, step_count)
+        if self.profile_components:
+            self.component_seconds = dict.fromkeys(
+                ("poisson", "recurrent", "lif_update", "readout_sync"), 0.0
+            )
+
         with torch.no_grad():
             for step in range(step_count):
-                poisson_rows = [
-                    (
-                        torch.rand(
-                            self.neuron_count,
-                            device=self.device,
-                            generator=generator,
-                        )
-                        < (rates[row] * p.dt_ms / 1000.0).clamp(0.0, 1.0)
-                    ).to(torch.float32)
-                    for row, generator in enumerate(self._generators)
-                ]
-                poisson = torch.stack(poisson_rows) * p.poisson_scale
-                recurrent = self._recurrent(spikes)
-                incoming = p.synapse_scale_mv * (poisson + recurrent)
+                with self._timed("poisson"):
+                    poisson = chunk.draw(step) * p.poisson_scale
+                with self._timed("recurrent"):
+                    recurrent = self._recurrent(spikes)
+                with self._timed("lif_update"):
+                    incoming = p.synapse_scale_mv * (poisson + recurrent)
 
-                refractory = refractory * (1 - spikes.to(torch.int16)) + 1
-                can_integrate = (refractory > refractory_steps).to(torch.float32)
-                conductance_new = (
-                    conductance * (1.0 - p.dt_ms / p.synaptic_tau_ms)
-                    + delay[delay_slot] * can_integrate
-                )
-                target_slot = (delay_slot + delay.shape[0] - 1) % delay.shape[0]
-                delay[target_slot] = incoming
-                delay_slot = (delay_slot + 1) % delay.shape[0]
+                    refractory = refractory * (1 - spikes.to(torch.int16)) + 1
+                    can_integrate = (refractory > refractory_steps).to(torch.float32)
+                    conductance_new = (
+                        conductance * (1.0 - p.dt_ms / p.synaptic_tau_ms)
+                        + delay[delay_slot] * can_integrate
+                    )
+                    target_slot = (delay_slot + delay.shape[0] - 1) % delay.shape[0]
+                    delay[target_slot] = incoming
+                    delay_slot = (delay_slot + 1) % delay.shape[0]
 
-                voltage = voltage + (p.dt_ms / p.membrane_tau_ms) * (
-                    conductance - (voltage - p.resting_mv)
-                )
-                spikes = (voltage > p.threshold_mv).to(torch.float32)
-                voltage = torch.where(
-                    spikes.bool(), torch.full_like(voltage, p.reset_mv), voltage
-                )
-                conductance = torch.where(
-                    spikes.bool(), torch.zeros_like(conductance_new), conductance_new
-                )
-                counts += spikes.to(torch.int32)
+                    voltage = voltage + (p.dt_ms / p.membrane_tau_ms) * (
+                        conductance - (voltage - p.resting_mv)
+                    )
+                    spikes = (voltage > p.threshold_mv).to(torch.float32)
+                    voltage = torch.where(
+                        spikes.bool(), torch.full_like(voltage, p.reset_mv), voltage
+                    )
+                    conductance = torch.where(
+                        spikes.bool(), torch.zeros_like(conductance_new), conductance_new
+                    )
+                    counts += spikes.to(torch.int32)
 
                 if self.record_events and bool(spikes.any()):
                     batch_ids, neuron_indices = spikes.nonzero(as_tuple=True)
@@ -223,6 +249,8 @@ class TorchFlyWireBackend:
                     )
 
         self._state = (conductance, delay, spikes, voltage, refractory, counts)
+        with self._timed("readout_sync"):
+            self._synchronize()
         readout = torch.as_tensor(
             self.readout_indices, dtype=torch.int64, device=self.device
         )
@@ -245,6 +273,75 @@ class TorchFlyWireBackend:
 
     def _recurrent(self, spikes: Any) -> Any:
         return self.torch.sparse.mm(self.weights, spikes.T).T
+
+    def _synchronize(self) -> None:
+        if self.device.type == "cuda":
+            self.torch.cuda.synchronize(self.device)
+
+    @contextmanager
+    def _timed(self, component: str) -> Any:
+        """Attribute wall time to one simulator component when profiling."""
+
+        if not self.profile_components:
+            yield
+            return
+        self._synchronize()
+        started = time.perf_counter()
+        try:
+            yield
+        finally:
+            self._synchronize()
+            self.component_seconds[component] = self.component_seconds.get(
+                component, 0.0
+            ) + (time.perf_counter() - started)
+
+    class _PoissonSource:
+        """Independent per-fly Poisson spikes with a reproducible stream.
+
+        Both methods consume each fly's own generator in its own order, so rows
+        never influence each other and the statistical process is identical.
+        The chunked method only changes how many kernel launches that takes.
+        """
+
+        def __init__(self, backend: "TorchFlyWireBackend", probability: Any, steps: int) -> None:
+            self.backend = backend
+            self.probability = probability
+            self.steps = steps
+            self.block = min(backend.poisson_chunk_steps, steps)
+            self._cache: Any | None = None
+            self._cache_start = -1
+
+        def draw(self, step: int) -> Any:
+            torch = self.backend.torch
+            if self.backend.poisson_method == "per-step-per-row-v1":
+                rows = [
+                    (
+                        torch.rand(
+                            self.backend.neuron_count,
+                            device=self.backend.device,
+                            generator=generator,
+                        )
+                        < self.probability[row]
+                    ).to(torch.float32)
+                    for row, generator in enumerate(self.backend._generators)
+                ]
+                return torch.stack(rows)
+            if self._cache is None or step >= self._cache_start + self.block:
+                self._cache_start = step
+                span = min(self.block, self.steps - step)
+                rows = [
+                    (
+                        torch.rand(
+                            (span, self.backend.neuron_count),
+                            device=self.backend.device,
+                            generator=generator,
+                        )
+                        < self.probability[row]
+                    ).to(torch.float32)
+                    for row, generator in enumerate(self.backend._generators)
+                ]
+                self._cache = torch.stack(rows, dim=1)
+            return self._cache[step - self._cache_start]
 
     def simulate(self, stimulus: Stimulus, duration_ms: float) -> FlyActivity:
         activity = self.simulate_tensor(stimulus, duration_ms)

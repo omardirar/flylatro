@@ -12,18 +12,18 @@ from flylatro.env.upstream_contract import ObsDict
 from flylatro.fly.mushroom_body.topology import PlasticEdgeTopology
 from flylatro.fly.plastic_backend import PlasticFlyDecisionActivity
 from flylatro.fly.plastic_features import feature_names, observation_features
-from flylatro.interface.motor import HEAD_SIZES
+from flylatro.interface.motor import MOTOR_POOL_COUNT
 
 
 @dataclass(frozen=True, slots=True)
 class SyntheticPlasticCircuitSpec:
     seed: int = 1701
     kenyon_count: int = 48
-    output_count: int = sum(HEAD_SIZES.values())
+    output_count: int = MOTOR_POOL_COUNT * 2
     kc_active_fraction: float = 0.10
 
     def __post_init__(self) -> None:
-        if self.kenyon_count < 2 or self.output_count < sum(HEAD_SIZES.values()):
+        if self.kenyon_count < 2 or self.output_count < MOTOR_POOL_COUNT:
             raise ValueError("synthetic circuit populations are too small")
         if not 0 < self.kc_active_fraction <= 1:
             raise ValueError("kc_active_fraction must be in (0, 1]")
@@ -63,10 +63,20 @@ class SyntheticPlasticFlyProcessor:
             self.spec.kenyon_count,
         )
         anatomical = rng.uniform(0.5, 1.5, len(pre_local)).astype(np.float32)
+        kc_root_ids = np.arange(
+            8_900_000, 8_900_000 + self.spec.kenyon_count, dtype=np.int64
+        )
+        mbon_root_ids = np.arange(
+            9_000_000, 9_000_000 + self.spec.output_count, dtype=np.int64
+        )
+        # Root IDs mirror the real path: plastic edges terminate on the same
+        # MBON identities the MBON-direct motor interface reads.
         self.topology = PlasticEdgeTopology.synthetic(
             pre_local,
             post_local + self.spec.kenyon_count,
             anatomical,
+            pre_root_ids=kc_root_ids[pre_local],
+            post_root_ids=mbon_root_ids[post_local],
         )
         self._edge_pre_local = pre_local
         self._edge_post_local = post_local
@@ -82,12 +92,16 @@ class SyntheticPlasticFlyProcessor:
         self.output_root_ids = np.arange(
             root_start, root_start + self.spec.output_count, dtype=np.int64
         )
-        self.kc_root_ids = np.arange(
-            8_900_000, 8_900_000 + self.spec.kenyon_count, dtype=np.int64
+        self.kc_root_ids = kc_root_ids
+        self.kc_indices = np.arange(self.spec.kenyon_count, dtype=np.int64)
+        self.mbon_indices = (
+            np.arange(self.spec.output_count, dtype=np.int64) + self.spec.kenyon_count
         )
-        self.mbon_root_ids = np.arange(
-            9_000_000, 9_000_000 + self.spec.output_count, dtype=np.int64
+        self.output_indices = self.mbon_indices
+        self.kc_types = np.asarray(
+            ["KC-synthetic"] * self.spec.kenyon_count, dtype=np.str_
         )
+        self.mbon_root_ids = mbon_root_ids
         self.dan_root_ids = np.asarray([8_800_001, 8_800_002], dtype=np.int64)
         self.pam_root_ids = self.dan_root_ids[:1]
         self.ppl1_root_ids = self.dan_root_ids[1:]

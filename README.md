@@ -62,25 +62,58 @@ the experiments intended for the dedicated GPU machine.
 ## Primary commands
 
 ```text
-flylatro-train                 internal KC->MBON plastic learning
-flylatro-evaluate              frozen plastic-fly evaluation
-flylatro-analyze-synapses      learned-weight distributions and biological groups
-flylatro-create-sensory-mapping field-aware ALPN mapping and collision audit
-flylatro-calibrate-motor       reward-free canonical motor-pool artifact
-flylatro-calibrate-plasticity  short stability report and configurable gates
-flylatro-preflight             formal PASS/WARN/FAIL readiness report
-flylatro-create-protocol       paired replicate/control manifest
-flylatro-shuffle-reward        deterministic shuffled-reinforcement schedule
-bench-plasticity               sparse plastic-edge update benchmark
-bench-plastic-end-to-end       plastic-fly decision throughput
-flylatro-replay                deterministic simulator and optional live replay
-flylatro-visualize             fixed-coordinate neural/plasticity rendering
+flylatro-readiness               what remains before a real Ante-1 run
+flylatro-build-calibration-corpus frozen reward-free observable-state corpus
+flylatro-create-sensory-mapping  field-aware ALPN mapping + state-conditioned health
+flylatro-diagnose-representation neural representation, --stage pre or post
+flylatro-calibrate-motor         reward-free canonical motor-pool artifact
+flylatro-calibrate-plasticity    short stability report and configurable gates
+flylatro-diagnose-specificity    chosen-action vs diffuse plasticity attribution
+flylatro-preflight               PASS/WARN/FAIL gate, --profile initial or ante1
+flylatro-create-protocol         paired replicate/control manifest
+flylatro-materialize-protocol    one exact runnable configuration per arm
+flylatro-train                   internal KC->MBON plastic learning
+flylatro-evaluate                frozen plastic-fly evaluation
+flylatro-validate-controls       matched-control semantics report
+flylatro-analyze-synapses        learned-weight distributions and biological groups
+flylatro-shuffle-reward          deterministic shuffled-reinforcement schedule
+bench-plasticity                 sparse plastic-edge update benchmark
+bench-plastic-end-to-end         plastic-fly decision throughput and components
+flylatro-replay                  deterministic simulator and optional live replay
+flylatro-visualize               fixed-coordinate neural/plasticity rendering
 ```
 
+The dedicated-machine order is fixed and dependency-driven: build the artifact,
+freeze a reward-free calibration corpus, map and audit the sensory route on that
+corpus, measure representation **before** any motor artifact exists, choose the
+neural duration, calibrate the motor interface, re-measure representation
+**with** the persisted mapping, calibrate plasticity, run the initial preflight,
+run a tiny real experiment and its matched control, benchmark, build and
+materialize the protocol, run the strict preflight, then Ante-1.
+`flylatro-readiness` reports which of those stages is blocking and why.
+
+## Evidence provenance
+
+Every generated report carries an evidence identity: git commit and dirty state,
+config SHA, simulator version, FlyWire artifact/population/connectivity SHAs,
+plastic topology SHA and minimum synapse threshold, sensory feature-contract and
+mapping SHAs, calibration corpus SHA, motor candidate-set and mapping SHAs,
+reinforcement and plasticity rule SHAs, fly dynamics SHA, decision duration,
+output mode, backend and device.
+
+`flylatro-preflight` does not trust a report's own `PASS`. It checks that the
+report's identity matches the current experiment and fails with an exact
+mismatch message otherwise, so evidence measured at another duration, with
+another sensory or motor mapping, or against another artifact or topology cannot
+silently authorize a run.
+
 For a deliberately short showcase-training run,
-`flylatro-train --record-plasticity-events` records only changed KC->MBON edge
-IDs, root IDs and old/new/delta efficacy in streamed Parquet row groups. It is opt-in because detailed edge events can be large
-on the real graph.
+`flylatro-train --record-plasticity-events` records changed KC->MBON edge IDs,
+root IDs and old/new/delta efficacy in streamed Parquet row groups. It is opt-in
+because detailed edge events are large on the real graph and because routine
+training deliberately keeps the whole plastic state on the simulation device:
+a normal CUDA step copies only a small scalar block to the host, never a full
+efficacy, eligibility or reinforcement vector.
 
 `configs/plastic-real-template.toml` is deliberately a template whose budget
 basis is a refused placeholder. Real training must provide a measured budget
@@ -104,6 +137,15 @@ bench-end-to-end
 Legacy code still provides useful environment, seed, replay, benchmark, and
 visualisation infrastructure. A green legacy test is not evidence that the
 plastic-brain experiment is complete.
+
+## Licence
+
+Flylatro's own source is MIT licensed (see `LICENSE` and ADR 0013). That licence
+covers this repository's code only. FlyWire connectome data, Balatro itself, the
+pinned `balatroagent` simulator and every third-party Python dependency carry
+their own terms and are not redistributed here; see
+[docs/DEPENDENCIES.md](docs/DEPENDENCIES.md). `uv.lock` pins the resolved
+dependency graph, including the pinned simulator revision.
 
 ## External data and assets
 

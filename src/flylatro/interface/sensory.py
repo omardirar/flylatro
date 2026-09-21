@@ -29,6 +29,7 @@ class SensoryMapping:
     feature_names: tuple[str, ...]
     population_indices: NDArray[np.int64]
     population_root_ids: NDArray[np.int64]
+    available_alpn_indices: NDArray[np.int64]
     available_alpn_root_ids: NDArray[np.int64]
     max_rate_hz: float = 150.0
     input_population_rule: str = "classification.class == ALPN"
@@ -42,6 +43,8 @@ class SensoryMapping:
             raise ValueError("population root IDs do not match mapping indices")
         if self.available_alpn_root_ids.ndim != 1 or not len(self.available_alpn_root_ids):
             raise ValueError("available ALPN root IDs must be a non-empty vector")
+        if self.available_alpn_indices.shape != self.available_alpn_root_ids.shape:
+            raise ValueError("available ALPN indices and root IDs must align")
         if self.population_indices.size and (
             self.population_indices.min() < 0
             or self.population_indices.max() >= self.neuron_count
@@ -82,6 +85,7 @@ class SensoryMapping:
             "feature_names": list(self.feature_names),
             "population_indices": self.population_indices.tolist(),
             "population_root_ids": self.population_root_ids.tolist(),
+            "available_alpn_indices": self.available_alpn_indices.tolist(),
             "available_alpn_root_ids": self.available_alpn_root_ids.tolist(),
             "max_rate_hz": self.max_rate_hz,
             "input_population_rule": self.input_population_rule,
@@ -126,12 +130,22 @@ class SensoryMapping:
             feature_names=names,
             population_indices=indices,
             population_root_ids=artifact.root_ids[indices],
+            available_alpn_indices=np.asarray(inputs, dtype=np.int64).copy(),
             available_alpn_root_ids=artifact.root_ids[inputs].copy(),
             max_rate_hz=max_rate_hz,
             input_population_rule=rule,
         )
 
     def collision_audit(self) -> dict[str, object]:
+        """Structural assignment counts.
+
+        These are *informational* diagnostics of the fixed random projection.
+        A high assignment count says how many Balatro feature channels could in
+        principle drive one ALPN, not how many of them are simultaneously
+        active in any real state.  Readiness must be judged from the
+        state-conditioned metrics in ``flylatro.analysis.sensory_health``.
+        """
+
         unique, used_counts = np.unique(self.population_root_ids, return_counts=True)
         lookup = {int(root): int(count) for root, count in zip(unique, used_counts, strict=True)}
         counts = np.asarray(
@@ -158,6 +172,13 @@ class SensoryMapping:
             for name, quantile in (("min", 0), ("median", 0.5), ("p90", 0.9), ("p95", 0.95), ("p99", 0.99), ("max", 1.0))
         }
         return {
+            "metric_kind": "structural_assignment_capacity_informational",
+            "interpretation": (
+                "structural collisions count feature channels sharing one ALPN "
+                "across the whole contract; simultaneous collision load counts "
+                "channels that are non-zero in the same observed state and is "
+                "measured separately on the calibration corpus"
+            ),
             "assignments": int(self.population_root_ids.size),
             "feature_channels": len(self.feature_names),
             "population_width": int(self.population_indices.shape[1]),
@@ -185,6 +206,33 @@ class SensoryMapping:
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(json.dumps(self.to_manifest(), indent=2, sort_keys=True) + "\n")
         return path
+
+    @classmethod
+    def from_manifest(cls, payload: dict[str, object]) -> "SensoryMapping":
+        mapping = cls(
+            version=str(payload["version"]),
+            mapping_seed=int(payload["mapping_seed"]),
+            neuron_count=int(payload["neuron_count"]),
+            feature_names=tuple(str(value) for value in payload["feature_names"]),
+            population_indices=np.asarray(payload["population_indices"], dtype=np.int64),
+            population_root_ids=np.asarray(payload["population_root_ids"], dtype=np.int64),
+            available_alpn_indices=np.asarray(
+                payload["available_alpn_indices"], dtype=np.int64
+            ),
+            available_alpn_root_ids=np.asarray(
+                payload["available_alpn_root_ids"], dtype=np.int64
+            ),
+            max_rate_hz=float(payload["max_rate_hz"]),
+            input_population_rule=str(payload["input_population_rule"]),
+            collision_policy=str(payload["collision_policy"]),
+        )
+        if payload.get("sha256") != mapping.sha256:
+            raise ValueError("sensory mapping artifact hash mismatch")
+        return mapping
+
+    @classmethod
+    def load(cls, path: Path) -> "SensoryMapping":
+        return cls.from_manifest(json.loads(Path(path).read_text(encoding="utf-8")))
 
 
 class FixedPlasticSensoryEncoder:

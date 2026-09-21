@@ -1,5 +1,15 @@
 # Dependencies, licences, and external data
 
+Flylatro's own source code is **MIT licensed** (`LICENSE`, ADR 0013). That
+licence was chosen deliberately for research reuse and is not inherited from any
+dependency. It covers this repository's code only. Everything in the table below
+carries its own terms, and none of it is redistributed here.
+
+`uv.lock` pins the fully resolved dependency graph, including the exact
+`balatro-sim` git revision, with hashes. `pyproject.toml` remains the authority
+for declared version ranges; refresh the lock with `uv lock` as a deliberate,
+reviewable change.
+
 Flylatro keeps proprietary Balatro assets and FlyWire data outside this
 repository. Dependencies are separated into small core, training, simulator,
 connectome-build, and visualisation extras so routine tests do not import heavy
@@ -41,9 +51,11 @@ The implementation distinguishes evidence from modelling choices:
 | Bennett et al. 2021, DOI `10.1038/s41467-021-22592-4` | A computational precedent for KC->MBON plasticity and reinforcement signals | A requirement for an external learned critic; V1 begins with absolute outcome pulses |
 | Gerstner et al. 2018, DOI `10.3389/fncir.2018.00053` | Eligibility traces as a transparent three-factor modelling convention | Fly-specific eligibility constants |
 
-The field-aware synthetic sensory projection, reward-free calibrated motor
-pools, synthetic reinforcement magnitudes, trace decay, efficacy bounds,
-simplified LIF model, and decision-
-scale timing are Flylatro-specific engineering choices. They are versioned in
+The field-aware synthetic sensory projection, the contextual motor routing that
+lets mutually exclusive target heads share one neural pool, the reward-free
+median/IQR motor normalization, the reward-free calibrated motor pools, synthetic
+reinforcement magnitudes, trace decay, efficacy bounds, simplified LIF model,
+Poisson input generation method, and decision-scale timing are Flylatro-specific
+engineering choices. They are versioned in
 configuration and checkpoint hashes and must be calibrated empirically rather
 than described as measured biological constants.

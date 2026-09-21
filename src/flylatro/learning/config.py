@@ -24,7 +24,17 @@ from flylatro.fly.synthetic_plastic import (
     SyntheticPlasticFlyProcessor,
 )
 from flylatro.fly.plastic_features import channel_manifest, feature_names
-from flylatro.interface.motor import HEAD_SIZES, FixedMotorInterface, MotorMapping
+from flylatro.interface.motor import (
+    MOTOR_POOL_COUNT,
+    FixedMotorInterface,
+    MotorMapping,
+)
+from flylatro.interface.motor_calibration import (
+    MotorCalibrationError,
+    MotorCalibrationThresholds,
+    calibrate_reward_free_motor,
+)
+from flylatro.interface.motor_candidates import canonical_motor_candidates
 from flylatro.interface.sensory import FixedPlasticSensoryEncoder, SensoryMapping
 from flylatro.learning.agent import PlasticFlyAgent
 from flylatro.learning.reinforcement import ReinforcementConfig, ReinforcementMapper
@@ -96,6 +106,36 @@ class CurriculumSettings:
 
 
 @dataclass(frozen=True, slots=True)
+class CalibrationSettings:
+    """Paths to the frozen evidence this experiment is authorized against."""
+
+    corpus_path: str = ""
+    sensory_health_report: str = ""
+    representation_pre_report: str = ""
+    representation_post_report: str = ""
+    motor_calibration_report: str = ""
+    reachability_report: str = ""
+    plasticity_report: str = ""
+    specificity_report: str = ""
+    benchmark_report: str = ""
+
+
+@dataclass(frozen=True, slots=True)
+class ProtocolBinding:
+    """Identity of the materialized protocol arm this configuration executes."""
+
+    protocol_path: str = ""
+    protocol_sha256: str = ""
+    protocol_name: str = ""
+    replicate_id: str = ""
+    arm_id: str = ""
+
+    @property
+    def bound(self) -> bool:
+        return bool(self.protocol_sha256)
+
+
+@dataclass(frozen=True, slots=True)
 class RuntimeSettings:
     output_root: str = "runs"
     tensorboard: bool = False
@@ -113,6 +153,8 @@ class PlasticExperimentConfig:
     training: TrainingSettings
     curriculum: CurriculumSettings
     runtime: RuntimeSettings
+    calibration: CalibrationSettings = CalibrationSettings()
+    protocol: ProtocolBinding = ProtocolBinding()
 
     @classmethod
     def load(cls, path: Path) -> "PlasticExperimentConfig":
@@ -128,6 +170,8 @@ class PlasticExperimentConfig:
             "training",
             "curriculum",
             "runtime",
+            "calibration",
+            "protocol",
         }
         unknown = raw.keys() - allowed
         if unknown:
@@ -151,6 +195,8 @@ class PlasticExperimentConfig:
             training=_section(TrainingSettings, raw.get("training", {})),
             curriculum=_section(CurriculumSettings, curriculum),
             runtime=_section(RuntimeSettings, raw.get("runtime", {})),
+            calibration=_section(CalibrationSettings, raw.get("calibration", {})),
+            protocol=_section(ProtocolBinding, raw.get("protocol", {})),
         )
         config.validate()
         return config
@@ -236,6 +282,8 @@ class PlasticExperimentConfig:
             "training": asdict(self.training),
             "curriculum": asdict(self.curriculum),
             "runtime": asdict(self.runtime),
+            "calibration": asdict(self.calibration),
+            "protocol": asdict(self.protocol),
         }
 
     def require_heavy_opt_in(self, heavy: bool) -> None:
@@ -260,23 +308,162 @@ class PlasticTrainingStack:
     components: dict[str, Any]
 
 
+def synthetic_circuit_spec(
+    config: PlasticExperimentConfig,
+) -> SyntheticPlasticCircuitSpec:
+    """The development circuit this configuration declares."""
+
+    return SyntheticPlasticCircuitSpec(
+        seed=config.fly.synthetic_seed,
+        kenyon_count=config.fly.synthetic_kenyon_count,
+        output_count=MOTOR_POOL_COUNT * config.fly.motor_pool_width + 16,
+    )
+
+
+#: Identity placeholders for the development-only synthetic circuit. They are
+#: constants so a synthetic report is still provenance-checkable.
+SYNTHETIC_ARTIFACT_IDENTITY = "synthetic-development-only"
+SYNTHETIC_SENSORY_IDENTITY = "synthetic-fixed-projection-v1"
+
+
+def fly_dynamics_payload(config: PlasticExperimentConfig) -> dict[str, Any]:
+    """The exact fixed-dynamics identity of a configuration.
+
+    Computed without constructing the backend so that preflight can verify a
+    report's provenance without loading the whole connectome twice.
+    """
+
+    if config.fly.backend == "synthetic":
+        return {
+            "version": "synthetic-plastic-mushroom-body-v1",
+            "mode": config.fly.mode,
+            "seed": config.fly.synthetic_seed,
+            "kenyon_count": config.fly.synthetic_kenyon_count,
+            "decision_duration_ms": 1.0,
+            "fast_state_policy": "stateless-synthetic-decision",
+        }
+    from flylatro.fly.plastic_backend import PlasticTorchFlyWireBackend
+    from flylatro.fly.torch_backend import POISSON_METHOD, ShiuLIFParameters
+
+    backend_payload = {
+        "backend_version": PlasticTorchFlyWireBackend.backend_version,
+        "parameters": asdict(ShiuLIFParameters()),
+        "poisson_method": POISSON_METHOD,
+    }
+    return {
+        "backend_dynamics_sha256": hashlib.sha256(
+            json.dumps(backend_payload, sort_keys=True, separators=(",", ":")).encode()
+        ).hexdigest(),
+        "decision_duration_ms": config.fly.duration_ms,
+        "reset_fast_state_each_decision": config.fly.reset_fast_state_each_decision,
+    }
+
+
+def payload_sha256(payload: Mapping[str, Any]) -> str:
+    return hashlib.sha256(
+        json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
+    ).hexdigest()
+
+
+def resolve_path(config: PlasticExperimentConfig, value: str) -> Path:
+    """Resolve a configured path relative to the repository root."""
+
+    path = Path(value)
+    return path if path.is_absolute() else config.source_path.parent.parent / path
+
+
+def calibration_corpus_hash(config: PlasticExperimentConfig) -> str | None:
+    """SHA-256 of the configured frozen calibration corpus, if any."""
+
+    if not config.calibration.corpus_path:
+        return None
+    manifest = resolve_path(config, config.calibration.corpus_path)
+    manifest = manifest.with_suffix(manifest.suffix + ".manifest.json")
+    if not manifest.exists():
+        raise FileNotFoundError(
+            f"configured calibration corpus manifest is missing: {manifest}"
+        )
+    return str(json.loads(manifest.read_text(encoding="utf-8"))["sha256"])
+
+
+def _development_motor_mapping(
+    config: PlasticExperimentConfig,
+    env: Any,
+    processor: Any,
+    topology: PlasticEdgeTopology,
+    learners: int,
+) -> tuple[MotorMapping, str]:
+    """Reward-free calibration for the synthetic development circuit only.
+
+    The synthetic circuit is an engineering test double, so the diversity
+    thresholds are deliberately relaxed.  Real experiments must supply the
+    persisted `flylatro-calibrate-motor` artifact instead.
+    """
+
+    rows = []
+    for sample in range(8):
+        observations, _ = env.reset(
+            tuple(70_000_000 + sample * learners + row for row in range(learners))
+        )
+        activity = processor.process(
+            observations,
+            fly_seeds=tuple(
+                80_000_000 + sample * learners + row for row in range(learners)
+            ),
+            efficacy=np.ones((learners, topology.edge_count), dtype=np.float32),
+        )
+        rows.append(activity.output_activity)
+    try:
+        result = calibrate_reward_free_motor(
+            processor.output_root_ids,
+            np.concatenate(rows, axis=0),
+            mode=config.fly.mode,
+            pool_width=config.fly.motor_pool_width,
+            thresholds=MotorCalibrationThresholds(
+                minimum_candidate_robust_scale_hz=1e-9,
+                minimum_scale_hz=0.5,
+                minimum_normalized_option_range=0.0,
+                minimum_effective_signal_fraction=0.0,
+                maximum_pool_silent_fraction=1.0,
+            ),
+            exploration_epsilon=config.motor.exploration_epsilon,
+            exploration_temperature=config.motor.exploration_temperature,
+            exploration_seed=config.motor.exploration_seed,
+            calibration_metadata={
+                "development_only_relaxed_thresholds": True,
+                "state_sampling": "synthetic development bootstrap resets",
+                "reward_or_outcome_observed": False,
+            },
+        )
+    except MotorCalibrationError:
+        return (
+            MotorMapping.contiguous_pools(
+                processor.output_root_ids,
+                mode=config.fly.mode,
+                pool_width=config.fly.motor_pool_width,
+                exploration_epsilon=config.motor.exploration_epsilon,
+                exploration_temperature=config.motor.exploration_temperature,
+                exploration_seed=config.motor.exploration_seed,
+            ),
+            "uncalibrated-structural-bootstrap",
+        )
+    return result.mapping, f"development-reward-free-calibration-{result.status.lower()}"
+
+
 def build_plastic_stack(
     config: PlasticExperimentConfig, *, allow_uncalibrated_motor: bool = False
 ) -> PlasticTrainingStack:
+    protocol_arm = validate_protocol_binding(config)
+    calibration_corpus_sha256 = calibration_corpus_hash(config)
     env = build_plastic_environment(config)
     learners = config.environment.num_envs
     if config.fly.backend == "synthetic":
         processor = SyntheticPlasticFlyProcessor(
-            SyntheticPlasticCircuitSpec(
-                seed=config.fly.synthetic_seed,
-                kenyon_count=config.fly.synthetic_kenyon_count,
-                output_count=sum(HEAD_SIZES.values()) * config.fly.motor_pool_width,
-            ),
-            mode=config.fly.mode,
+            synthetic_circuit_spec(config), mode=config.fly.mode
         )
         topology = processor.topology
-        artifact_hash = "synthetic-development-only"
-        population_hash = "synthetic-development-only"
+        artifact_hash = SYNTHETIC_ARTIFACT_IDENTITY
+        population_hash = SYNTHETIC_ARTIFACT_IDENTITY
         population_manifest: dict[str, Any] = {
             "development_only": True,
             "counts": {
@@ -287,7 +474,10 @@ def build_plastic_stack(
                 "kc_mbon_edges": topology.edge_count,
             },
         }
-        sensory_hash = "synthetic-fixed-projection-v1"
+        candidate_set = None
+        candidate_set_hash = None
+        candidate_manifest = {"development_only": True}
+        sensory_hash = SYNTHETIC_SENSORY_IDENTITY
         sensory_manifest: dict[str, Any] = {
             "version": "synthetic-fixed-projection-v1",
             "seed": config.fly.synthetic_seed,
@@ -339,11 +529,11 @@ def build_plastic_stack(
             max_rate_hz=config.fly.max_rate_hz,
         )
         encoder = FixedPlasticSensoryEncoder(sensory_mapping)
-        output_indices = (
-            artifact.mbon_indices
-            if config.fly.mode == "mbon_direct"
-            else artifact.descending_indices
-        )
+        # The motor universe is defined by the REAL unshuffled anatomy at the
+        # canonical minimum synapse count, so a topology control or a weak-edge
+        # sensitivity experiment can never move it.
+        candidate_set = canonical_motor_candidates(artifact, mode=config.fly.mode)
+        output_indices = candidate_set.indices
         readout = PlasticFlyProcessor.required_readout_indices(
             artifact, topology, output_indices
         )
@@ -375,17 +565,24 @@ def build_plastic_stack(
                 and isinstance(value, (int, np.integer))
             },
         }
+        candidate_set_hash = candidate_set.sha256
+        candidate_manifest = {
+            "version": candidate_set.version,
+            "rule": candidate_set.rule,
+            "mode": candidate_set.mode,
+            "minimum_synapse_count": candidate_set.minimum_synapse_count,
+            "candidate_count": len(candidate_set),
+            "sha256": candidate_set_hash,
+        }
         sensory_hash = sensory_mapping.sha256
         sensory_manifest = sensory_mapping.to_manifest()
         backend_version = backend.backend_version
         fly_connectivity_hash = backend.connectivity_hash
-        dynamics_payload = {
-            "backend_dynamics_sha256": backend.dynamics_hash,
-            "decision_duration_ms": config.fly.duration_ms,
-            "reset_fast_state_each_decision": (
-                config.fly.reset_fast_state_each_decision
-            ),
-        }
+        dynamics_payload = fly_dynamics_payload(config)
+        if dynamics_payload["backend_dynamics_sha256"] != backend.dynamics_hash:
+            raise RuntimeError(
+                "declared fly dynamics identity differs from the constructed backend"
+            )
         topology_procedure = backend.topology_procedure
     state = (
         TorchPlasticEdgeState.initialize(
@@ -402,18 +599,39 @@ def build_plastic_stack(
         if not motor_path.is_absolute():
             motor_path = config.source_path.parent.parent / motor_path
         configured_motor_path = motor_path
+    motor_calibration_status = "persisted-artifact"
     if configured_motor_path is not None and configured_motor_path.exists():
         motor_mapping = MotorMapping.load(configured_motor_path)
         if motor_mapping.mode != config.fly.mode or not np.array_equal(
             motor_mapping.output_root_ids, processor.output_root_ids
         ):
-            raise ValueError("motor calibration artifact does not match canonical output roots")
+            raise ValueError(
+                "motor calibration artifact does not match the canonical motor "
+                "candidate universe for this output mode"
+            )
+        if (
+            candidate_set_hash is not None
+            and motor_mapping.candidate_set_sha256 is not None
+            and motor_mapping.candidate_set_sha256 != candidate_set_hash
+        ):
+            raise ValueError(
+                "motor artifact candidate-set hash "
+                f"{motor_mapping.candidate_set_sha256} differs from the canonical "
+                f"universe {candidate_set_hash}; the motor map must be identical "
+                "across every matched topology control"
+            )
+        motor_mapping = motor_mapping.with_exploration(
+            epsilon=config.motor.exploration_epsilon,
+            temperature=config.motor.exploration_temperature,
+            seed=config.motor.exploration_seed,
+        )
     elif config.fly.backend == "flywire" and not allow_uncalibrated_motor:
         raise ValueError(
             f"real FlyWire training requires the reward-free motor mapping artifact: {configured_motor_path}"
         )
     elif config.fly.backend == "flywire":
-        motor_mapping = MotorMapping.round_robin(
+        motor_calibration_status = "uncalibrated-structural-bootstrap"
+        motor_mapping = MotorMapping.contiguous_pools(
             processor.output_root_ids,
             mode=config.fly.mode,
             pool_width=config.fly.motor_pool_width,
@@ -421,26 +639,17 @@ def build_plastic_stack(
             exploration_seed=config.motor.exploration_seed,
         )
     else:
-        calibration_rows = []
-        for sample in range(8):
-            observations, _ = env.reset(
-                tuple(70_000_000 + sample * learners + row for row in range(learners))
-            )
-            activity = processor.process(
-                observations,
-                fly_seeds=tuple(80_000_000 + sample * learners + row for row in range(learners)),
-                efficacy=np.ones((learners, topology.edge_count), dtype=np.float32),
-            )
-            calibration_rows.append(activity.output_activity)
-        motor_mapping = MotorMapping.from_reward_free_calibration(
-            processor.output_root_ids,
-            np.concatenate(calibration_rows, axis=0),
-            mode=config.fly.mode,
-            pool_width=config.fly.motor_pool_width,
-            high_rate_hz=200.0,
-            exploration_epsilon=config.motor.exploration_epsilon,
-            exploration_temperature=config.motor.exploration_temperature,
-            exploration_seed=config.motor.exploration_seed,
+        motor_mapping, motor_calibration_status = _development_motor_mapping(
+            config, env, processor, topology, learners
+        )
+    if protocol_arm is not None and protocol_arm["motor_mapping_id"] not in {
+        motor_mapping.structure_sha256,
+        motor_mapping.sha256,
+    }:
+        raise ValueError(
+            f"protocol arm {protocol_arm['arm_id']} requires motor mapping "
+            f"{protocol_arm['motor_mapping_id']} but this configuration loaded "
+            f"{motor_mapping.structure_sha256}"
         )
     motor = FixedMotorInterface(motor_mapping)
     reinforcement = ReinforcementMapper(config.reinforcement)
@@ -488,11 +697,7 @@ def build_plastic_stack(
         "fly_backend": backend_version,
         "fly_connectivity_sha256": fly_connectivity_hash,
         "fly_dynamics": dynamics_payload,
-        "fly_dynamics_sha256": hashlib.sha256(
-            json.dumps(
-                dynamics_payload, sort_keys=True, separators=(",", ":")
-            ).encode()
-        ).hexdigest(),
+        "fly_dynamics_sha256": payload_sha256(dynamics_payload),
         "output_mode": config.fly.mode,
         "topology_condition": config.fly.topology,
         "topology_procedure": topology_procedure,
@@ -507,14 +712,41 @@ def build_plastic_stack(
         "plasticity_rule_sha256": config.plasticity.sha256,
         "sensory_mapping_sha256": sensory_hash,
         "sensory_mapping": sensory_manifest,
-        "motor_mapping_sha256": motor_mapping.sha256,
+        # Structure only: exploration is per-replicate interface state and
+        # must not make a matched control look like a different interface.
+        "motor_mapping_sha256": motor_mapping.structure_sha256,
+        "motor_artifact_sha256": motor_mapping.sha256,
+        "motor_exploration": {
+            "epsilon": config.motor.exploration_epsilon,
+            "temperature": config.motor.exploration_temperature,
+            "seed": config.motor.exploration_seed,
+        },
         "motor_mapping": motor_mapping.to_manifest(),
-        "motor_mapping_bootstrap_only": bool(
-            allow_uncalibrated_motor and config.fly.backend == "flywire" and (configured_motor_path is None or not configured_motor_path.exists())
-        ),
+        "motor_mapping_bootstrap_only": motor_calibration_status
+        != "persisted-artifact",
         "canonical_motor_root_ids_sha256": hashlib.sha256(
             processor.output_root_ids.astype("<i8", copy=False).tobytes()
         ).hexdigest(),
+        "canonical_motor_candidate_set_sha256": candidate_set_hash,
+        "canonical_motor_candidate_set": candidate_manifest,
+        "motor_routing_sha256": motor_mapping.routing.sha256,
+        "motor_normalization_sha256": (
+            None if motor_mapping.normalization is None else motor_mapping.normalization.sha256
+        ),
+        "motor_calibration_status": motor_calibration_status,
+        "motor_supported_action_types": list(
+            motor_mapping.routing.supported_action_types
+        ),
+        "motor_reserved_action_types": list(
+            motor_mapping.routing.reserved_action_types
+        ),
+        "calibration_corpus_sha256": calibration_corpus_sha256,
+        "protocol_sha256": config.protocol.protocol_sha256 or None,
+        "protocol_name": config.protocol.protocol_name or None,
+        "protocol_replicate_id": config.protocol.replicate_id or None,
+        "protocol_arm_id": config.protocol.arm_id or None,
+        "reinforcement_condition": config.reinforcement.condition,
+        "simulator_version": getattr(env, "simulator_version", "unknown"),
         "reinforcement_mapping_sha256": config.reinforcement.sha256,
         "reinforcement_mapping": asdict(config.reinforcement),
         "plasticity_rule": asdict(config.plasticity),
@@ -540,6 +772,26 @@ def build_plastic_stack(
         ),
     }
     return PlasticTrainingStack(env, agent, trainer, components)
+
+
+def validate_protocol_binding(config: PlasticExperimentConfig) -> dict[str, Any] | None:
+    """Refuse to run a protocol arm whose configuration drifted from the manifest."""
+
+    binding = config.protocol
+    if not binding.bound:
+        return None
+    from flylatro.learning.protocol import assert_configuration_matches_arm
+
+    if not binding.protocol_path:
+        raise ValueError("a bound protocol arm must record protocol_path")
+    path = resolve_path(config, binding.protocol_path)
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    if payload.get("sha256") != binding.protocol_sha256:
+        raise ValueError(
+            f"protocol {path} has SHA-256 {payload.get('sha256')} but this run is "
+            f"bound to {binding.protocol_sha256}"
+        )
+    return assert_configuration_matches_arm(payload, config)
 
 
 def build_plastic_environment(config: PlasticExperimentConfig) -> Any:

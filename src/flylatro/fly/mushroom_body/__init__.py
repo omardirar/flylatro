@@ -3,6 +3,7 @@
 from flylatro.fly.mushroom_body.plasticity import (
     PlasticityConfig,
     PlasticityEvent,
+    PlasticityEventDetail,
     ThreeFactorPlasticity,
 )
 from flylatro.fly.mushroom_body.state import PlasticEdgeState
@@ -13,5 +14,6 @@ __all__ = [
     "PlasticEdgeTopology",
     "PlasticityConfig",
     "PlasticityEvent",
+    "PlasticityEventDetail",
     "ThreeFactorPlasticity",
 ]

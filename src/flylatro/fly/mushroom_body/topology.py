@@ -148,6 +148,9 @@ class PlasticEdgeTopology:
         pre_indices: NDArray[np.int64],
         post_indices: NDArray[np.int64],
         anatomical_weights: NDArray[np.float32],
+        *,
+        pre_root_ids: NDArray[np.int64] | None = None,
+        post_root_ids: NDArray[np.int64] | None = None,
     ) -> "PlasticEdgeTopology":
         count = len(pre_indices)
         edge_indices = np.arange(count, dtype=np.int64)
@@ -156,12 +159,16 @@ class PlasticEdgeTopology:
             edge_indices=edge_indices,
             pre_indices=np.asarray(pre_indices, dtype=np.int64),
             post_indices=np.asarray(post_indices, dtype=np.int64),
-            pre_root_ids=np.asarray(pre_indices, dtype=np.int64),
-            post_root_ids=np.asarray(post_indices, dtype=np.int64),
+            pre_root_ids=np.asarray(
+                pre_indices if pre_root_ids is None else pre_root_ids, dtype=np.int64
+            ),
+            post_root_ids=np.asarray(
+                post_indices if post_root_ids is None else post_root_ids, dtype=np.int64
+            ),
             anatomical_weights=np.asarray(anatomical_weights, dtype=np.float32),
-            kc_types=np.full(count, "KC-synthetic", dtype=np.str_),
-            mbon_types=np.full(count, "MBON-synthetic", dtype=np.str_),
-            compartments=np.full(count, "synthetic", dtype=np.str_),
+            kc_types=np.asarray(["KC-synthetic"] * count, dtype=np.str_),
+            mbon_types=np.asarray(["MBON-synthetic"] * count, dtype=np.str_),
+            compartments=np.asarray(["synthetic"] * count, dtype=np.str_),
             minimum_synapse_count=1,
         )
 

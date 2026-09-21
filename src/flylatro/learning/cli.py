@@ -87,7 +87,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         raise FileExistsError(f"run directory is not empty: {run_dir}")
     run_dir.mkdir(parents=True, exist_ok=True)
     stack = build_plastic_stack(config)
-    stack.trainer.record_sparse_changes = args.record_plasticity_events
+    stack.trainer.record_detailed_plasticity = args.record_plasticity_events
     curriculum = (
         PlasticAnteCurriculum(
             PlasticCurriculumConfig(
@@ -297,16 +297,18 @@ def main(argv: Sequence[str] | None = None) -> int:
             if plasticity_parquet is not None:
                 plasticity_parquet.close()
     generated_action_hash = sha256_file(run_dir / "training-actions.jsonl")
-    completed_components = dict(stack.components)
-    if completed_components.get("action_schedule_sha256") is None:
-        completed_components["action_schedule_sha256"] = generated_action_hash
-        completed_components["state_hash_schedule_sha256"] = generated_action_hash
-    elif completed_components["action_schedule_sha256"] != generated_action_hash:
-        raise RuntimeError(
-            "executed matched action schedule bytes differ from the source schedule"
-        )
+    completed_at = datetime.now(timezone.utc).isoformat()
+    # One canonical completed identity is written to every final product, so a
+    # manifest, a summary and a checkpoint can never disagree merely because
+    # one of them was serialized first.
+    completed_components = finalize_components(
+        stack.components,
+        executed_action_schedule_sha256=generated_action_hash,
+        reserved_action_legal_observations=stack.agent.motor.reserved_action_legal_count,
+        completed_at=completed_at,
+    )
     manifest["components"] = completed_components
-    manifest["completed_at"] = datetime.now(timezone.utc).isoformat()
+    manifest["completed_at"] = completed_at
     (run_dir / "run-manifest.json").write_text(
         json.dumps(manifest, indent=2, sort_keys=True) + "\n", encoding="utf-8"
     )
@@ -315,24 +317,23 @@ def main(argv: Sequence[str] | None = None) -> int:
         final_path,
         stack.trainer,
         experiment_config=config.to_dict(),
-        component_metadata={
-            **stack.components,
-            "executed_action_schedule_sha256": generated_action_hash,
-        },
+        component_metadata=completed_components,
         curriculum_state=(curriculum.state_dict() if curriculum is not None else None),
     )
     summary = {
         "run_dir": str(run_dir),
         "checkpoint": str(final_path),
+        "completed_at": completed_at,
         "environment_decisions": stack.trainer.state.environment_decisions,
         "episodes": stack.trainer.state.completed_episodes,
         "plasticity_events": stack.trainer.state.plasticity_events,
         "plastic_weight_sha256": stack.agent.plasticity.state.weight_sha256,
+        "plastic_weight_audit": stack.agent.plasticity.weight_audit(),
         "external_trainable_parameter_count": 0,
         "runtime": _runtime_metrics(
             training_started, stack.trainer.state.environment_decisions
         ),
-        "components": stack.components,
+        "components": completed_components,
         "record_plasticity_events": args.record_plasticity_events,
     }
     (run_dir / "run-summary.json").write_text(
@@ -357,6 +358,55 @@ def main(argv: Sequence[str] | None = None) -> int:
         )
     )
     return 0
+
+
+COMPLETED_COMPONENT_IDENTITY_VERSION = "completed-run-component-identity-v1"
+
+#: Fields that must be identical in the run manifest, the run summary and the
+#: final checkpoint (and its manifest). Asserted by tests.
+COMPLETED_IDENTITY_FIELDS: tuple[str, ...] = (
+    "executed_action_schedule_sha256",
+    "action_schedule_sha256",
+    "state_hash_schedule_sha256",
+    "motor_mapping_sha256",
+    "sensory_mapping_sha256",
+    "plastic_topology_sha256",
+    "plasticity_rule_sha256",
+    "reinforcement_mapping_sha256",
+    "canonical_motor_candidate_set_sha256",
+    "fly_dynamics_sha256",
+    "artifact_sha256",
+    "population_sha256",
+    "condition",
+    "completed_at",
+)
+
+
+def finalize_components(
+    components: dict[str, object],
+    *,
+    executed_action_schedule_sha256: str,
+    reserved_action_legal_observations: int,
+    completed_at: str,
+) -> dict[str, object]:
+    """Build the single immutable completed-run component identity."""
+
+    completed = dict(components)
+    declared = completed.get("action_schedule_sha256")
+    if declared is None:
+        completed["action_schedule_sha256"] = executed_action_schedule_sha256
+        completed["state_hash_schedule_sha256"] = executed_action_schedule_sha256
+    elif declared != executed_action_schedule_sha256:
+        raise RuntimeError(
+            "executed matched action schedule bytes differ from the source schedule"
+        )
+    completed["executed_action_schedule_sha256"] = executed_action_schedule_sha256
+    completed["reserved_action_legal_observations"] = int(
+        reserved_action_legal_observations
+    )
+    completed["component_identity_version"] = COMPLETED_COMPONENT_IDENTITY_VERSION
+    completed["completed_at"] = completed_at
+    return completed
 
 
 def _default_run_dir(config: PlasticExperimentConfig) -> Path:

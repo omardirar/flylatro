@@ -1,6 +1,8 @@
 # ADR 0007: field-aware sensory coding and calibrated canonical motor pools
 
-Status: accepted and locally validated; real activity calibration is pending.
+Status: accepted; the motor-allocation decision is superseded by ADR 0011 and
+the collision-readiness decision by ADR 0012. Real activity calibration is a
+dedicated-machine gate.
 
 ## Decision
 
@@ -14,7 +16,9 @@ strategy, hand-quality, expected-value or recommended-action feature exists.
 The seeded ALPN projection stays synthetic and non-trainable. Collisions use
 fixed clipped accumulation, not assignment-count averaging. This preserves a
 single active categorical channel at full configured rate. Audits report ALPN
-use, assignment quantiles, class collisions and isolated effective rates.
+use, assignment quantiles, class collisions and isolated effective rates, but
+ADR 0012 demotes those structural counts to informational: readiness is decided
+by the state-conditioned sensory health report measured on the frozen corpus.
 
 The scientific motor default is a persisted reward-free calibration artifact,
 not round-robin single neurons. It selects non-silent, non-high-rate-only,
@@ -22,6 +26,11 @@ variable outputs into pools wider than one where population size permits. The
 artifact records root IDs, pool indices, criteria, state seeds/hashes,
 duration, calibration seed and hash. It consumes no reward, action correctness
 or win information and has zero trainable parameters.
+
+ADR 0011 replaces the globally-disjoint pool allocation this ADR originally
+specified with contextual routing, a canonical plastic-reachable candidate
+universe, unrepresented reserved action slots, and fixed reward-free
+baseline/scale normalization.
 
 Canonical output root IDs come from the real unshuffled artifact. Real,
 no-plasticity, KC->MBON shuffle, whole-brain shuffle, shuffled reinforcement,

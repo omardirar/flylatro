@@ -6,13 +6,22 @@ from pathlib import Path
 import numpy as np
 
 from flylatro.env.array_mock import MockArrayBalatroEnv
+import pytest
+
 from flylatro.env.upstream_contract import (
     MASK_SPEC,
     N_ACTION_TYPES,
     UpstreamActionType,
 )
 from flylatro.fly.flywire_artifact import FlyWireArtifact
-from flylatro.interface.motor import HEAD_SIZES, FixedMotorInterface, MotorMapping
+from flylatro.interface.motor import (
+    HEAD_SIZES,
+    MOTOR_POOL_COUNT,
+    RESERVED_ACTION_TYPES,
+    SUPPORTED_ACTION_TYPES,
+    FixedMotorInterface,
+    MotorMapping,
+)
 from flylatro.interface.sensory import FixedPlasticSensoryEncoder, SensoryMapping
 
 
@@ -52,10 +61,11 @@ def test_seeded_sensory_mapping_is_fixed_non_trainable_and_replicable(
     assert encoder.trainable_parameter_count == 0
 
 
-def motor() -> tuple[FixedMotorInterface, MotorMapping]:
-    mapping = MotorMapping.round_robin(
-        np.arange(sum(HEAD_SIZES.values()), dtype=np.int64),
+def motor(pool_width: int = 2) -> tuple[FixedMotorInterface, MotorMapping]:
+    mapping = MotorMapping.contiguous_pools(
+        np.arange(MOTOR_POOL_COUNT * pool_width, dtype=np.int64),
         mode="mbon_direct",
+        pool_width=pool_width,
     )
     return FixedMotorInterface(mapping), mapping
 
@@ -119,10 +129,48 @@ def test_motor_supports_optional_consumable_card_targets() -> None:
 
 def test_motor_hash_covers_mapping_and_mode() -> None:
     _, mapping = motor()
-    same = MotorMapping.round_robin(
-        mapping.output_root_ids, mode="mbon_direct"
+    same = MotorMapping.contiguous_pools(
+        mapping.output_root_ids, mode="mbon_direct", pool_width=2
     )
     changed = replace(mapping, mode="whole_brain")
     assert mapping.sha256 == same.sha256
     assert mapping.sha256 != changed.sha256
     assert len(mapping.sha256) == 64
+
+
+def test_reserved_action_slots_own_no_population_and_cannot_be_selected() -> None:
+    interface, mapping = motor()
+    assert tuple(SUPPORTED_ACTION_TYPES) == tuple(range(13))
+    assert set(RESERVED_ACTION_TYPES) == set(range(13, N_ACTION_TYPES))
+    for reserved in RESERVED_ACTION_TYPES:
+        assert mapping.pools["action_type"][reserved] == ()
+        assert mapping.routing.head_routes["action_type"][reserved] == -1
+    activity = np.zeros((1, len(mapping.output_root_ids)), dtype=np.float32)
+    masks = mock_masks()
+    # A reserved slot that the contract reports as legal is excluded, counted,
+    # and never chosen while a represented alternative exists.
+    masks["action_type_mask"][0, RESERVED_ACTION_TYPES[0]] = True
+    action = interface.decode(activity, masks)
+    assert action["action_type"][0] in SUPPORTED_ACTION_TYPES
+    assert interface.reserved_action_legal_count == 1
+
+    masks["action_type_mask"][:] = False
+    masks["action_type_mask"][0, RESERVED_ACTION_TYPES[0]] = True
+    with pytest.raises(ValueError, match="no scientifically represented action"):
+        interface.decode(activity, masks)
+
+
+def test_contextual_heads_reuse_pools_but_simultaneous_heads_do_not() -> None:
+    _, mapping = motor()
+    routing = mapping.routing
+    # Target heads are mutually exclusive by action type, so they share pools.
+    assert routing.head_routes["shop"][2] == routing.head_routes["pack"][2]
+    assert routing.head_routes["joker"][2] == routing.head_routes["consumable"][2]
+    # Card slots are read at the same time as a consumable target, and every
+    # head that competes inside one comparison keeps distinct populations.
+    assert set(routing.head_routes["card"]).isdisjoint(routing.head_routes["consumable"])
+    assert set(routing.head_routes["card"]).isdisjoint(routing.head_routes["card_count"])
+    represented = [value for value in routing.head_routes["action_type"] if value >= 0]
+    assert len(set(represented)) == len(represented)
+    # The naive sum of head widths would need far more distinct neurons.
+    assert routing.pool_count < sum(HEAD_SIZES.values())
