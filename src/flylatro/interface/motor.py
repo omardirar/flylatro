@@ -88,6 +88,9 @@ RESERVED_ACTION_TYPES: tuple[int, ...] = tuple(
 CONTEXTUAL_SLOT_HEADS: tuple[str, ...] = ("joker", "consumable", "shop", "pack")
 
 MOTOR_ROUTING_VERSION = "contextual-motor-routing-v1"
+ACTION_CONDITIONED_ROUTING_VERSION = "action-conditioned-card-routing-v2"
+ACTION_CARD_HEAD_SIZES = {**HEAD_SIZES, "discard_card": HAND_MAX,
+                          "discard_card_count": MAX_CARD_PICKS + 1}
 
 
 @dataclass(frozen=True, slots=True)
@@ -109,9 +112,9 @@ class MotorRouting:
     def __post_init__(self) -> None:
         if len(self.group_names) != len(self.group_pool_counts):
             raise ValueError("routing groups and pool counts must align")
-        if set(self.head_routes) != set(HEAD_SIZES):
+        if set(self.head_routes) != set(self.head_sizes):
             raise ValueError("routing must cover every structured action head")
-        for head, size in HEAD_SIZES.items():
+        for head, size in self.head_sizes.items():
             route = self.head_routes[head]
             if len(route) != size:
                 raise ValueError(f"routing head {head} must cover {size} options")
@@ -129,12 +132,39 @@ class MotorRouting:
         for value in self.supported_action_types:
             if action_route[value] < 0:
                 raise ValueError("supported action types require a neural pool")
-        for head in ("action_type", "card_count", "card"):
+        for head in ("action_type", "card_count", "card", "discard_card", "discard_card_count"):
+            if head not in self.head_routes:
+                continue
             represented = [value for value in self.head_routes[head] if value >= 0]
             if len(set(represented)) != len(represented):
                 raise ValueError(
                     f"head {head} competes simultaneously and needs distinct pools"
                 )
+        if self.action_conditioned:
+            for head, group in (("action_type", "action_type"), ("card", "card_slot"), ("card_count", "card_count"),
+                                ("discard_card", "discard_card_slot"),
+                                ("discard_card_count", "discard_card_count")):
+                if {pool for pool in self.head_routes[head] if pool >= 0} != set(self.group_pool_ids(group)):
+                    raise ValueError(f"action-conditioned {head} must own its {group} pools")
+
+    @property
+    def action_conditioned(self) -> bool:
+        return self.version == ACTION_CONDITIONED_ROUTING_VERSION
+
+    @property
+    def head_sizes(self) -> Mapping[str, int]:
+        return ACTION_CARD_HEAD_SIZES if self.action_conditioned else HEAD_SIZES
+
+    def card_heads(self, action_type: int) -> tuple[str, str]:
+        """Return membership/count heads for the executed action, not a guess."""
+        if self.action_conditioned and action_type == int(UpstreamActionType.DISCARD):
+            return "discard_card", "discard_card_count"
+        return "card", "card_count"
+
+    @property
+    def card_pool_ids(self) -> tuple[int, ...]:
+        heads = ("card", "discard_card") if self.action_conditioned else ("card",)
+        return tuple(pool for head in heads for pool in self.head_routes[head])
 
     @property
     def pool_count(self) -> int:
@@ -279,6 +309,25 @@ class MotorRouting:
             group_pool_counts=tuple(count for _, count in groups),
             head_routes=head_routes,
         )
+
+    @classmethod
+    def action_conditioned_v2(cls) -> "MotorRouting":
+        """Separate PLAY/DISCARD membership and counts; keep target contracts.
+
+        The legacy card/count heads retain PLAY and USE_CONSUMABLE semantics.
+        DISCARD owns independent heads. Consumable targeting is not redesigned.
+        """
+        base = cls.contextual_v1()
+        groups = tuple(zip(base.group_names, base.group_pool_counts, strict=True)) + (
+            ("discard_card_count", MAX_CARD_PICKS + 1), ("discard_card_slot", HAND_MAX))
+        offset = base.pool_count
+        routes = dict(base.head_routes)
+        routes["discard_card_count"] = tuple(range(offset, offset + MAX_CARD_PICKS + 1))
+        offset += MAX_CARD_PICKS + 1
+        routes["discard_card"] = tuple(range(offset, offset + HAND_MAX))
+        return cls(version=ACTION_CONDITIONED_ROUTING_VERSION,
+                   group_names=tuple(name for name, _ in groups),
+                   group_pool_counts=tuple(count for _, count in groups), head_routes=routes)
 
 
 CONTEXTUAL_ROUTING = MotorRouting.contextual_v1()
@@ -449,6 +498,20 @@ class MotorMapping:
             self.normalization.baseline.shape[0] != self.routing.pool_count
         ):
             raise ValueError("normalization width does not match the routing")
+        if self.routing.action_conditioned:
+            core = ("action_type", "card_count", "card_slot", "discard_card_count", "discard_card_slot")
+            groups = {group: {index for pool in self.routing.group_pool_ids(group)
+                              for index in self.pool_indices[pool]} for group in core}
+            seen: set[int] = set()
+            for group in core:
+                if seen & groups[group]:
+                    raise ValueError("action-conditioned core groups must use disjoint neurons")
+                seen.update(groups[group])
+            cards = groups["card_slot"] | groups["discard_card_slot"]
+            others = {index for pool, group in enumerate(self.routing.pool_groups)
+                      if group not in ("card_slot", "discard_card_slot") for index in self.pool_indices[pool]}
+            if cards & others:
+                raise ValueError("action-conditioned card neurons must be isolated from noncard pools")
 
     @property
     def pool_width(self) -> int:
@@ -463,7 +526,7 @@ class MotorMapping:
                 self.pool_indices[pool] if pool >= 0 else ()
                 for pool in self.routing.head_routes[head]
             )
-            for head in HEAD_SIZES
+            for head in self.routing.head_sizes
         }
 
     def represented_pools(self) -> dict[str, dict[int, tuple[int, ...]]]:
@@ -475,7 +538,7 @@ class MotorMapping:
                 for option, pool in enumerate(self.routing.head_routes[head])
                 if pool >= 0
             }
-            for head in HEAD_SIZES
+            for head in self.routing.head_sizes
         }
 
     @property
@@ -707,6 +770,60 @@ class FixedMotorInterface:
             scores[head] = values
         return scores
 
+    def selected_pool_mask(self, actions: ActionDict, masks: MaskDict) -> NDArray[np.bool_]:
+        """Pools chosen in competing heads of the executed structured actions.
+
+        Forced options add no new choice credit. A pool selected by multiple
+        heads/cards appears once. Inactive context heads never receive credit.
+        This describes choices only; it uses no outcome or poker strategy.
+        """
+        batch = len(actions["action_type"])
+        validate_batch(ACTION_SPEC, actions, batch, "executed motor actions")
+        selected = np.zeros((batch, self.mapping.routing.pool_count), dtype=np.bool_)
+        for row in range(batch):
+            def mark(head, option):
+                pool = int(self._routes[head][option])
+                if pool < 0:
+                    raise ValueError("choice credit requires a represented motor option")
+                selected[row, pool] = True
+
+            action_type = int(actions["action_type"][row])
+            legal = masks["action_type_mask"][row] & self._supported_mask
+            if not 0 <= action_type < len(legal) or not legal[action_type]:
+                raise ValueError("choice credit action is not legally represented")
+            if np.count_nonzero(legal) > 1:
+                mark("action_type", action_type)
+            if action_type in (int(UpstreamActionType.PLAY_HAND),
+                               int(UpstreamActionType.DISCARD),
+                               int(UpstreamActionType.USE_CONSUMABLE)):
+                available = masks["card_select_mask"][row]
+                maximum = min(MAX_CARD_PICKS, int(available.sum()))
+                minimum = 0 if action_type == int(UpstreamActionType.USE_CONSUMABLE) else 1
+                count = int(actions["n_cards"][row])
+                card_head, count_head = self.mapping.routing.card_heads(action_type)
+                if not minimum <= count <= maximum:
+                    raise ValueError("choice credit card count is illegal")
+                if maximum > minimum:
+                    mark(count_head, count)
+                cards = actions["cards"][row, :count]
+                if (len(np.unique(cards)) != count or np.any(cards < 0)
+                        or np.any(cards >= len(available)) or not available[cards].all()):
+                    raise ValueError("choice credit selected cards are illegal")
+                if 0 < count < int(available.sum()):
+                    for card in cards:
+                        mark(card_head, int(card))
+            for expected_type, field, head, mask_name in _TARGET_SPECS:
+                if action_type != expected_type:
+                    continue
+                target = int(actions[field][row])
+                available = masks[mask_name][row]
+                if not 0 <= target < len(available) or not available[target]:
+                    raise ValueError("choice credit contextual target is illegal")
+                if np.count_nonzero(available) > 1:
+                    mark(head, target)
+                break
+        return selected
+
     def decode(
         self,
         activity: NDArray[np.floating],
@@ -783,10 +900,11 @@ class FixedMotorInterface:
                 count_mask = np.arange(MAX_CARD_PICKS + 1) <= maximum
                 if action_type != int(UpstreamActionType.USE_CONSUMABLE):
                     count_mask[0] = False
+                card_head, count_head = self.mapping.routing.card_heads(action_type)
                 count = self._choose(
-                    scores["card_count"][row], count_mask, deterministic, rng
+                    scores[count_head][row], count_mask, deterministic, rng
                 )
-                card_scores = scores["card"][row].copy()
+                card_scores = scores[card_head][row].copy()
                 card_scores[~available] = -np.inf
                 selected = np.argsort(-card_scores, kind="stable")[:count]
                 actions["n_cards"][row] = count

@@ -40,7 +40,6 @@ def main(argv: Sequence[str] | None = None) -> int:
             config, environment=replace(config.environment, num_envs=1)
         )
         env = build_plastic_environment(one)
-        env.set_win_ante(8)
     else:
         from flylatro.training.config import ExperimentConfig, build_environment
 
@@ -56,6 +55,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         "bundle": str(bundle.path),
         "simulator_verified": not divergences,
         "decisions": len(bundle.decisions),
+        "win_ante": bundle.manifest.get("metadata", {}).get("win_ante"),
+        "verified_won": bundle.manifest.get("metadata", {}).get("episode", {}).get("won"),
     }
     if args.live:
         report = play_live_replay(

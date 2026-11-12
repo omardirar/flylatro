@@ -2,6 +2,9 @@
 
 Status: accepted and locally validated; real calibration is a dedicated-machine gate.
 
+ADR 0014 supersedes the globally distinct neuron allocation and clarifies
+selected-output reachability; the routed pool IDs and contextual sharing remain.
+
 Supersedes the motor-allocation part of ADR 0007.
 
 ## Problem

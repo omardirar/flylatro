@@ -7,7 +7,7 @@ import json
 from pathlib import Path
 from typing import Sequence
 
-from flylatro.analysis.corpus import build_calibration_corpus
+from flylatro.analysis.corpus import NAVIGATION_RULES, SCRIPTED_NAVIGATION_RULE, build_calibration_corpus
 from flylatro.learning.config import PlasticExperimentConfig, build_plastic_environment
 
 
@@ -23,6 +23,10 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--states-per-seed", type=int, required=True)
     parser.add_argument("--sample-every", type=int, default=1)
     parser.add_argument("--navigation-seed", type=int, required=True)
+    parser.add_argument(
+        "--navigation-rule", choices=NAVIGATION_RULES, default=SCRIPTED_NAVIGATION_RULE,
+        help="collection-only legality rule; inventory-context navigation retains lone items",
+    )
     parser.add_argument("--maximum-decisions-per-seed", type=int)
     parser.add_argument(
         "--store-snapshots",
@@ -49,6 +53,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         navigation_seed=args.navigation_seed,
         maximum_decisions_per_seed=args.maximum_decisions_per_seed,
         store_snapshots=args.store_snapshots,
+        navigation_rule=args.navigation_rule,
     )
     manifest = corpus.save(args.output)
     print(

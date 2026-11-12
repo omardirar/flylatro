@@ -7,17 +7,19 @@ import json
 import math
 from pathlib import Path
 from typing import Mapping
+from flylatro.telemetry.buffered import BufferedTextWriter
 
 
 class MetricLogger:
     def __init__(
-        self, run_dir: Path, *, run_id: str, tensorboard: bool = True
+        self, run_dir: Path, *, run_id: str, tensorboard: bool = True,
+        buffer_bytes: int = 262144, flush_seconds: float = 0.0
     ) -> None:
         self.run_dir = run_dir
         self.run_dir.mkdir(parents=True, exist_ok=True)
         self.run_id = run_id
         self.path = run_dir / "metrics.jsonl"
-        self._stream = self.path.open("a", encoding="utf-8")
+        self._stream = BufferedTextWriter(self.path, max_bytes=buffer_bytes, flush_seconds=flush_seconds)
         self._writer = None
         if tensorboard:
             try:
@@ -40,18 +42,25 @@ class MetricLogger:
         self._stream.write(
             json.dumps(payload, sort_keys=True, allow_nan=False) + "\n"
         )
-        self._stream.flush()
+        self._stream.maybe_flush()
         if self._writer is not None:
             for key, value in metrics.items():
                 if math.isfinite(float(value)):
                     self._writer.add_scalar(key, float(value), step)
+
+
+    def flush(self) -> None:
+        self._stream.flush()
+        if self._writer is not None:
             self._writer.flush()
 
     def close(self) -> None:
-        if not self._stream.closed:
-            self._stream.close()
-        if self._writer is not None:
-            self._writer.close()
+        try:
+            if not self._stream.closed:
+                self._stream.close()
+        finally:
+            if self._writer is not None:
+                self._writer.close()
 
     def __enter__(self) -> "MetricLogger":
         return self

@@ -15,14 +15,16 @@ from typing import Sequence
 
 import numpy as np
 
-from flylatro.analysis.evidence import experiment_identity, load_corpus, record_corpus_activity
+from flylatro.analysis.evidence import experiment_identity, load_corpus
 from flylatro.analysis.provenance import EvidenceIdentity
+from flylatro.analysis.activity_cache import cached_corpus_activity
 from flylatro.interface.motor_contexts import motor_context_windows
 from flylatro.interface.motor_calibration import (
     MOTOR_CALIBRATION_VERSION,
     MotorCalibrationError,
     MotorCalibrationThresholds,
     calibrate_reward_free_motor,
+    validate_reward_free_motor,
 )
 from flylatro.learning.config import PlasticExperimentConfig, build_plastic_stack
 
@@ -30,10 +32,16 @@ from flylatro.learning.config import PlasticExperimentConfig, build_plastic_stac
 def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--config", type=Path, required=True)
+    parser.add_argument('--validate-existing', action='store_true',
+        help='requalify the configured motor artifact without selecting pools or changing normalization')
     parser.add_argument("--calibration-corpus", type=Path)
     parser.add_argument("--states", type=int, help="limit corpus states (default: all)")
     parser.add_argument("--repeats", type=int, default=1)
     parser.add_argument("--batch-size", type=int, default=1)
+    parser.add_argument(
+        "--activity-cache", type=Path,
+        help="save/reuse hash-verified neural activity for this exact experiment and sampling settings",
+    )
     parser.add_argument("--calibration-seed", type=int, required=True)
     parser.add_argument("--high-rate-hz", type=float, default=200.0)
     parser.add_argument("--silence-hz", type=float, default=0.0)
@@ -58,6 +66,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         default=2,
         help="of those, states offering more than one legal option",
     )
+    parser.add_argument("--minimum-pool-width", type=int, choices=(1, 2), default=2,
+                        help="explicit width-one exploratory artifact validation; primary default remains two")
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument(
         "--report",
@@ -66,15 +76,28 @@ def main(argv: Sequence[str] | None = None) -> int:
     )
     parser.add_argument("--heavy", action="store_true")
     args = parser.parse_args(argv)
+    report_path = args.report or args.output.with_name(args.output.stem + "-report.json")
+    for destination in (args.output, report_path):
+        if destination.exists():
+            raise FileExistsError(f"motor calibration destination already exists: {destination}")
     config = PlasticExperimentConfig.load(args.config)
     # State sampling must never depend on a previous calibrated motor artifact.
-    config = replace(config, fly=replace(config.fly, motor_mapping_path=""))
+    if not args.validate_existing:
+        config = replace(config, fly=replace(config.fly, motor_mapping_path=""))
+    elif not config.fly.motor_mapping_path:
+        raise ValueError('--validate-existing requires a configured motor artifact')
     config.require_heavy_opt_in(args.heavy)
     corpus = load_corpus(config, args.calibration_corpus)
-    stack = build_plastic_stack(config, allow_uncalibrated_motor=True)
-    activity = record_corpus_activity(
+    stack = build_plastic_stack(config, allow_uncalibrated_motor=not args.validate_existing)
+    identity = experiment_identity(
+        config, stack.components, report_kind="motor_calibration",
+        report_version=MOTOR_CALIBRATION_VERSION, corpus=corpus,
+    )
+    activity, activity_sha256 = cached_corpus_activity(
+        args.activity_cache,
         stack,
         corpus,
+        identity=identity.to_dict(),
         seed=args.calibration_seed,
         repeats=args.repeats,
         batch_size=args.batch_size,
@@ -90,56 +113,41 @@ def main(argv: Sequence[str] | None = None) -> int:
         minimum_effective_signal_fraction=args.minimum_effective_signal_fraction,
         minimum_normalized_option_range=args.minimum_normalized_option_range,
         maximum_pool_silent_fraction=args.maximum_pool_silent_fraction,
-        minimum_pool_width=2,
+        minimum_pool_width=args.minimum_pool_width,
         minimum_context_states=args.minimum_context_states,
         minimum_competing_context_states=args.minimum_competing_context_states,
     )
     # Candidate quality is judged in the states where each routing group is
     # actually read, using the corpus's own legality masks.
     contexts = motor_context_windows(
-        corpus.masks, order=activity.state_labels.tolist()
+        corpus.masks, order=activity.state_labels.tolist(),
+        routing=stack.agent.motor.mapping.routing if args.validate_existing else None,
     )
     details = _candidate_details(stack, config)
-    report_path = args.report or args.output.with_name(args.output.stem + "-report.json")
-    identity = experiment_identity(
-        config,
-        stack.components,
-        report_kind="motor_calibration",
-        report_version=MOTOR_CALIBRATION_VERSION,
-        corpus=corpus,
-    )
+    metadata = {
+        'calibration_seed': args.calibration_seed, 'neural_activity_sha256': activity_sha256,
+        'calibration_corpus_sha256': corpus.sha256,
+        'corpus_states': len(set(activity.state_labels.tolist())), 'repeats_per_state': args.repeats,
+        'motor_context_coverage': {name: window.counts() for name, window in contexts.items()},
+        'observable_state_hashes': list(dict.fromkeys(activity.state_hashes)),
+        'state_sampling': ('frozen reward-free calibration corpus; no bootstrap decoder '
+            'trajectory, no reward and no outcome observed'),
+        'decision_duration_ms': config.fly.duration_ms, 'reward_or_outcome_observed': False,
+    }
     try:
-        result = calibrate_reward_free_motor(
-            np.asarray(stack.agent.processor.output_root_ids, dtype=np.int64),
-            activity.output,
-            mode=config.fly.mode,
-            pool_width=config.fly.motor_pool_width,
-            thresholds=thresholds,
-            contexts=contexts,
-            exploration_epsilon=config.motor.exploration_epsilon,
-            exploration_temperature=config.motor.exploration_temperature,
-            exploration_seed=config.motor.exploration_seed,
-            candidate_set_sha256=stack.components.get(
-                "canonical_motor_candidate_set_sha256"
-            ),
-            candidate_details=details,
-            calibration_metadata={
-                "calibration_seed": args.calibration_seed,
-                "calibration_corpus_sha256": corpus.sha256,
-                "corpus_states": len(set(activity.state_labels.tolist())),
-                "repeats_per_state": args.repeats,
-                "motor_context_coverage": {
-                    name: window.counts() for name, window in contexts.items()
-                },
-                "observable_state_hashes": list(dict.fromkeys(activity.state_hashes)),
-                "state_sampling": (
-                    "frozen reward-free calibration corpus; no bootstrap decoder "
-                    "trajectory, no reward and no outcome observed"
-                ),
-                "decision_duration_ms": config.fly.duration_ms,
-                "reward_or_outcome_observed": False,
-            },
-        )
+        if args.validate_existing:
+            result = validate_reward_free_motor(stack.agent.motor.mapping, activity.output,
+                thresholds=thresholds, contexts=contexts, calibration_metadata=metadata)
+        else:
+            result = calibrate_reward_free_motor(
+                np.asarray(stack.agent.processor.output_root_ids, dtype=np.int64), activity.output,
+                mode=config.fly.mode, pool_width=config.fly.motor_pool_width,
+                thresholds=thresholds, contexts=contexts,
+                exploration_epsilon=config.motor.exploration_epsilon,
+                exploration_temperature=config.motor.exploration_temperature,
+                exploration_seed=config.motor.exploration_seed,
+                candidate_set_sha256=stack.components.get('canonical_motor_candidate_set_sha256'),
+                candidate_details=details, calibration_metadata=metadata)
     except MotorCalibrationError as error:
         failure = {
             "version": MOTOR_CALIBRATION_VERSION,

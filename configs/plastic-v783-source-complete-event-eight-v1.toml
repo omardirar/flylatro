@@ -1,0 +1,110 @@
+[experiment]
+name = "performance-event-source-complete-eight-v1"
+
+[environment]
+backend = "balatro_sim"
+blind_target = 25.0
+initial_discards = 2
+initial_hands = 3
+num_envs = 8
+strict_actions = true
+
+[fly]
+artifact_path = "data/flywire-source-complete-v783/flywire_fafb_v783.npz"
+backend = "flywire"
+device = "cuda"
+duration_ms = 100
+execution = "cuda_native_event_graph_blocks"
+max_rate_hz = 150.0
+minimum_synapse_count = 1
+mode = "mbon_direct"
+motor_mapping_path = "/home/omz/Projects/flylatro/artefacts/lr-sensitivity-20261009/source-complete-gain0p225-100ms-pearson-v5-motor.json"
+motor_pool_width = 2
+reset_fast_state_each_decision = true
+sensory_mapping_seed = 0
+sensory_population_width = 3
+shuffle_seed = 1701
+synapse_scale_mv = 0.225
+synthetic_kenyon_count = 48
+synthetic_seed = 1701
+topology = "real"
+
+[motor]
+deterministic_training = false
+exploration_epsilon = 0.05
+exploration_seed = 757137546
+exploration_temperature = 1.0
+
+[plasticity]
+dopamine_decay = 0.0
+eligibility_decay = 0.9
+kc_reference_hz = 20.0
+learning_rate = 0.002
+max_efficacy = 2.0
+max_eligibility = 4.0
+mbon_reference_hz = 20.0
+min_efficacy = 0.2
+version = "three-factor-global-v1"
+
+[reinforcement]
+ante8_success_pulse = 1.5
+ante_clear_pulse = 0.8
+blind_clear_pulse = 0.4
+condition = "primary-progress"
+max_progress_component = 1.0
+max_total_pulse = 2.0
+progress_scale = 0.05
+run_failure_pulse = 0.6
+version = "balatro-outcome-synthetic-reinforcement-v2"
+
+[training]
+action_schedule_path = ""
+base_fly_seed = 1971516477
+budget_basis = "performance qualification; original model/mappings/rule; 1000 measured decisions after 10 warmup"
+checkpoint_every_decisions = 400
+condition = "plastic_real"
+episode_history_limit = 512
+matched_source_run_dir = ""
+max_environment_decisions = 8800
+plasticity_enabled = true
+reinforcement_mode = "outcome"
+reinforcement_schedule_path = ""
+training_seed_offset = 3000
+
+[curriculum]
+enabled = true
+evaluation_episodes = 1
+evaluation_every_decisions = 1
+ladder = [1]
+promotion_win_rate = 0.7
+
+[runtime]
+output_root = "runs"
+tensorboard = false
+
+[calibration]
+benchmark_report = "/home/omz/Projects/flylatro/artefacts/performance-migration/20261014-event-v1-calibration/benchmark.json"
+corpus_path = "artefacts/calibration-corpus-v783-balanced-long.npz"
+coverage_policy_path = ""
+motor_calibration_report = "/home/omz/Projects/flylatro/artefacts/performance-migration/20261014-event-v1-calibration/motor-report.json"
+plasticity_report = "/home/omz/Projects/flylatro/artefacts/performance-migration/20261014-event-v1-calibration/plasticity.json"
+reachability_report = "/home/omz/Projects/flylatro/artefacts/performance-migration/20261014-event-v1-calibration/reachability.json"
+representation_post_report = "/home/omz/Projects/flylatro/artefacts/performance-migration/20261014-event-v1-calibration/representation-post.json"
+representation_pre_report = "/home/omz/Projects/flylatro/artefacts/performance-migration/20261014-event-v1-calibration/representation-pre.json"
+sensory_health_report = "/home/omz/Projects/flylatro/artefacts/lr-sensitivity-20261009/sensory-health-source-complete.json"
+specificity_report = "/home/omz/Projects/flylatro/artefacts/performance-migration/20261014-event-v1-calibration/specificity.json"
+
+[protocol]
+arm_id = ""
+protocol_name = ""
+protocol_path = ""
+protocol_sha256 = ""
+replicate_id = ""
+
+[safety]
+enabled = true
+maximum_bound_fraction = 0.1
+maximum_mean_absolute_drift = 0.5
+minimum_kc_active_fraction = 0.01
+minimum_motor_active_fraction = 0.01
+silence_patience_steps = 8

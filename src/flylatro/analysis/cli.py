@@ -9,6 +9,8 @@ from pathlib import Path
 from typing import Sequence
 
 from flylatro.analysis.plasticity import plasticity_diagnostics, synaptic_change_report
+from flylatro.analysis.evidence import experiment_identity, write_report
+from flylatro.fly.flywire_artifact import sha256_file
 from flylatro.learning.checkpoints import load_plastic_checkpoint
 from flylatro.learning.config import PlasticExperimentConfig, build_plastic_stack
 
@@ -39,6 +41,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--action-schedule", type=Path)
     parser.add_argument("--heavy", action="store_true")
     args = parser.parse_args(argv)
+    if args.output.exists():
+        raise FileExistsError(f"refusing to overwrite historical evidence: {args.output}")
     config = PlasticExperimentConfig.load(args.config)
     if args.output_mode is not None:
         config = replace(config, fly=replace(config.fly, mode=args.output_mode))
@@ -91,9 +95,12 @@ def main(argv: Sequence[str] | None = None) -> int:
     config.require_heavy_opt_in(args.heavy)
     stack = build_plastic_stack(config)
     load_plastic_checkpoint(
-        args.checkpoint, stack.trainer, expected_components=stack.components
+        args.checkpoint, stack.trainer, expected_components=stack.components,
+        require_matching_exposure_budget=False,
     )
     report = {
+        "version": "checkpoint-synaptic-audit-v2",
+        "checkpoint": str(args.checkpoint.resolve()),
         "synaptic_changes": synaptic_change_report(
             stack.agent.plasticity.topology,
             stack.agent.plasticity.state,
@@ -104,9 +111,14 @@ def main(argv: Sequence[str] | None = None) -> int:
             stack.agent.plasticity.config,
         ),
     }
-    args.output.parent.mkdir(parents=True, exist_ok=True)
-    args.output.write_text(
-        json.dumps(report, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+    write_report(
+        args.output, report,
+        experiment_identity(
+            config, {**stack.components,
+                     "checkpoint_sha256": sha256_file(args.checkpoint),
+                     "plastic_weight_sha256": stack.agent.plasticity.state.weight_sha256},
+            report_kind="checkpoint_synaptic_audit", report_version=report["version"],
+        ),
     )
     print(json.dumps({"output": str(args.output.resolve())}, sort_keys=True))
     return 0

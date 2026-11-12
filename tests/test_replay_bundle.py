@@ -16,6 +16,9 @@ from flylatro.policy.torch_structured import TorchStructuredPolicy
 from flylatro.replay.bundle import ReplayBundle, ReplayBundleWriter, ReplayIdentity
 from flylatro.replay.verify import ReplayDivergedError, verify_replay
 from flylatro.replay.package import package_showcase
+from flylatro.env.balatro_sim import composite_actions_to_batch
+from flylatro.env.types import ActionType, CompositeAction
+from flylatro.evaluation.state_hash import hash_observation_row, terminal_hash
 from flylatro.seeds import seed_everything
 
 
@@ -124,3 +127,40 @@ def test_showcase_package_embeds_verified_checkpoint_config_and_readme(tmp_path)
         packaged.manifest["files"]
     )
     assert "Balatro seed" in (packaged.path / "README.md").read_text()
+
+
+def test_replay_restores_recorded_ante_target_and_checks_actual_win(tmp_path):
+    class TargetSensitiveFixture(MockArrayBalatroEnv):
+        def set_win_ante(self, target):
+            super().set_win_ante(target)
+            # Make the mock's terminal depend on the replay target so forcing
+            # Ante 8 would fail this synthetic fixture; no real win is claimed.
+            self.blind_target = 1 if target == 1 else 1e6
+
+    env = TargetSensitiveFixture(1)
+    env.set_win_ante(1)
+    before, _ = env.reset((123,))
+    action = CompositeAction(ActionType.PLAY_HAND, cards=(0,))
+    step = env.step(composite_actions_to_batch((action,)))
+    assert step.dones[0] and step.infos[0]["episode"]["won"]
+    with ReplayBundleWriter(tmp_path / "ante1", _identity(),
+        metadata={"win_ante": 1, "episode": {"won": True}}) as writer:
+        writer.record({"decision_id": 0, "action": action.to_payload(), "reward": float(step.rewards[0]),
+            "reward_components": step.infos[0]["reward_components"],
+            "state_hash_before": hash_observation_row(before, 0),
+            "state_hash_after": terminal_hash(step.infos[0]), "done": True})
+    bundle = ReplayBundle.open(tmp_path / "ante1")
+    replay = TargetSensitiveFixture(1)
+    replay.set_win_ante(8)
+    assert verify_replay(bundle, replay) == ()
+    assert replay._win_ante == 1
+    bundle.manifest["metadata"]["episode"]["won"] = False
+    with pytest.raises(ReplayDivergedError, match="won"):
+        verify_replay(bundle, replay)
+
+
+def test_replay_rejects_changed_recorded_reward(tmp_path):
+    bundle = _write_bundle(tmp_path / "replay")
+    bundle.decisions[0]["reward"] += 1
+    with pytest.raises(ReplayDivergedError, match="reward"):
+        verify_replay(bundle, MockArrayBalatroEnv(1, blind_target=18, initial_hands=3))

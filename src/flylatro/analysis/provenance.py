@@ -11,6 +11,7 @@ from __future__ import annotations
 from dataclasses import asdict, dataclass, fields
 from datetime import datetime, timezone
 import json
+import hashlib
 import subprocess
 from typing import Any, Mapping
 
@@ -37,6 +38,7 @@ COMPARABLE_IDENTITY_FIELDS: tuple[str, ...] = (
     "reinforcement_mapping_sha256",
     "plasticity_rule_sha256",
     "fly_dynamics_sha256",
+    "fly_implementation_sha256",
     "decision_duration_ms",
     "output_mode",
     "topology_condition",
@@ -75,12 +77,15 @@ class EvidenceIdentity:
     reinforcement_mapping_sha256: str | None = None
     plasticity_rule_sha256: str | None = None
     fly_dynamics_sha256: str | None = None
+    fly_implementation_sha256: str | None = None
     decision_duration_ms: float | None = None
     output_mode: str | None = None
     topology_condition: str | None = None
     fly_backend: str | None = None
     device: str | None = None
     backend_evidence: str | None = None
+    plastic_weight_sha256: str | None = None
+    checkpoint_sha256: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
         """Return every recorded field, including explicit ``None`` claims."""
@@ -179,12 +184,17 @@ class EvidenceIdentity:
             ),
             plasticity_rule_sha256=_text(components.get("plasticity_rule_sha256")),
             fly_dynamics_sha256=_text(components.get("fly_dynamics_sha256")),
+            fly_implementation_sha256=(hashlib.sha256(json.dumps(
+                components['fly_implementation'], sort_keys=True, separators=(',', ':')
+            ).encode()).hexdigest() if components.get('fly_implementation') else None),
             decision_duration_ms=duration,
             output_mode=_text(components.get("output_mode")),
             topology_condition=_text(components.get("topology_condition")),
             fly_backend=_text(components.get("fly_backend")),
             device=_text(device),
             backend_evidence=_text(backend_evidence),
+            plastic_weight_sha256=_text(components.get("plastic_weight_sha256")),
+            checkpoint_sha256=_text(components.get("checkpoint_sha256")),
         )
 
 

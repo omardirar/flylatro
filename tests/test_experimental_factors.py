@@ -535,7 +535,7 @@ def test_a_report_of_an_incompatible_version_is_rejected(tmp_path: Path) -> None
     gate = _gate(report, "kc_subtype_reachability")
     assert gate["status"] == "FAIL"
     assert "not compatible with this build" in gate["reason"]
-    assert "kc-subtype-reachability-v1" in gate["evidence"]["compatible_versions"]
+    assert "kc-subtype-reachability-v2" in gate["evidence"]["compatible_versions"]
 
 
 def test_a_pre_stage_report_cannot_satisfy_the_post_stage_gate(tmp_path: Path) -> None:

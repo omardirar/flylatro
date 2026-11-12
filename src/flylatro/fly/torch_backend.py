@@ -108,15 +108,26 @@ class TorchFlyWireBackend:
             raise ValueError("at least one readout neuron is required")
         self.readout_indices = selected
         self.readout_root_ids = artifact.root_ids[selected]
+        self._readout_device = torch.as_tensor(selected, dtype=torch.int64, device=self.device)
+        self._readout_roots_device = torch.as_tensor(
+            self.readout_root_ids.astype(np.int64), dtype=torch.int64, device=self.device)
         pre, post, weights, procedure = artifact.edge_arrays(
             shuffle_seed=shuffle_seed,
             preserve_populations=shuffle_preserve_populations,
             shuffle_scope=shuffle_scope,
         )
+        self._initialize_connectivity(pre, post, weights, procedure)
+        self._state: tuple[Any, ...] | None = None
+        self._generators: list[Any] = []
+
+    def _initialize_connectivity(self, pre, post, weights, procedure):
+        """Reference construction hook; accelerated layouts may reuse preparation."""
+        torch = self.torch
+        self.topology_procedure = procedure
         sparse_indices = torch.from_numpy(np.stack((post, pre))).to(
             device=self.device, dtype=torch.int64
         )
-        values = torch.from_numpy(weights).to(device=self.device, dtype=torch.float32)
+        values = torch.tensor(weights, device=self.device, dtype=torch.float32)
         self.weights = torch.sparse_coo_tensor(
             sparse_indices,
             values,
@@ -124,13 +135,10 @@ class TorchFlyWireBackend:
             device=self.device,
             check_invariants=False,
         ).coalesce()
-        self.topology_procedure = procedure
         coalesced = self.weights.coalesce()
         coo = coalesced.indices().detach().cpu().numpy()
         vals = coalesced.values().detach().cpu().numpy()
         self.connectivity_hash = connectivity_sha256(coo[1], coo[0], vals)
-        self._state: tuple[Any, ...] | None = None
-        self._generators: list[Any] = []
 
     @property
     def dynamics_hash(self) -> str:
@@ -183,7 +191,7 @@ class TorchFlyWireBackend:
         conductance, delay, spikes, voltage, refractory, counts = self._state
         if stimulus.rates_hz.shape != tuple(voltage.shape):
             raise ValueError("stimulus shape does not match fly batch state")
-        rates = torch.as_tensor(
+        rates = torch.tensor(
             np.asarray(stimulus.rates_hz), dtype=torch.float32, device=self.device
         )
         p = self.parameters
@@ -212,29 +220,11 @@ class TorchFlyWireBackend:
                 with self._timed("recurrent"):
                     recurrent = self._recurrent(spikes)
                 with self._timed("lif_update"):
-                    incoming = p.synapse_scale_mv * (poisson + recurrent)
-
-                    refractory = refractory * (1 - spikes.to(torch.int16)) + 1
-                    can_integrate = (refractory > refractory_steps).to(torch.float32)
-                    conductance_new = (
-                        conductance * (1.0 - p.dt_ms / p.synaptic_tau_ms)
-                        + delay[delay_slot] * can_integrate
+                    conductance, spikes, voltage, refractory = self._lif_step(
+                        conductance, delay, spikes, voltage, refractory, counts,
+                        poisson, recurrent, delay_slot, refractory_steps,
                     )
-                    target_slot = (delay_slot + delay.shape[0] - 1) % delay.shape[0]
-                    delay[target_slot] = incoming
                     delay_slot = (delay_slot + 1) % delay.shape[0]
-
-                    voltage = voltage + (p.dt_ms / p.membrane_tau_ms) * (
-                        conductance - (voltage - p.resting_mv)
-                    )
-                    spikes = (voltage > p.threshold_mv).to(torch.float32)
-                    voltage = torch.where(
-                        spikes.bool(), torch.full_like(voltage, p.reset_mv), voltage
-                    )
-                    conductance = torch.where(
-                        spikes.bool(), torch.zeros_like(conductance_new), conductance_new
-                    )
-                    counts += spikes.to(torch.int32)
 
                 if self.record_events and bool(spikes.any()):
                     batch_ids, neuron_indices = spikes.nonzero(as_tuple=True)
@@ -251,14 +241,8 @@ class TorchFlyWireBackend:
         self._state = (conductance, delay, spikes, voltage, refractory, counts)
         with self._timed("readout_sync"):
             self._synchronize()
-        readout = torch.as_tensor(
-            self.readout_indices, dtype=torch.int64, device=self.device
-        )
-        root_ids = torch.as_tensor(
-            self.readout_root_ids.astype(np.int64),
-            dtype=torch.int64,
-            device=self.device,
-        )
+        readout = self._readout_device
+        root_ids = self._readout_roots_device
         return TorchFlyActivity(
             spike_counts=counts.index_select(1, readout),
             final_voltage=voltage.index_select(1, readout),
@@ -270,6 +254,34 @@ class TorchFlyWireBackend:
             ),
             event_times_ms=torch.cat(event_time) if event_time else None,
         )
+
+    def _lif_step(self, conductance, delay, spikes, voltage, refractory, counts,
+                  poisson, recurrent, delay_slot, refractory_steps):
+        torch = self.torch
+        p = self.parameters
+        incoming = p.synapse_scale_mv * (poisson + recurrent)
+
+        refractory = refractory * (1 - spikes.to(torch.int16)) + 1
+        can_integrate = (refractory > refractory_steps).to(torch.float32)
+        conductance_new = (
+            conductance * (1.0 - p.dt_ms / p.synaptic_tau_ms)
+            + delay[delay_slot] * can_integrate
+        )
+        target_slot = (delay_slot + delay.shape[0] - 1) % delay.shape[0]
+        delay[target_slot] = incoming
+
+        voltage = voltage + (p.dt_ms / p.membrane_tau_ms) * (
+            conductance - (voltage - p.resting_mv)
+        )
+        spikes = (voltage > p.threshold_mv).to(torch.float32)
+        voltage = torch.where(
+            spikes.bool(), torch.full_like(voltage, p.reset_mv), voltage
+        )
+        conductance = torch.where(
+            spikes.bool(), torch.zeros_like(conductance_new), conductance_new
+        )
+        counts += spikes.to(torch.int32)
+        return conductance, spikes, voltage, refractory
 
     def _recurrent(self, spikes: Any) -> Any:
         return self.torch.sparse.mm(self.weights, spikes.T).T

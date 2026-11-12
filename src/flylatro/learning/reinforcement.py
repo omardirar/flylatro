@@ -34,6 +34,23 @@ SENSITIVITY_CONDITIONS: dict[str, dict[str, float]] = {
     "terminal-or-clear-only": {"progress_scale": 0.0},
 }
 
+# Post-hoc engineering candidates, separate from the predeclared protocol.
+# The 2026-10-09 batch-four run delivered about 60 times more negative than
+# positive pulse magnitude and stopped at lower-bound saturation. Reducing
+# failure punishment by 60x tests that imbalance; it does not establish a
+# biologically supported rule or imply improved game performance.
+EXPLORATORY_CONDITIONS: dict[str, dict[str, float]] = {
+    "exploratory-weak-failure-v1": {
+        "progress_scale": 0.05,
+        "run_failure_pulse": 0.01,
+        "blind_clear_pulse": 0.40,
+        "ante_clear_pulse": 0.80,
+        "ante8_success_pulse": 1.50,
+        "max_progress_component": 1.0,
+        "max_total_pulse": 2.0,
+    },
+}
+
 
 @dataclass(frozen=True, slots=True)
 class ReinforcementConfig:
@@ -61,10 +78,13 @@ class ReinforcementConfig:
             raise ValueError("reinforcement parameters must be finite and non-negative")
         expected = SENSITIVITY_CONDITIONS.get(self.condition)
         if expected is None:
+            expected = EXPLORATORY_CONDITIONS.get(self.condition)
+        if expected is None:
             raise ValueError(
                 "reinforcement.condition must be one of "
-                f"{sorted(SENSITIVITY_CONDITIONS)}; ad-hoc shaping magnitudes are "
-                "not predeclared experiments"
+                f"{sorted(SENSITIVITY_CONDITIONS | EXPLORATORY_CONDITIONS)}; "
+                "ad-hoc shaping magnitudes are not predeclared experiments "
+                "or named exploratory candidates"
             )
         mismatched = {
             name: (getattr(self, name), value)
@@ -82,6 +102,13 @@ class ReinforcementConfig:
         return hashlib.sha256(
             json.dumps(asdict(self), sort_keys=True, separators=(",", ":")).encode()
         ).hexdigest()
+
+
+def exploratory_condition(name: str) -> ReinforcementConfig:
+    """Build a fixed post-hoc candidate without altering protocol conditions."""
+    if name not in EXPLORATORY_CONDITIONS:
+        raise ValueError(f"unknown exploratory reinforcement condition: {name}")
+    return ReinforcementConfig(condition=name, **EXPLORATORY_CONDITIONS[name])
 
 
 class ReinforcementMapper:

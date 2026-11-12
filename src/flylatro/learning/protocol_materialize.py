@@ -14,7 +14,7 @@ import json
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
-from flylatro.learning.config import PlasticExperimentConfig
+from flylatro.learning.config import PlasticExperimentConfig, resolve_path
 from flylatro.learning.protocol import (
     ConditionArm,
     EXACT_ACTION_MATCHED_CONDITIONS,
@@ -64,6 +64,8 @@ def materialize_protocol(
     payload = json.loads(Path(protocol_path).read_text(encoding="utf-8"))
     if payload.get("sha256") != protocol.sha256:
         raise ValueError("protocol file hash does not match the loaded protocol")
+    if output_dir.exists() and any(output_dir.iterdir()):
+        raise FileExistsError(f"materialized protocol destination is not empty: {output_dir}")
     output_dir.mkdir(parents=True, exist_ok=True)
     by_id = {item.arm_id: item for item in protocol.arms}
     arms: list[MaterializedArm] = []
@@ -213,6 +215,16 @@ def _arm_document(
     matched_source_dir: str,
 ) -> dict[str, Any]:
     document = json.loads(json.dumps(base.to_dict()))
+    # Config paths are resolved from source_path.parent.parent. Moving a base
+    # document into nested artefacts/arms would otherwise silently relocate all
+    # its inputs and evidence. Anchor inherited paths before emitting any arm.
+    for key in ("artifact_path", "motor_mapping_path"):
+        value = document["fly"][key]
+        if value:
+            document["fly"][key] = str(resolve_path(base, value).resolve())
+    for key, value in document["calibration"].items():
+        if value:
+            document["calibration"][key] = str(resolve_path(base, value).resolve())
     document["name"] = f"{protocol.name}-{arm.arm_id.replace(':', '-')}"
     fly = document["fly"]
     fly["sensory_mapping_seed"] = arm.sensory_mapping_seed
@@ -225,6 +237,9 @@ def _arm_document(
     reinforcement["condition"] = arm.reinforcement_condition
     reinforcement.update(SENSITIVITY_CONDITIONS[arm.reinforcement_condition])
     training = document["training"]
+    # The plan's run-directory arguments are relative to the invocation cwd,
+    # not to the destination config directory; match their actual destination.
+    matched_source_dir = str(Path(matched_source_dir).resolve())
     training.update(
         condition=arm.condition,
         training_seed_offset=arm.training_seed_offset,
@@ -256,21 +271,13 @@ def _arm_document(
     curriculum["enabled"] = True
     curriculum["ladder"] = list(arm.curriculum_ladder)
     document["protocol"] = {
-        "protocol_path": _relative(protocol_path, base.source_path),
+        "protocol_path": str(protocol_path.resolve()),
         "protocol_sha256": protocol.sha256,
         "protocol_name": protocol.name,
         "replicate_id": arm.replicate_id,
         "arm_id": arm.arm_id,
     }
     return document
-
-
-def _relative(path: Path, config_source: Path) -> str:
-    root = config_source.parent.parent
-    try:
-        return str(Path(path).resolve().relative_to(root.resolve()))
-    except ValueError:
-        return str(Path(path).resolve())
 
 
 def _command(
@@ -323,6 +330,7 @@ def render_toml(document: Mapping[str, Any]) -> str:
         "runtime",
         "calibration",
         "protocol",
+        "safety",
     ):
         values = document.get(section)
         if values is None:

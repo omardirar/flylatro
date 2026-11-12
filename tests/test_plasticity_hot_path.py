@@ -141,6 +141,27 @@ def test_effective_anatomical_weights_work_for_both_state_implementations() -> N
             np.testing.assert_allclose(weights, expected)
 
 
+def test_direction_and_near_bound_metrics_preserve_state_and_match_backends() -> None:
+    values = np.asarray([
+        [.21, .28, 1., 1.5, 1.90, 1.92],
+        [.20, .22, .25, .30, 1.98, 2.],
+    ], dtype=np.float32)
+    for state in (PlasticEdgeState.initialize(6, learners=2), TorchPlasticEdgeState.initialize(6, learners=2)):
+        rule = _rule(state)
+        if rule.is_torch:
+            state.efficacy.copy_(torch.as_tensor(values))
+        else:
+            state.efficacy[:] = values
+        before = state.state_dict()
+        metrics = rule.routine_metrics()
+        assert metrics['net_strengthened_fraction'] == pytest.approx(5 / 12)
+        assert metrics['net_weakened_fraction'] == pytest.approx(6 / 12)
+        assert metrics['max_learner_near_bound_fraction'] == pytest.approx(5 / 6)
+        assert metrics['max_learner_bound_fraction'] == pytest.approx(2 / 6)
+        for key, value in before.items():
+            np.testing.assert_array_equal(value, state.state_dict()[key])
+
+
 def test_weight_audit_is_explicit_and_not_part_of_the_hot_path() -> None:
     rule = _rule(TorchPlasticEdgeState.initialize(8, learners=2))
     audit = rule.weight_audit()

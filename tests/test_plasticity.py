@@ -53,6 +53,23 @@ def test_no_dopamine_or_zero_eligibility_means_no_update() -> None:
     np.testing.assert_array_equal(empty.state.efficacy, initial)
 
 
+def test_shorter_eligibility_trace_limits_credit_from_earlier_decisions() -> None:
+    slow = rule(eligibility_decay=0.9)
+    short = rule(eligibility_decay=0.5)
+    active = np.ones((1, 2), dtype=np.float32)
+    inactive = np.zeros_like(active)
+    for plasticity in (slow, short):
+        plasticity.record_activity(active, active)
+        for _ in range(3):
+            plasticity.record_activity(inactive, inactive)
+    np.testing.assert_allclose(slow.state.eligibility, 0.9 ** 3, atol=1e-7)
+    np.testing.assert_allclose(short.state.eligibility, 0.5 ** 3)
+    slow.apply_dopamine(0.0, 0.6)
+    short.apply_dopamine(0.0, 0.6)
+    assert np.all(short.state.efficacy > slow.state.efficacy)
+    assert np.all(short.state.efficacy < 1.0)
+
+
 def test_positive_and_negative_dopamine_change_eligible_edges() -> None:
     positive = rule()
     positive.record_activity(

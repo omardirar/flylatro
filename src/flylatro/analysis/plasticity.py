@@ -86,12 +86,21 @@ def plasticity_diagnostics(
     state: PlasticEdgeState,
     config: PlasticityConfig,
 ) -> dict[str, Any]:
-    efficacy = state_numpy(state.efficacy).astype(np.float64)
+    # Compare in the stored dtype, just as the live NumPy/Torch guard does.
+    # Promoting float32(0.2) to float64 before comparing with Python's 0.2
+    # makes a clipped lower-bound value appear strictly above the bound.
+    stored_efficacy = state_numpy(state.efficacy)
+    lower = np.asarray(config.min_efficacy, dtype=stored_efficacy.dtype)
+    upper = np.asarray(config.max_efficacy, dtype=stored_efficacy.dtype)
+    lower_mask = stored_efficacy <= lower
+    upper_mask = stored_efficacy >= upper
+    efficacy = stored_efficacy.astype(np.float64)
     delta = efficacy - state_numpy(state.initial_efficacy)
     eligibility = state_numpy(state.eligibility).astype(np.float64)
-    finite = bool(np.isfinite(efficacy).all() and np.isfinite(eligibility).all())
-    lower_fraction = float(np.mean(efficacy <= config.min_efficacy))
-    upper_fraction = float(np.mean(efficacy >= config.max_efficacy))
+    finite = bool(all(np.isfinite(state_numpy(values)).all() for values in
+                      (state.efficacy, state.initial_efficacy, state.eligibility, state.dopamine)))
+    lower_fraction = float(np.mean(lower_mask))
+    upper_fraction = float(np.mean(upper_mask))
     return {
         "finite": finite,
         "modified_fraction": float(np.mean(delta != 0)),
@@ -118,6 +127,10 @@ def plasticity_diagnostics(
         "eligibility_max_absolute": float(np.abs(eligibility).max()),
         "lower_bound_fraction": lower_fraction,
         "upper_bound_fraction": upper_fraction,
+        "lower_bound_counts": lower_mask.sum(axis=1).tolist(),
+        "upper_bound_counts": upper_mask.sum(axis=1).tolist(),
+        "max_learner_bound_fraction": float(np.mean(lower_mask | upper_mask, axis=1).max()),
+        "bound_comparison": "exact-in-stored-efficacy-dtype-v1",
         "all_weights_saturated": bool(lower_fraction + upper_fraction >= 0.999),
         "no_synaptic_change": bool(not np.any(delta)),
         "update_counts": state_numpy(state.update_count).tolist(),
@@ -213,7 +226,12 @@ def run_controlled_plasticity_sequence(
             edge_scale[::-1] * level * rule.config.mbon_reference_hz,
             (rule.state.learners, rule.state.edge_count),
         ).copy()
-        rule.record_activity(pre, post)
+        credit = None
+        if rule.config.version == 'three-factor-choice-gated-v1':
+            # A controlled structural mask exercises selected/idle traces;
+            # integrated calibration obtains real masks from executed actions.
+            credit = np.broadcast_to((edge_axis.astype(np.int64) + decision) % 3 == 0, pre.shape).copy()
+        rule.record_activity(pre, post, edge_credit=credit)
         appetitive, aversive = reinforcement[decision % len(reinforcement)]
         events = rule.apply_dopamine(
             appetitive,

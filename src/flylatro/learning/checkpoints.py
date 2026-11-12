@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from dataclasses import asdict
 from datetime import datetime, timezone
 import json
 import os
@@ -15,6 +16,7 @@ import numpy as np
 
 from flylatro.fly.flywire_artifact import sha256_file
 from flylatro.learning.trainer import PlasticTrainer
+from flylatro.learning.safety import TrainingSafetyConfig
 
 
 PLASTIC_CHECKPOINT_FORMAT = 1
@@ -44,6 +46,8 @@ def save_plastic_checkpoint(
     experiment_config: Mapping[str, Any],
     component_metadata: Mapping[str, Any],
     curriculum_state: Mapping[str, Any] | None = None,
+    monitoring_state: Mapping[str, Any] | None = None,
+    provenance: Mapping[str, Any] | None = None,
 ) -> Path:
     path = path.resolve()
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -55,6 +59,9 @@ def save_plastic_checkpoint(
         "components": dict(component_metadata),
         "curriculum_state": dict(curriculum_state or {}),
     }
+    if monitoring_state is not None:
+        # Display counters are metadata, outside the behavioural trainer state.
+        payload["monitoring_state"] = dict(monitoring_state)
     temporary = path.with_suffix(path.suffix + ".tmp")
     with temporary.open("wb") as stream:
         pickle.dump(payload, stream, protocol=pickle.HIGHEST_PROTOCOL)
@@ -77,9 +84,11 @@ def save_plastic_checkpoint(
         "components": dict(component_metadata),
         "experiment_config": dict(experiment_config),
         "curriculum_state": dict(curriculum_state or {}),
-        "git": git_metadata(),
-        "software": software_metadata(),
+        "git": provenance['git'] if provenance is not None else git_metadata(),
+        "software": provenance['software'] if provenance is not None else software_metadata(),
     }
+    if provenance is not None:
+        manifest['provenance_captured_at'] = provenance['captured_at']
     manifest_path = path.with_suffix(path.suffix + ".manifest.json")
     manifest_temporary = manifest_path.with_suffix(manifest_path.suffix + ".tmp")
     manifest_temporary.write_text(
@@ -89,13 +98,31 @@ def save_plastic_checkpoint(
     return manifest_path
 
 
+def capture_checkpoint_provenance() -> dict[str, Any]:
+    """Record the running process's fixed software/Git identity once.
+
+    Weight/state hashes and decision counters are still captured for each save.
+    Repeated subprocess/software discovery need not block every checkpoint.
+    """
+    return {'captured_at': datetime.now(timezone.utc).isoformat(),
+        'git': git_metadata(), 'software': software_metadata()}
+
+
 def load_plastic_checkpoint(
     path: Path,
     trainer: PlasticTrainer,
     *,
     expected_components: Mapping[str, Any] | None = None,
     verify_hash: bool = True,
+    require_matching_exposure_budget: bool = True,
 ) -> dict[str, Any]:
+    """Restore verified state, retaining strict experiment checks by default.
+
+    Frozen evaluation and synaptic analysis may load a checkpoint whose training
+    budget was overridden at the CLI. Training-only budget and safety-policy
+    checks can be skipped for frozen diagnostics; all model, mapping, condition
+    and schedule identities remain mandatory.
+    """
     path = path.resolve()
     manifest = load_plastic_manifest(path, verify_hash=verify_hash)
     with path.open("rb") as stream:
@@ -104,12 +131,24 @@ def load_plastic_checkpoint(
         raise ValueError("unsupported plastic checkpoint format")
     if payload.get("kind") != "flylatro-plastic-brain":
         raise ValueError("checkpoint is not a plastic-brain checkpoint")
+    if payload['components']['plasticity_rule_sha256'] != trainer.agent.plasticity.config.sha256:
+        raise ValueError("checkpoint plasticity rule differs; start a fresh experiment")
+    saved_skip_policy = payload["experiment_config"].get("environment", {}).get(
+        "allow_skip_blinds", True
+    )
+    if saved_skip_policy != getattr(trainer.env, "allow_skip_blinds", True):
+        raise ValueError("checkpoint blind-skipping policy differs; start a fresh experiment")
+    if require_matching_exposure_budget:
+        saved_safety = payload["experiment_config"].get("safety", asdict(TrainingSafetyConfig()))
+        if saved_safety != asdict(trainer.safety.config):
+            raise ValueError("checkpoint training safety policy differs; exact resume cannot relax its gates")
     if expected_components is not None:
         differences = {
             key: {"checkpoint": payload["components"].get(key), "current": value}
             for key, value in expected_components.items()
             if payload["components"].get(key) != value
             and not (value is None and key in COMPLETION_DERIVED_COMPONENT_FIELDS)
+            and not (key == "exposure_budget_decisions" and not require_matching_exposure_budget)
         }
         if differences:
             raise ValueError(

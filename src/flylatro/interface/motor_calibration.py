@@ -5,7 +5,7 @@ or any strategy label.  Selection uses only structural and statistical
 properties of neural activity recorded over a frozen, reward-free calibration
 state corpus, plus the environment's own legality masks.
 
-Selection is **context-aware** (v3).  A routing group is evaluated in the states
+Selection is **context-aware**.  A routing group is evaluated in the states
 where its pools are actually read, not across the whole corpus: a neuron with a
 large dynamic range in ``PLAYING`` states and none in the shop is not evidence
 that the contextual slot pools carry shop signal.  The four contextual heads
@@ -37,9 +37,9 @@ from flylatro.interface.motor_contexts import (
 )
 
 
-MOTOR_CALIBRATION_VERSION = "reward-free-neural-motor-calibration-v3"
+MOTOR_CALIBRATION_VERSION = "reward-free-neural-motor-calibration-v5"
 MOTOR_SELECTION_METHOD = (
-    "reward-free-context-conditioned-robust-scale-with-within-group-decorrelation"
+    "reward-free-context-conditioned-disjoint-pool-diversity-v1"
 )
 
 
@@ -116,20 +116,30 @@ def calibrate_reward_free_motor(
 
     statistics = _candidate_statistics(values, limits)
     eligible = statistics["eligible"]
-    required = routing.pool_count * pool_width
-    if int(eligible.sum()) < required:
-        raise MotorCalibrationError(
-            f"reward-free calibration found {int(eligible.sum())} usable motor "
-            f"candidates; the contextual routing needs {required} "
-            f"({routing.pool_count} pools x width {pool_width})",
-            {"candidate_statistics": _summarize_candidates(statistics, roots)},
-        )
-
     group_evidence = _group_evidence(values, routing, contexts, limits, roots)
+    # Each group performs a separate comparison. A neuron may contribute to
+    # different heads, but never to competing alternatives within one head.
+    # Eligibility is context-specific too: a whole-corpus IQR cannot reject a
+    # neuron with useful modulation only in its group's interpretation states.
+    required = max(routing.group_pool_counts) * pool_width
+    for group, count in zip(routing.group_names, routing.group_pool_counts, strict=True):
+        available = int(group_evidence[group]["eligible"].sum())
+        if available < count * pool_width:
+            raise MotorCalibrationError(
+                f"group {group} has {available} usable motor candidates; "
+                f"needs {count * pool_width} ({count} competing pools x width {pool_width})",
+                {
+                    "candidate_statistics": _summarize_candidates(statistics, roots),
+                    "selection_evidence_by_group": {
+                        name: evidence["summary"] for name, evidence in group_evidence.items()
+                    },
+                },
+            )
     assignment = _assign_pools(
         routing=routing,
         pool_width=pool_width,
         maximum_correlation=limits.maximum_within_group_correlation,
+        minimum_effective_fraction=limits.minimum_effective_signal_fraction,
         group_evidence=group_evidence,
     )
     pool_indices = assignment["pool_indices"]
@@ -163,6 +173,8 @@ def calibrate_reward_free_motor(
         "pool_count": routing.pool_count,
         "pool_width": int(pool_width),
         "required_outputs": required,
+        "allocation_policy": "distinct-within-comparison-reuse-across-groups-v1",
+        "unique_selected_count": int(len(np.unique(selected_positions))),
         "thresholds": asdict(limits),
         "selected_root_ids": roots[selected_positions].tolist(),
         "pool_root_ids": [
@@ -226,6 +238,52 @@ def calibrate_reward_free_motor(
 # --------------------------------------------------------------------------
 
 
+def validate_reward_free_motor(
+    mapping: MotorMapping,
+    activity_hz: NDArray[np.floating],
+    *,
+    thresholds: MotorCalibrationThresholds | None = None,
+    contexts: Mapping[str, MotorContextWindow] | None = None,
+    calibration_metadata: Mapping[str, Any] | None = None,
+) -> MotorCalibrationResult:
+    """Requalify existing pools and normalization without changing the policy."""
+    limits = thresholds or MotorCalibrationThresholds()
+    if mapping.normalization is None:
+        raise MotorCalibrationError('existing motor artifact lacks calibrated normalization')
+    values = np.asarray(activity_hz, dtype=np.float64)
+    if values.ndim != 2 or values.shape[1] != len(mapping.output_root_ids):
+        raise MotorCalibrationError('calibration activity must align with existing motor candidates')
+    if values.shape[0] < 4 or not np.isfinite(values).all():
+        raise MotorCalibrationError('insufficient finite reward-free calibration states')
+    if contexts is not None and any(window.relevant.shape[0] != len(values) for window in contexts.values()):
+        raise MotorCalibrationError('motor context windows must align with the calibration samples')
+    pool_activity = np.stack([values[:, list(pool)].mean(axis=1)
+        for pool in mapping.pool_indices], axis=1)
+    quality = _quality_report(pool_activity=pool_activity,
+        normalized=mapping.normalization.apply(pool_activity), routing=mapping.routing,
+        limits=limits, contexts=contexts)
+    checks = {**quality['checks'], 'pool_width_sufficient': all(
+        len(pool) >= limits.minimum_pool_width for pool in mapping.pool_indices)}
+    quality['checks'] = checks
+    report = {
+        'version': MOTOR_CALIBRATION_VERSION, 'mode': mapping.mode,
+        'motor_mapping_sha256': mapping.structure_sha256,
+        'motor_artifact_sha256': mapping.sha256,
+        'routing_sha256': mapping.routing.sha256,
+        'normalization_sha256': mapping.normalization.sha256,
+        'candidate_set_sha256': mapping.candidate_set_sha256,
+        'calibration_sha256': mapping.calibration_sha256,
+        'normalization': mapping.normalization.to_manifest(),
+        'calibration': {'existing_mapping_revalidated': True, 'reward_used': False,
+            'outcome_information_used': False, 'sample_count': len(values),
+            'thresholds': asdict(limits), 'quality': quality,
+            'state_sample_set': dict(calibration_metadata or {})},
+        'gates': {'status': 'PASS' if all(checks.values()) else 'FAIL',
+            'checks': checks, 'failed': [name for name, passed in checks.items() if not passed]},
+    }
+    return MotorCalibrationResult(mapping=mapping, report=report)
+
+
 def _group_evidence(
     values: NDArray[np.float64],
     routing: MotorRouting,
@@ -259,6 +317,7 @@ def _group_evidence(
             "eligible": statistics["eligible"],
             "order": _ranked_candidates(statistics, roots),
             "standardized": _standardize(subset, statistics["std"]),
+            "values": subset,
             "summary": {
                 "relevant_states": int(rows.size),
                 "context_restricted": restricted,
@@ -355,12 +414,13 @@ def _assign_pools(
     routing: MotorRouting,
     pool_width: int,
     maximum_correlation: float,
+    minimum_effective_fraction: float,
     group_evidence: Mapping[str, dict[str, Any]],
 ) -> dict[str, Any]:
-    used: set[int] = set()
     pools: list[tuple[int, ...] | None] = [None] * routing.pool_count
     relaxed: list[dict[str, Any]] = []
     for group, count in zip(routing.group_names, routing.group_pool_counts, strict=True):
+        used: set[int] = set()
         evidence = group_evidence[group]
         standardized = evidence["standardized"]
         eligible = evidence["eligible"]
@@ -379,13 +439,19 @@ def _assign_pools(
             picked = None
             if chosen:
                 reference = standardized[:, chosen]
-                for candidate in available:
+                diverse: list[tuple[float, int, int]] = []
+                for rank, candidate in enumerate(available):
                     correlation = np.abs(
-                        reference.T @ standardized[:, candidate] / max(samples - 1, 1)
+                        reference.T @ standardized[:, candidate] / max(samples, 1)
                     )
                     if correlation.max(initial=0.0) <= maximum_correlation:
-                        picked = candidate
-                        break
+                        # A loose ceiling alone lets the robust-scale ranking
+                        # fill every option with the same common-mode signal.
+                        # Prefer the least redundant eligible candidate, with
+                        # the fixed robust-scale/root ordering as a tie-break.
+                        diverse.append((float(np.mean(correlation**2)), rank, candidate))
+                if diverse:
+                    picked = min(diverse)[2]
             else:
                 picked = available[0]
             if picked is None:
@@ -397,14 +463,141 @@ def _assign_pools(
             used.add(picked)
         # Interleave so that no single option monopolises the most responsive
         # neurons: pool j receives ranks j, j+count, j+2*count, ...
-        for position, pool_id in enumerate(pool_ids):
-            members = tuple(
+        members_by_pool = [
+            tuple(
                 chosen[position + step * count] for step in range(pool_width)
             )
+            for position in range(count)
+        ]
+        # Selection of individually diverse neurons is not sufficient: their
+        # averages can reconstruct a common mode. Refine discrete membership,
+        # never decoder weights, against the unchanged pooled diversity gate.
+        if pool_width == 2:
+            members_by_pool = _refine_pairs(
+                evidence["values"], ranked, members_by_pool,
+                minimum_effective_fraction=minimum_effective_fraction,
+            )
+        for pool_id, members in zip(pool_ids, members_by_pool, strict=True):
             pools[pool_id] = members
     if any(pool is None for pool in pools):
         raise MotorCalibrationError("routing pool was not assigned a neural population")
     return {"pool_indices": tuple(pools), "relaxed": relaxed}  # type: ignore[arg-type]
+
+
+def _refine_pairs(
+    values: NDArray[np.float64],
+    ranked: Sequence[int],
+    initial: Sequence[tuple[int, ...]],
+    *,
+    minimum_effective_fraction: float,
+) -> list[tuple[int, ...]]:
+    """Bounded, deterministic membership search on reward-free pool covariance.
+
+    Maximize the participation ratio of the pooled correlation matrix. Starting
+    assignments and single-member exchanges use anatomy/statistics only; pool
+    labels have no strategy semantics. The original assignment remains a
+    fallback, and genuinely redundant data still fails the same quality gate.
+    """
+    count = len(initial)
+    initial_array = np.asarray(initial, dtype=np.int64)
+    covariance = np.cov(values, rowvar=False, bias=True)
+
+    def fraction(pairs: NDArray[np.int64]) -> float:
+        block = sum(
+            covariance[pairs[:, i, None], pairs[None, :, j]]
+            for i in range(2) for j in range(2)
+        )
+        variance = np.diag(block)
+        denominator = np.maximum(np.outer(variance, variance), 1e-12)
+        return float(count / max(float(np.sum(block**2 / denominator)), 1e-12))
+
+    best = initial_array.copy()
+    best_fraction = fraction(best)
+    if best_fraction >= minimum_effective_fraction:
+        return list(initial)
+    # Bound quadratic pair enumeration even for whole-brain candidate sets.
+    # Include every initially selected neuron, then fill by robust-scale rank.
+    selected = set(initial_array.ravel().tolist())
+    candidates = list(dict.fromkeys([*sorted(selected), *ranked]))
+    candidates = sorted(candidates[:max(64, count * 2)])
+    available = np.asarray(candidates, dtype=np.int64)
+    local = covariance[np.ix_(available, available)]
+    left, right = np.triu_indices(len(available), 1)
+    pair_variance = local[left, left] + local[right, right] + 2 * local[left, right]
+    pair_variance = np.maximum(pair_variance, 1e-12)
+
+    # Fixed, evenly spaced starts avoid a first-pair choice dominating search.
+    starts = np.unique(np.linspace(0, len(left) - 1, min(32, len(left)), dtype=int))
+    for start in starts:
+        pairs = [(int(left[start]), int(right[start]))]
+        used = set(pairs[0])
+        for _ in range(1, count):
+            chosen = np.asarray(pairs, dtype=np.int64)
+            chosen_variance = (
+                local[chosen[:, 0], chosen[:, 0]]
+                + local[chosen[:, 1], chosen[:, 1]]
+                + 2 * local[chosen[:, 0], chosen[:, 1]]
+            )
+            cross = sum(
+                local[index[:, None], chosen[None, :, member]]
+                for index in (left, right) for member in range(2)
+            )
+            scores = np.sum(
+                cross**2 / np.maximum(pair_variance[:, None] * chosen_variance[None, :], 1e-12),
+                axis=1,
+            )
+            invalid = np.isin(left, list(used)) | np.isin(right, list(used))
+            scores[invalid] = np.inf
+            picked = int(np.argmin(scores))
+            pairs.append((int(left[picked]), int(right[picked])))
+            used.update(pairs[-1])
+        current = available[np.asarray(pairs, dtype=np.int64)]
+        # Every exchange strictly improves the pooled objective; deterministic
+        # tie order and an iteration cap make the persisted mapping repeatable.
+        for _ in range(200):
+            current_fraction = fraction(current)
+            improved = current_fraction
+            change: tuple[int, int, int] | None = None
+            used_roots = set(current.ravel().tolist())
+            for position in range(count):
+                other = np.delete(current, position, axis=0)
+                other_variance = (
+                    covariance[other[:, 0], other[:, 0]]
+                    + covariance[other[:, 1], other[:, 1]]
+                    + 2 * covariance[other[:, 0], other[:, 1]]
+                )
+                for member in range(2):
+                    partner = current[position, 1 - member]
+                    variance = (
+                        covariance[available, available] + covariance[partner, partner]
+                        + 2 * covariance[available, partner]
+                    )
+                    cross = sum(
+                        covariance[index, other[:, side]]
+                        for index in (available[:, None], partner)
+                        for side in range(2)
+                    )
+                    scores = np.sum(
+                        cross**2 / np.maximum(variance[:, None] * other_variance[None, :], 1e-12),
+                        axis=1,
+                    )
+                    old = current[position, member]
+                    old_score = float(scores[candidates.index(int(old))])
+                    for candidate in sorted(used_roots - {int(old)}):
+                        scores[candidates.index(candidate)] = np.inf
+                    picked = int(np.argmin(scores))
+                    total = count / current_fraction + 2 * (float(scores[picked]) - old_score)
+                    candidate_fraction = count / max(total, 1e-12)
+                    if candidate_fraction > improved + 1e-10:
+                        improved = candidate_fraction
+                        change = (position, member, int(available[picked]))
+            if change is None:
+                break
+            current[change[0], change[1]] = change[2]
+        result = fraction(current)
+        if result > best_fraction + 1e-10:
+            best, best_fraction = current.copy(), result
+    return [tuple(int(index) for index in pair) for pair in best]
 
 
 # --------------------------------------------------------------------------
@@ -615,7 +808,8 @@ def _correlation_matrix(values: NDArray[np.float64]) -> NDArray[np.float64]:
     std = values.std(axis=0)
     safe = np.where(std > 0, std, 1.0)
     standardized = centred / safe
-    matrix = standardized.T @ standardized / max(values.shape[0] - 1, 1)
+    # std uses ddof=0; use the same population denominator for covariance.
+    matrix = standardized.T @ standardized / max(values.shape[0], 1)
     constant = std <= 0
     if constant.any():
         matrix[constant, :] = 0.0

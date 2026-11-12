@@ -19,6 +19,9 @@ from numpy.typing import NDArray
 from flylatro.fly.mushroom_body.state import PlasticEdgeState, state_numpy
 from flylatro.fly.mushroom_body.topology import PlasticEdgeTopology
 
+GLOBAL_PLASTICITY_VERSION = "three-factor-global-v1"
+CHOICE_GATED_PLASTICITY_VERSION = "three-factor-choice-gated-v1"
+
 
 @dataclass(frozen=True, slots=True)
 class PlasticityConfig:
@@ -33,6 +36,8 @@ class PlasticityConfig:
     max_eligibility: float = 4.0
 
     def __post_init__(self) -> None:
+        if self.version not in {GLOBAL_PLASTICITY_VERSION, CHOICE_GATED_PLASTICITY_VERSION}:
+            raise ValueError("unsupported plasticity rule version")
         if self.learning_rate < 0:
             raise ValueError("learning_rate cannot be negative")
         if not 0 <= self.eligibility_decay <= 1:
@@ -134,9 +139,14 @@ class ThreeFactorPlasticity:
         self,
         edge_pre_activity: NDArray[np.floating],
         edge_post_activity: NDArray[np.floating],
+        *,
+        edge_credit: object | None = None,
     ) -> None:
+        gated = self.config.version == CHOICE_GATED_PLASTICITY_VERSION
+        if gated != (edge_credit is not None):
+            raise ValueError("choice-gated plasticity requires an explicit credit mask; global plasticity forbids one")
         if self.is_torch:
-            self._record_activity_torch(edge_pre_activity, edge_post_activity)
+            self._record_activity_torch(edge_pre_activity, edge_post_activity, edge_credit)
             return
         pre = np.asarray(edge_pre_activity, dtype=np.float32)
         post = np.asarray(edge_post_activity, dtype=np.float32)
@@ -145,6 +155,10 @@ class ThreeFactorPlasticity:
             raise ValueError(f"edge activity must have shape {expected}")
         if not np.isfinite(pre).all() or not np.isfinite(post).all():
             raise ValueError("edge activity must be finite")
+        if edge_credit is not None:
+            edge_credit = np.asarray(edge_credit)
+            if edge_credit.shape != expected or edge_credit.dtype != np.bool_:
+                raise ValueError("edge credit must be an edge-aligned boolean mask")
         pre = np.maximum(pre, 0.0)
         post = np.maximum(post, 0.0)
         # Absolute, fixed-reference scaling preserves magnitude across
@@ -153,6 +167,8 @@ class ThreeFactorPlasticity:
         pre_scaled = np.clip(pre / self.config.kc_reference_hz, 0.0, 1.0)
         post_scaled = np.clip(post / self.config.mbon_reference_hz, 0.0, 1.0)
         coincidence = pre_scaled * post_scaled
+        if edge_credit is not None:
+            coincidence *= edge_credit
         self.state.eligibility *= self.config.eligibility_decay
         self.state.eligibility += coincidence
         np.clip(
@@ -163,13 +179,18 @@ class ThreeFactorPlasticity:
         )
         self.state.decision_count += 1
 
-    def _record_activity_torch(self, edge_pre_activity: object, edge_post_activity: object) -> None:
+    def _record_activity_torch(self, edge_pre_activity: object, edge_post_activity: object,
+                               edge_credit: object | None = None) -> None:
         import torch
 
         pre = torch.as_tensor(edge_pre_activity, dtype=torch.float32, device=self.state.device)
         post = torch.as_tensor(edge_post_activity, dtype=torch.float32, device=self.state.device)
         if tuple(pre.shape) != tuple(self.state.efficacy.shape) or tuple(post.shape) != tuple(pre.shape):
             raise ValueError(f"edge activity must have shape {tuple(self.state.efficacy.shape)}")
+        if edge_credit is not None:
+            edge_credit = torch.as_tensor(edge_credit, device=self.state.device)
+            if edge_credit.shape != pre.shape or edge_credit.dtype != torch.bool:
+                raise ValueError("edge credit must be an edge-aligned boolean mask")
         with torch.no_grad():
             # One fused device-side finiteness reduction; no host copy of the
             # full activity vectors on the routine path.
@@ -180,6 +201,8 @@ class ThreeFactorPlasticity:
             post_scaled = torch.clamp(post, min=0) / self.config.mbon_reference_hz
             post_scaled.clamp_(0, 1)
             coincidence.mul_(post_scaled)
+            if edge_credit is not None:
+                coincidence.mul_(edge_credit)
             self.state.eligibility.mul_(self.config.eligibility_decay).add_(coincidence)
             self.state.eligibility.clamp_(-self.config.max_eligibility, self.config.max_eligibility)
             self.state.decision_count.add_(1)
@@ -394,7 +417,14 @@ class ThreeFactorPlasticity:
 
         On the Torch path every quantity is a device reduction and the whole
         block reaches the host as one small tensor.
+
+        Net direction is relative to initialization, rather than the last
+        update. "Near bound" means within 5% of the configured efficacy
+        range of either bound, including already clamped weights. It is
+        diagnostic only and does not replace the saturation safety gate.
         """
+
+        bound_margin = 0.05 * (self.config.max_efficacy - self.config.min_efficacy)
 
         if not self.is_torch:
             efficacy = self.state.efficacy
@@ -417,6 +447,20 @@ class ThreeFactorPlasticity:
                 "upper_bound_fraction": float(
                     np.mean(efficacy >= self.config.max_efficacy)
                 ),
+                "max_learner_bound_fraction": float(np.mean(
+                    (efficacy <= self.config.min_efficacy) | (efficacy >= self.config.max_efficacy), axis=1,
+                ).max()),
+                "max_learner_mean_absolute_drift": float(drift.mean(axis=1).max()),
+                "net_strengthened_fraction": float(np.mean(efficacy > initial)),
+                "net_weakened_fraction": float(np.mean(efficacy < initial)),
+                "max_learner_near_bound_fraction": float(np.mean(
+                    (efficacy <= self.config.min_efficacy + bound_margin)
+                    | (efficacy >= self.config.max_efficacy - bound_margin), axis=1,
+                ).max()),
+                "finite_state": float(all(np.isfinite(values).all() for values in
+                                          (efficacy, initial, self.state.eligibility, self.state.dopamine))),
+                "efficacy_outside_bounds": float(np.any(
+                    (efficacy < self.config.min_efficacy - 1e-7) | (efficacy > self.config.max_efficacy + 1e-7))),
             }
         import torch
 
@@ -435,6 +479,15 @@ class ThreeFactorPlasticity:
                     self.state.dopamine.abs().mean(),
                     (efficacy <= self.config.min_efficacy).to(torch.float64).mean(),
                     (efficacy >= self.config.max_efficacy).to(torch.float64).mean(),
+                    ((efficacy <= self.config.min_efficacy) | (efficacy >= self.config.max_efficacy)).to(torch.float64).mean(dim=1).amax(),
+                    drift.mean(dim=1).amax(),
+                    (torch.isfinite(efficacy).all() & torch.isfinite(self.state.initial_efficacy).all()
+                     & torch.isfinite(self.state.eligibility).all() & torch.isfinite(self.state.dopamine).all()).to(torch.float64),
+                    ((efficacy < self.config.min_efficacy - 1e-7) | (efficacy > self.config.max_efficacy + 1e-7)).any().to(torch.float64),
+                    (efficacy > self.state.initial_efficacy).to(torch.float64).mean(),
+                    (efficacy < self.state.initial_efficacy).to(torch.float64).mean(),
+                    ((efficacy <= self.config.min_efficacy + bound_margin)
+                     | (efficacy >= self.config.max_efficacy - bound_margin)).to(torch.float64).mean(dim=1).amax(),
                 )
             ).to(torch.float64)
             values = block.cpu().numpy()
@@ -448,6 +501,13 @@ class ThreeFactorPlasticity:
             "reinforcement_trace_mean_absolute",
             "lower_bound_fraction",
             "upper_bound_fraction",
+            "max_learner_bound_fraction",
+            "max_learner_mean_absolute_drift",
+            "finite_state",
+            "efficacy_outside_bounds",
+            "net_strengthened_fraction",
+            "net_weakened_fraction",
+            "max_learner_near_bound_fraction",
         )
         return {name: float(values[index]) for index, name in enumerate(names)}
 

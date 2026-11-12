@@ -32,7 +32,7 @@ from flylatro.interface.motor_contexts import (
 )
 
 
-REPRESENTATION_REPORT_VERSION = "flylatro-representation-v3"
+REPRESENTATION_REPORT_VERSION = "flylatro-representation-v4"
 MOTOR_POPULATION_BY_MODE: dict[str, str] = {
     "mbon_direct": "mbon",
     "whole_brain": "descending",
@@ -547,7 +547,8 @@ def _correlation(values: NDArray[np.float64]) -> NDArray[np.float64]:
     centred = values - values.mean(axis=0)
     std = values.std(axis=0)
     standardized = centred / np.where(std > 0, std, 1.0)
-    matrix = standardized.T @ standardized / max(values.shape[0] - 1, 1)
+    # std uses ddof=0; this is Pearson correlation, including small contexts.
+    matrix = standardized.T @ standardized / max(values.shape[0], 1)
     constant = std <= 0
     if constant.any():
         matrix[constant, :] = 0.0

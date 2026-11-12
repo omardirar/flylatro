@@ -2,13 +2,13 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
 import random
 from typing import Any, Callable, Sequence
 
 import numpy as np
 
-from flylatro.env.balatro_sim import ArrayBalatroEnv
+from flylatro.env.balatro_sim import ArrayBalatroEnv, ArrayStep
 from flylatro.env.upstream_contract import ActionDict
 from flylatro.env.upstream_contract import N_ACTION_TYPES
 from flylatro.evaluation.state_hash import hash_observation_row, terminal_hash
@@ -16,6 +16,7 @@ from flylatro.learning.agent import LearningResult, PlasticDecision, PlasticFlyA
 from flylatro.learning.reinforcement import DopaminePulse
 from flylatro.learning.reward_schedule import MatchedActionStep
 from flylatro.seeds import derive_seed
+from flylatro.learning.safety import TRAINING_SAFETY_VERSION, TrainingSafetyConfig, TrainingSafetyMonitor, TrainingSafetyStop
 
 
 @dataclass(frozen=True, slots=True)
@@ -25,12 +26,15 @@ class PlasticTrainingConfig:
     plasticity_enabled: bool = True
     checkpoint_every_decisions: int = 100
     base_fly_seed: int = 2001
+    episode_history_limit: int = 512
 
     def __post_init__(self) -> None:
         if self.max_environment_decisions < 1:
             raise ValueError("max_environment_decisions must be positive")
         if self.checkpoint_every_decisions < 1:
             raise ValueError("checkpoint cadence must be positive")
+        if self.episode_history_limit < 1:
+            raise ValueError("episode history limit must be positive")
 
 
 @dataclass(slots=True)
@@ -45,6 +49,10 @@ class PlasticTrainingState:
     action_type_counts: list[int] = field(
         default_factory=lambda: [0] * N_ACTION_TYPES
     )
+    episode_history_start: int = 0
+    episode_return_sum: float = 0.0
+    best_episode_return: float | None = None
+    best_episode_ante: int = 0
 
 
 class PlasticTrainer:
@@ -57,6 +65,7 @@ class PlasticTrainer:
         training_seeds: Sequence[int],
         dopamine_schedule: Sequence[DopaminePulse] | None = None,
         action_schedule: Sequence[MatchedActionStep] | None = None,
+        safety: TrainingSafetyConfig = TrainingSafetyConfig(),
     ) -> None:
         if len(training_seeds) != env.num_envs:
             raise ValueError("one training seed is required per environment")
@@ -80,11 +89,16 @@ class PlasticTrainer:
         self.state = PlasticTrainingState()
         self.last_decision: PlasticDecision | None = None
         self.last_learning: LearningResult | None = None
+        self.last_step: ArrayStep | None = None
         self.last_executed_actions: ActionDict | None = None
         self.last_state_hashes_before: tuple[str, ...] = ()
         self.last_state_hashes_after: tuple[str, ...] = ()
         self.last_scheduled_ante: int | None = None
         self.record_detailed_plasticity = False
+        self._motor_columns = np.unique(np.concatenate([
+            np.asarray(pool, dtype=np.int64) for pool in self.agent.motor.mapping.pool_indices
+        ]))
+        self.safety = TrainingSafetyMonitor(safety, maximum_eligibility=agent.plasticity.config.max_eligibility)
 
     def step(self) -> dict[str, float]:
         scheduled = (
@@ -126,6 +140,7 @@ class PlasticTrainer:
             deterministic_motor=self.config.deterministic_motor,
             motor_learner_ids=self.training_seeds,
             motor_decision_ids=decision_ids,
+            record_eligibility=self.agent.credit is None,
         )
         executed_actions = (
             scheduled.actions
@@ -133,6 +148,8 @@ class PlasticTrainer:
             else decision.actions
         )
         step = self.env.step(executed_actions)
+        if self.agent.credit is not None:
+            self.agent.record_choice_activity(decision.neural, executed_actions, self.masks)
         hashes_after = tuple(
             terminal_hash(step.infos[row])
             if bool(step.dones[row])
@@ -155,6 +172,7 @@ class PlasticTrainer:
         )
         self.last_decision = decision
         self.last_learning = learning
+        self.last_step = step
         self.last_executed_actions = executed_actions
         self.last_state_hashes_before = hashes_before
         self.last_state_hashes_after = hashes_after
@@ -176,8 +194,19 @@ class PlasticTrainer:
             if not isinstance(episode, dict):
                 continue
             self.state.completed_episodes += 1
-            self.state.episode_returns.append(float(episode.get("r", 0.0)))
-            self.state.episode_antes.append(int(episode.get("ante", 0)))
+            episode_return = float(episode.get("r", 0.0))
+            episode_ante = int(episode.get("ante", 0))
+            self.state.episode_returns.append(episode_return)
+            self.state.episode_antes.append(episode_ante)
+            self.state.episode_return_sum += episode_return
+            self.state.best_episode_return = (episode_return if self.state.best_episode_return is None
+                else max(self.state.best_episode_return, episode_return))
+            self.state.best_episode_ante = max(self.state.best_episode_ante, episode_ante)
+            excess = len(self.state.episode_returns) - self.config.episode_history_limit
+            if excess > 0:
+                del self.state.episode_returns[:excess]
+                del self.state.episode_antes[:excess]
+                self.state.episode_history_start += excess
             self.state.wins += bool(episode.get("won", False))
         # Device-resident reductions: routine training never copies a full
         # efficacy, eligibility or reinforcement-trace vector to the host.
@@ -188,7 +217,21 @@ class PlasticTrainer:
         action_probabilities /= action_probabilities.sum()
         observed = action_probabilities[action_probabilities > 0]
         action_entropy = -float(np.sum(observed * np.log(observed)))
+        neural = decision.neural.health_summary
+        if neural is None:
+            neural = {
+                'kc_active_fraction': float(np.mean(decision.neural.kc_activity > 0)),
+                'mbon_mean_activity': float(decision.neural.mbon_activity.mean()),
+                'descending_mean_activity': float(decision.neural.descending_activity.mean()),
+                'min_learner_kc_active_fraction': float(np.mean(decision.neural.kc_activity > 0, axis=1).min()),
+                'finite_activity': float(all(np.isfinite(values).all() for values in (
+                    decision.neural.kc_activity, decision.neural.mbon_activity,
+                    decision.neural.descending_activity, decision.neural.output_activity))),
+            }
+        neural = {**neural, 'min_learner_motor_active_fraction': float(
+            np.mean(decision.neural.output_activity[:, self._motor_columns] > 0, axis=1).min())}
         return {
+            **(self.agent.credit.metrics if self.agent.credit is not None else {}),
             "training/environment_decisions": float(self.state.environment_decisions),
             "training/completed_episodes": float(self.state.completed_episodes),
             "training/win_rate": (
@@ -229,25 +272,27 @@ class PlasticTrainer:
             ),
             "plasticity/lower_bound_fraction": plastic["lower_bound_fraction"],
             "plasticity/upper_bound_fraction": plastic["upper_bound_fraction"],
+            **{f"plasticity/{name}": plastic[name] for name in (
+                "finite_state", "efficacy_outside_bounds", "max_learner_bound_fraction", "max_learner_mean_absolute_drift",
+                "net_strengthened_fraction", "net_weakened_fraction", "max_learner_near_bound_fraction",
+            )},
             "behaviour/action_type_entropy": action_entropy,
             "behaviour/action_types_observed": float(len(observed)),
             "behaviour/dominant_action_fraction": float(
                 action_probabilities.max()
             ),
-            "neural/kc_active_fraction": float(
-                np.mean(decision.neural.kc_activity > 0)
-            ),
-            "neural/mbon_mean_activity": float(decision.neural.mbon_activity.mean()),
-            "neural/descending_mean_activity": float(
-                decision.neural.descending_activity.mean()
-            ),
+            **{f'neural/{name}': value for name, value in neural.items()},
         }
 
     def train(
         self,
         *,
         on_step: Callable[["PlasticTrainer", dict[str, float]], None] | None = None,
+        stop_after_environment_decisions: int | None = None,
     ) -> PlasticTrainingState:
+        target = self.config.max_environment_decisions if stop_after_environment_decisions is None else stop_after_environment_decisions
+        if not self.state.environment_decisions <= target <= self.config.max_environment_decisions or target < 1 or target % self.env.num_envs:
+            raise ValueError("stage stop must be aligned, not precede restored exposure and not exceed the declared budget")
         if (
             self.dopamine_schedule is not None
             and len(self.dopamine_schedule) < self.config.max_environment_decisions
@@ -258,13 +303,30 @@ class PlasticTrainer:
         required_steps = self.config.max_environment_decisions // self.env.num_envs
         if self.action_schedule is not None and len(self.action_schedule) < required_steps:
             raise ValueError("matched action schedule is shorter than exposure budget")
+        state_metrics = {f"plasticity/{key}": value for key, value in self.agent.plasticity.routine_metrics().items()}
+        state_metrics["training/environment_decisions"] = float(self.state.environment_decisions)
+        if self.safety.observe(state_metrics, state_only=True) is not None:
+            raise TrainingSafetyStop(self.safety.failure)
         while (
             self.state.environment_decisions
-            < self.config.max_environment_decisions
+            < target
         ):
-            metrics = self.step()
+            try:
+                metrics = self.step()
+            except ValueError as error:
+                if not self.safety.config.enabled or "finite" not in str(error):
+                    raise
+                self.safety.failure = {
+                    "version": TRAINING_SAFETY_VERSION, "status": "SAFETY_STOPPED",
+                    "failed": ["non_finite_neural_or_plastic_input"], "error": str(error),
+                    "metrics": {"training/environment_decisions": self.state.environment_decisions},
+                }
+                raise TrainingSafetyStop(self.safety.failure) from error
+            self.safety.observe(metrics)
             if on_step is not None:
                 on_step(self, metrics)
+            if self.safety.failure is not None:
+                raise TrainingSafetyStop(self.safety.failure)
         return self.state
 
     def state_dict(self) -> dict[str, Any]:
@@ -284,22 +346,14 @@ class PlasticTrainer:
                 torch.cuda.get_rng_state_all() if torch.cuda.is_available() else []
             )
         return {
-            "training_state": {
-                "environment_decisions": self.state.environment_decisions,
-                "vector_steps": self.state.vector_steps,
-                "completed_episodes": self.state.completed_episodes,
-                "episode_returns": list(self.state.episode_returns),
-                "episode_antes": list(self.state.episode_antes),
-                "wins": self.state.wins,
-                "plasticity_events": self.state.plasticity_events,
-                "action_type_counts": list(self.state.action_type_counts),
-            },
+            "training_state": asdict(self.state),
             "plastic_state": self.agent.plasticity.state.state_dict(),
             "motor_rng_state": self.agent.motor.rng_state(),
             "observations": self.observations,
             "masks": self.masks,
             "environment_snapshots": self.env.snapshot_all(),
             "training_seeds": self.training_seeds,
+            "safety_state": self.safety.state_dict(),
             "rng": rng,
         }
 
@@ -339,8 +393,18 @@ class PlasticTrainer:
                 int(value)
                 for value in state.get("action_type_counts", [0] * N_ACTION_TYPES)
             ],
+            episode_history_start=int(state.get("episode_history_start", 0)),
+            episode_return_sum=float(state.get("episode_return_sum", sum(state["episode_returns"]))),
+            best_episode_return=state.get("best_episode_return", max(state["episode_returns"], default=None)),
+            best_episode_ante=int(state.get("best_episode_ante", max(state["episode_antes"], default=0))),
         )
+        excess = len(self.state.episode_returns) - self.config.episode_history_limit
+        if excess > 0:
+            del self.state.episode_returns[:excess]
+            del self.state.episode_antes[:excess]
+            self.state.episode_history_start += excess
         self.env.reset(self.training_seeds)
         self.env.restore_all(values["environment_snapshots"])
         self.observations = values["observations"]
         self.masks = values["masks"]
+        self.safety.load_state_dict(values.get("safety_state", {}))

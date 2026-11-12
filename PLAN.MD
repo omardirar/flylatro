@@ -6,6 +6,11 @@ This is the authoritative plan for Flylatro. The superseded fixed-reservoir/PPO
 plan is preserved at `docs/archive/RESERVOIR_V1_PLAN.md` and its implementation
 is a legacy comparison only.
 
+Exploratory priorities and their short-, medium-, and long-term gates are
+tracked in [docs/LEARNING_ROADMAP.md](docs/LEARNING_ROADMAP.md). The isolated
+card-learning harness is documented in
+[docs/CARD_LEARNING_EXPERIMENTS.md](docs/CARD_LEARNING_EXPERIMENTS.md).
+
 Plastic-brain V1 asks whether reward-modulated plasticity at anatomically
 identified Kenyon-cell to mushroom-body-output-neuron (KC->MBON) connections in
 an adult FlyWire-derived network can acquire useful Balatro behaviour. A second
@@ -239,6 +244,15 @@ group because the already-selected action type makes them mutually exclusive;
 card slots stay separate because a consumable reads both at once. The routing is
 zero-parameter, non-trainable, deterministic, versioned and hashed. It needs 35
 pools rather than the 61 that summing every head width would demand.
+
+Neuron membership is disjoint within each comparison group; independently
+interpreted groups may reuse physical neurons while retaining separate routed
+pool IDs and normalization. Calibration evaluates candidate variability in each
+group's own legal contexts. At width two the 35 pools have 70 memberships, but
+the largest comparison requires 26 distinct candidates, not 70 globally distinct
+outputs. This decoder convention and its cross-head dependence are recorded in
+ADR 0014. Selected-motor reachability is measured after calibration on the exact
+persisted pool members; full plastic-MBON coverage remains a separate gate.
 
 Action types 0-12 are the scientifically represented set. `MOVE_JOKER` needs a
 source and destination the pinned action contract cannot carry, and 14-24 are
@@ -493,3 +507,19 @@ The target technical statement is:
 > Flylatro learns by modifying synapses inside a connectome-derived model of
 > the fly mushroom-body learning circuit; its Balatro sensory and motor
 > interfaces are fixed and contain no learned policy.
+
+## Authorized exploratory local teaching — 28 October 2026
+
+The user retained local-plasticity-only learning and requested a learner
+redesign with visible-state teaching and a staged card-play curriculum.
+The separate [local teacher implementation](docs/LOCAL_TEACHER_CURRICULUM.md)
+keeps persistent trainable parameters on existing KC→MBON edges and adds
+local activity-mean traces and synthetic neuron-specific teaching signals.
+It uses no backpropagation, optimizer or external learned policy/critic.
+The exact new equations and teaching routes are engineering hypotheses,
+not established fly biology or replacements for primary V1.
+
+Two bounded candidates completed without reliable native first-blind gains.
+Their code, checkpoints, teacher-free evaluations and unsuccessful outcomes
+are preserved. The prerequisite for DISCARD/Ante-1/shop progression and
+long reinforcement training remains unmet; those stages were not launched.

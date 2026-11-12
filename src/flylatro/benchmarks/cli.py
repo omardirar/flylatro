@@ -274,8 +274,16 @@ def plastic_end_to_end_main(argv: Sequence[str] | None = None) -> int:
         torch.cuda.reset_peak_memory_stats()
     start = time.perf_counter()
     last = {}
-    for _ in range(args.steps):
-        last = stack.trainer.step()
+    components: dict[str, float] = {}
+    def observed(trainer, metrics):
+        nonlocal last
+        last = metrics
+        # Backend timings reset for every neural decision. Accumulate before
+        # the next reset and before optional comparison simulations replace it.
+        for name, value in (getattr(backend, "component_seconds", {}) or {}).items():
+            components[name] = components.get(name, 0.0) + value
+    stack.trainer.train(on_step=observed, stop_after_environment_decisions=(
+        stack.trainer.state.environment_decisions + args.steps * stack.env.num_envs))
     if config.fly.device.startswith("cuda"):
         torch.cuda.synchronize()
     seconds = time.perf_counter() - start
@@ -290,19 +298,20 @@ def plastic_end_to_end_main(argv: Sequence[str] | None = None) -> int:
         if config.fly.device.startswith("cuda"):
             torch.cuda.synchronize()
         batch_started = time.perf_counter()
-        stack.agent.processor.process(observations, fly_seeds=fly_seeds, efficacy=efficacy)
+        batched = stack.agent.processor.process(observations, fly_seeds=fly_seeds, efficacy=efficacy)
         if config.fly.device.startswith("cuda"):
             torch.cuda.synchronize()
         batch_seconds = time.perf_counter() - batch_started
         if config.fly.device.startswith("cuda"):
             torch.cuda.synchronize()
         sequential_started = time.perf_counter()
+        sequential = []
         for row in range(stack.env.num_envs):
-            stack.agent.processor.process(
+            sequential.append(stack.agent.processor.process(
                 {key: value[row:row + 1] for key, value in observations.items()},
                 fly_seeds=(fly_seeds[row],),
                 efficacy=efficacy[row:row + 1],
-            )
+            ))
         if config.fly.device.startswith("cuda"):
             torch.cuda.synchronize()
         sequential_seconds = time.perf_counter() - sequential_started
@@ -312,10 +321,14 @@ def plastic_end_to_end_main(argv: Sequence[str] | None = None) -> int:
             "sequential_seconds": sequential_seconds,
             "measured_speedup": sequential_seconds / max(batch_seconds, 1e-12),
             "memory_model": "one shared fixed sparse graph plus batched plastic KC-MBON edge contribution",
+            "maximum_activity_difference_hz": max(float(np.max(np.abs(
+                np.asarray(getattr(batched, name)) - np.concatenate([
+                    np.asarray(getattr(row, name)) for row in sequential], axis=0))))
+                for name in ("kc_activity", "mbon_activity", "descending_activity", "output_activity")),
         }
+        comparison["exact_activity_agreement"] = comparison["maximum_activity_difference_hz"] == 0
     from flylatro.analysis.evidence import experiment_identity
 
-    components = dict(getattr(backend, "component_seconds", {}) or {})
     details = {
         "output_mode": config.fly.mode,
         "plastic_edges": stack.agent.plasticity.topology.edge_count,
@@ -332,6 +345,7 @@ def plastic_end_to_end_main(argv: Sequence[str] | None = None) -> int:
         details["component_fraction"] = {
             name: value / max(seconds, 1e-12) for name, value in components.items()
         }
+        details["component_timing_scope"] = "sum across all measured training decisions; excludes sequential/batched comparison"
         details["component_note"] = (
             "recurrent is the total; recurrent_fixed and recurrent_plastic are "
             "its nested parts. Poisson dominance justifies switching "
@@ -347,7 +361,7 @@ def plastic_end_to_end_main(argv: Sequence[str] | None = None) -> int:
             config,
             stack.components,
             report_kind="benchmark",
-            report_version="plastic-end-to-end-benchmark-v2",
+            report_version="plastic-end-to-end-benchmark-v3",
         ).to_dict(),
     }
     if args.output is not None:

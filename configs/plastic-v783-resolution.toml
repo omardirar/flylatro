@@ -1,0 +1,73 @@
+[experiment]
+name = "plastic-v783-resolution"
+
+[environment]
+backend = "balatro_sim"
+num_envs = 1
+strict_actions = true
+
+[fly]
+backend = "flywire"
+mode = "mbon_direct"
+artifact_path = "data/flywire/flywire_fafb_v783.npz"
+device = "cuda"
+duration_ms = 500.0
+reset_fast_state_each_decision = true
+sensory_mapping_seed = 0
+sensory_population_width = 3
+max_rate_hz = 150.0
+motor_pool_width = 2
+motor_mapping_path = "artefacts/motor-map-v783-resolution.json"
+
+[motor]
+deterministic_training = false
+exploration_epsilon = 0.05
+exploration_temperature = 1.0
+exploration_seed = 2203
+
+[plasticity]
+learning_rate = 0.02
+eligibility_decay = 0.90
+dopamine_decay = 0.0
+min_efficacy = 0.20
+max_efficacy = 2.0
+kc_reference_hz = 20.0
+mbon_reference_hz = 20.0
+max_eligibility = 4.0
+
+[reinforcement]
+condition = "primary-progress"
+progress_scale = 0.05
+blind_clear_pulse = 0.40
+ante_clear_pulse = 0.80
+run_failure_pulse = 0.60
+ante8_success_pulse = 1.50
+
+[training]
+max_environment_decisions = 20
+checkpoint_every_decisions = 10
+budget_basis = "tiny-real-calibration-gate-20-decisions"
+base_fly_seed = 2001
+plasticity_enabled = true
+
+[curriculum]
+enabled = true
+ladder = [1]
+promotion_win_rate = 0.70
+evaluation_every_decisions = 1
+evaluation_episodes = 1
+
+[calibration]
+corpus_path = "artefacts/calibration-corpus-v783-balanced-long.npz"
+sensory_health_report = "artefacts/sensory-health-v783-balanced-long.json"
+representation_pre_report = "artefacts/representation-pre-resolution.json"
+representation_post_report = "artefacts/representation-post-resolution.json"
+motor_calibration_report = "artefacts/motor-map-v783-resolution-report.json"
+reachability_report = "artefacts/kc-reachability-resolution.json"
+plasticity_report = "artefacts/plasticity-calibration-resolution.json"
+specificity_report = "artefacts/chosen-action-specificity-resolution.json"
+benchmark_report = "artefacts/bench-plastic-end-to-end-resolution.json"
+
+[runtime]
+output_root = "runs"
+tensorboard = false

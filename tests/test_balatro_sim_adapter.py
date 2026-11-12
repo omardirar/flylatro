@@ -21,6 +21,7 @@ from flylatro.env.upstream_contract import (
     empty_action_batch,
     GLOBAL_ANTE_OFF,
     GLOBAL_PHASE_OFF,
+    UpstreamActionType,
 )
 
 
@@ -109,6 +110,47 @@ def test_adapter_rejects_contract_drift() -> None:
 
     with pytest.raises(ValueError, match="dtype"):
         adapter.step(malformed)
+
+
+@pytest.mark.parametrize("allow_skip", [True, False])
+def test_blind_skip_policy_applies_after_reset_step_and_restore(allow_skip) -> None:
+    adapter = BalatroSimAdapter(2, allow_skip_blinds=allow_skip,
+        sim_module=SimpleNamespace(BalatroVecEnv=FakeBalatroVecEnv))
+    skip = int(UpstreamActionType.SKIP_BLIND)
+    select = int(UpstreamActionType.SELECT_BLIND)
+    adapter._env.masks["action_type_mask"][:, [skip, select]] = True
+    _, masks = adapter.reset([11, 12])
+    assert np.all(masks["action_type_mask"][:, skip] == allow_skip)
+    assert masks["action_type_mask"][:, select].all()
+    assert adapter._env.masks["action_type_mask"][:, skip].all()
+    step = adapter.step(empty_action_batch(2))
+    assert np.all(step.masks["action_type_mask"][:, skip] == allow_skip)
+    adapter.restore_all([b"first", b"second"])
+    _, masks = adapter.observe()
+    assert np.all(masks["action_type_mask"][:, skip] == allow_skip)
+    assert adapter._env.masks["action_type_mask"][:, skip].all()
+
+
+def test_disabled_skip_is_rejected_before_any_batched_simulator_step() -> None:
+    adapter = BalatroSimAdapter(2, strict=False, allow_skip_blinds=False,
+        sim_module=SimpleNamespace(BalatroVecEnv=FakeBalatroVecEnv))
+    adapter.reset([11, 12])
+    actions = empty_action_batch(2)
+    actions["action_type"][1] = int(UpstreamActionType.SKIP_BLIND)
+    with pytest.raises(ValueError, match="SKIP_BLIND is disabled"):
+        adapter.step(actions)
+    assert adapter._env.last_actions is None
+
+
+def test_restore_keeps_reward_decomposition_on_the_first_resumed_transition() -> None:
+    adapter = BalatroSimAdapter(1, sim_module=SimpleNamespace(BalatroVecEnv=FakeBalatroVecEnv))
+    adapter._env.observations["global"][0, GLOBAL_PHASE_OFF + 1] = 1
+    adapter._env.observations["global"][0, GLOBAL_ANTE_OFF] = 1
+    adapter.reset([1])
+    adapter.restore(0, b"snapshot")
+    step = adapter.step(empty_action_batch(1))
+    assert "reward_components" in step.infos[0]
+    assert step.infos[0]["reward_components"]["blind_progress"] > 0
 
 
 @pytest.mark.parametrize(

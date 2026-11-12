@@ -38,7 +38,7 @@ from flylatro.env.upstream_contract import (
     MaskDict,
     UpstreamActionType,
 )
-from flylatro.interface.motor import HEAD_SIZES, SUPPORTED_ACTION_TYPES
+from flylatro.interface.motor import HEAD_SIZES, SUPPORTED_ACTION_TYPES, MotorRouting
 
 
 MOTOR_CONTEXT_VERSION = "motor-interpretation-contexts-v1"
@@ -170,6 +170,7 @@ def motor_context_windows(
     *,
     order: Sequence[int] | None = None,
     supported_action_types: Sequence[int] = SUPPORTED_ACTION_TYPES,
+    routing: MotorRouting | None = None,
 ) -> dict[str, MotorContextWindow]:
     """Derive every motor interpretation context from legality masks only.
 
@@ -225,13 +226,29 @@ def motor_context_windows(
             consumable_mask,
         ),
     }
+    specs = MOTOR_CONTEXTS
+    if routing is not None and routing.action_conditioned:
+        play_relevant = legal(UpstreamActionType.PLAY_HAND) | use_consumable
+        windows["card_count"] = (play_relevant & count_legal.any(axis=1), count_legal)
+        windows["card_slot"] = (play_relevant & card_mask.any(axis=1), card_mask)
+        discard_counts = count_legal.copy()
+        discard_counts[:, 0] = False
+        discard = legal(UpstreamActionType.DISCARD)
+        windows["discard_card_count"] = (discard & discard_counts.any(axis=1), discard_counts)
+        windows["discard_card_slot"] = (discard & card_mask.any(axis=1), card_mask)
+        specs = MOTOR_CONTEXTS + (
+            MotorContextSpec("discard_card_count", "discard_card_count", "discard_card_count",
+                             "states where DISCARD is legal; zero cards excluded"),
+            MotorContextSpec("discard_card_slot", "discard_card_slot", "discard_card",
+                             "states where DISCARD can select hand cards"),
+        )
     return {
         spec.name: MotorContextWindow(
             spec=spec,
             relevant=np.asarray(windows[spec.name][0], dtype=bool),
             option_legal=np.asarray(windows[spec.name][1], dtype=bool),
         )
-        for spec in MOTOR_CONTEXTS
+        for spec in specs
     }
 
 

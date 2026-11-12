@@ -58,12 +58,15 @@ class BalatroSimAdapter:
         *,
         strict: bool = True,
         win_ante: int = 8,
+        allow_skip_blinds: bool = True,
         sim_module: Any | None = None,
     ) -> None:
         if num_envs < 1:
             raise ValueError("num_envs must be positive")
         if not 1 <= win_ante <= 8:
             raise ValueError("win_ante must be in [1, 8]")
+        if not isinstance(allow_skip_blinds, bool):
+            raise ValueError("allow_skip_blinds must be boolean")
         if sim_module is None:
             try:
                 import balatro_sim as sim_module
@@ -74,6 +77,7 @@ class BalatroSimAdapter:
                 ) from error
         self._env = sim_module.BalatroVecEnv(num_envs, strict, win_ante)
         self.num_envs = num_envs
+        self.allow_skip_blinds = allow_skip_blinds
         self._beta = 1.0
         self._last_observations: ObsDict | None = None
 
@@ -84,10 +88,22 @@ class BalatroSimAdapter:
         validate_batch(OBS_SPEC, observations, self.num_envs, "observations")
         validate_batch(MASK_SPEC, masks, self.num_envs, "masks")
         self._last_observations = observations
-        return observations, masks
+        return observations, self._action_masks(masks)
+
+    def _action_masks(self, masks: MaskDict) -> MaskDict:
+        if self.allow_skip_blinds:
+            return masks
+        constrained = dict(masks)
+        constrained["action_type_mask"] = masks["action_type_mask"].copy()
+        constrained["action_type_mask"][:, int(UpstreamActionType.SKIP_BLIND)] = False
+        return constrained
 
     def step(self, actions: ActionDict) -> ArrayStep:
         validate_batch(ACTION_SPEC, actions, self.num_envs, "actions")
+        if not self.allow_skip_blinds and np.any(
+            actions["action_type"] == int(UpstreamActionType.SKIP_BLIND)
+        ):
+            raise ValueError("SKIP_BLIND is disabled by this experiment")
         contiguous = {
             key: np.ascontiguousarray(value, dtype=np.int64)
             for key, value in actions.items()
@@ -126,7 +142,7 @@ class BalatroSimAdapter:
             enriched_infos.append(info)
         self._last_observations = observations
         return ArrayStep(
-            observations, masks, rewards, dones, tuple(enriched_infos)
+            observations, self._action_masks(masks), rewards, dones, tuple(enriched_infos)
         )
 
     def set_shaping_beta(self, beta: float) -> None:
@@ -145,14 +161,17 @@ class BalatroSimAdapter:
         validate_batch(OBS_SPEC, observations, self.num_envs, "observations")
         validate_batch(MASK_SPEC, masks, self.num_envs, "masks")
         self._last_observations = observations
-        return observations, masks
+        return observations, self._action_masks(masks)
 
     def snapshot(self, env_index: int) -> bytes:
         return bytes(self._env.snapshot(int(env_index)))
 
     def restore(self, env_index: int, snapshot: bytes) -> None:
         self._env.restore(int(env_index), snapshot)
-        self._last_observations = None
+        # Reward decomposition and Ante-clear detection need the state before
+        # the next step, just as they do after reset. Restore must repopulate
+        # this adapter cache instead of losing the first resumed transition.
+        self.observe()
 
     def snapshot_all(self) -> tuple[bytes, ...]:
         return tuple(self.snapshot(index) for index in range(self.num_envs))

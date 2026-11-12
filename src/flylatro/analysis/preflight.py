@@ -60,7 +60,7 @@ from flylatro.learning.config import (
     resolve_path,
     synthetic_circuit_spec,
 )
-from flylatro.learning.protocol import ExperimentProtocol, validate_control_group
+from flylatro.learning.protocol import ExperimentProtocol, find_reference, validate_control_group
 
 
 PREFLIGHT_VERSION = "flylatro-preflight-v3"
@@ -107,7 +107,7 @@ REPORT_KIND_POLICY: dict[str, ReportKindPolicy] = {
         "chosen_action_specificity", (SPECIFICITY_REPORT_VERSION,)
     ),
     "benchmark": ReportKindPolicy(
-        "benchmark", ("plastic-end-to-end-benchmark-v2",)
+        "benchmark", ("plastic-end-to-end-benchmark-v3",)
     ),
 }
 
@@ -164,6 +164,9 @@ REPORT_IDENTITY_FIELDS: dict[str, tuple[str, ...]] = {
         "calibration_corpus_sha256",
         "decision_duration_ms",
         "fly_dynamics_sha256",
+        "output_mode",
+        "motor_candidate_set_sha256",
+        "motor_mapping_sha256",
     ),
     "plasticity_calibration": (
         "plasticity_rule_sha256",
@@ -177,7 +180,14 @@ REPORT_IDENTITY_FIELDS: dict[str, tuple[str, ...]] = {
         "motor_mapping_sha256",
         "reinforcement_mapping_sha256",
     ),
-    "benchmark": ("fly_backend", "fly_dynamics_sha256", "device"),
+    "benchmark": (
+        "fly_backend", "fly_dynamics_sha256", "device", "artifact_sha256",
+        "population_sha256", "fly_connectivity_sha256", "plastic_topology_sha256",
+        "minimum_synapse_count", "sensory_feature_contract_sha256",
+        "sensory_mapping_sha256", "motor_candidate_set_sha256", "motor_mapping_sha256",
+        "plasticity_rule_sha256", "reinforcement_mapping_sha256", "output_mode",
+        "decision_duration_ms",
+    ),
 }
 
 
@@ -277,6 +287,17 @@ def run_preflight(
 
     # ---- external data and populations -----------------------------------
     if artifact is not None:
+        source_floor = artifact.manifest.get("source_minimum_pair_synapse_count")
+        if source_floor is None and "connections_princeton.csv.gz" in artifact.manifest.get("source_sha256", {}):
+            source_floor = 5
+        source_complete = source_floor == 1
+        gate("anatomical_source_coverage", "PASS" if source_complete else "FAIL",
+             ("unthresholded v783 source preserves anatomical weak-edge coverage" if source_complete else
+              "primary V1 requires unthresholded source pairs; the artifact's source floor is "
+              f"{source_floor!r}, so minimum_synapse_count=1 cannot establish full anatomical coverage"),
+             {"source_minimum_pair_synapse_count": source_floor,
+              "connection_source": artifact.manifest.get("connection_source"),
+              "configured_minimum_synapse_count": config.fly.minimum_synapse_count})
         quality = {
             key: artifact.manifest.get(key)
             for key in (
@@ -395,7 +416,7 @@ def run_preflight(
         extra=_benchmark_fields_check(),
         status_key=None,
     )
-    _control_gates(gate, control_manifests, selected)
+    _control_gates(gate, control_manifests, selected, expected)
     _protocol_gate(config, gate, protocol_payload, selected)
 
     gate("environment_backend", "PASS" if config.environment.backend == "mock" or importlib.util.find_spec("balatro_sim") is not None else "FAIL", f"backend={config.environment.backend}")
@@ -520,6 +541,7 @@ def _expected_identity(
     from flylatro.fly.plastic_features import channel_manifest
 
     dynamics = fly_dynamics_payload(config)
+    from flylatro.fly.execution import backend_class, execution_identity_hash
     git = git_identity()
     identity = EvidenceIdentity(
         report_kind="expected_experiment_identity",
@@ -544,6 +566,7 @@ def _expected_identity(
         reinforcement_mapping_sha256=config.reinforcement.sha256,
         plasticity_rule_sha256=config.plasticity.sha256,
         fly_dynamics_sha256=payload_sha256(dynamics),
+        fly_implementation_sha256=execution_identity_hash(config.fly.execution),
         # The declared dynamics payload is authoritative: a backend that fixes
         # its own decision window must be compared against that window, not
         # against a configuration field it ignores.
@@ -551,7 +574,7 @@ def _expected_identity(
         output_mode=config.fly.mode,
         topology_condition=config.fly.topology,
         fly_backend=(
-            "flywire-shiu-torch-plastic-kc-mbon-v1"
+            backend_class(config.fly.execution).backend_version
             if config.fly.backend == "flywire"
             else "synthetic-plastic-mushroom-body-v1"
         ),
@@ -632,6 +655,8 @@ def _identity_verifier(
             )
             return
         fields = REPORT_IDENTITY_FIELDS[kind]
+        if expected.fly_implementation_sha256 is not None and kind != "sensory_health":
+            fields = (*fields, "fly_implementation_sha256")
         mismatches = identity.mismatches(expected, required_fields=fields)
         if mismatches:
             gate(
@@ -1163,6 +1188,7 @@ def _control_gates(
     gate: Callable[..., None],
     control_manifests: Sequence[Mapping[str, Any]],
     profile: PreflightProfile,
+    expected: EvidenceIdentity,
 ) -> None:
     if len(control_manifests) < 2:
         gate(
@@ -1177,12 +1203,24 @@ def _control_gates(
         )
         return
     report = validate_control_group(control_manifests)
+    reference_index, _ = find_reference(control_manifests)
+    reference = control_manifests[reference_index]
+    identity = EvidenceIdentity.from_components(
+        reference.get("components", reference),
+        report_kind="control_validation", report_version=report["version"], include_git=False,
+    )
+    mismatches = identity.mismatches(expected, required_fields=(
+        "artifact_sha256", "population_sha256", "plastic_topology_sha256",
+        "minimum_synapse_count", "sensory_mapping_sha256", "motor_mapping_sha256",
+        "motor_candidate_set_sha256", "reinforcement_mapping_sha256",
+        "plasticity_rule_sha256", "fly_dynamics_sha256", "output_mode", "fly_backend",
+    ))
     gate(
         "matched_control_readiness",
-        report["gates"]["status"],
-        "matched-control semantics validated for exact action-matched and "
-        "behaviourally independent topology controls",
-        {"failed": report["gates"]["failed"], "arms": report["arms"]},
+        "FAIL" if mismatches else report["gates"]["status"],
+        ("matched controls belong to a different model: " + describe_mismatches(mismatches)
+         if mismatches else "matched-control semantics and current model identity validated"),
+        {"failed": report["gates"]["failed"], "arms": report["arms"], "identity_mismatches": mismatches},
     )
     conditions = [arm["condition"] for arm in report["arms"]]
     has_real = "plastic_real" in conditions
@@ -1190,7 +1228,7 @@ def _control_gates(
         condition in {"no_plasticity", "kc_mbon_shuffled", "whole_brain_shuffled", "shuffled_reward"}
         for condition in conditions
     )
-    ok = has_real and has_control
+    ok = has_real and has_control and not mismatches and report["gates"]["status"] == "PASS"
     gate(
         "tiny_real_plastic_run",
         "PASS" if ok else ("FAIL" if profile.require_tiny_real_run else "WARN"),

@@ -25,32 +25,43 @@ from flylatro.fly.flywire_artifact import (
 )
 
 
-BUILD_VERSION = "flywire-v783-builder-v2-plastic-mb"
+BUILD_VERSION = "flywire-v783-builder-v3-explicit-source-threshold"
 REQUIRED_FILES = (
     "neurons.csv.gz",
     "classification.csv.gz",
     "consolidated_cell_types.csv.gz",
-    "connections_princeton.csv.gz",
     "coordinates.csv.gz",
 )
+CONNECTION_SOURCES = {
+    "unthresholded": "connections_princeton_no_threshold.csv.gz",
+    "threshold5": "connections_princeton.csv.gz",
+}
 REFERENCE_SHA256 = {
     "neurons.csv.gz": "6a6b3759e635f0f35a677d169052362131ec61d95f55919298b55c43fce4e719",
     "classification.csv.gz": "e946b552f4056dfc977707be0674609832c3f64332a22d69dc0d9615e7aae663",
     "consolidated_cell_types.csv.gz": "8aba246d71dc40361677493629972ce3883048c3d02010adc42bda22962a1a2d",
     "connections_princeton.csv.gz": "445f996bf6c4b1803b9ba186189138a3061ff8623aa94c0abcf38af30a5bd48b",
+    "connections_princeton_no_threshold.csv.gz": "62c2e562a7470bfd32cbb98e36af3daa607ba0822b37223b34f2aa45250a920e",
     "coordinates.csv.gz": "14337121f451f98c2576cee72c24409ada5aaf7948b7c7ca8de9040296840e05",
 }
 NT_SIGN = {"ACH": 1, "DA": 1, "OCT": 1, "SER": 1, "GABA": -1, "GLUT": -1}
 
 
-def build(source_dir: Path, output_dir: Path) -> tuple[Path, Path]:
+def build(source_dir: Path, output_dir: Path, *, connection_source: str = "unthresholded") -> tuple[Path, Path]:
     try:
         import pandas as pd
     except ImportError as error:
         raise ImportError("install Flylatro's 'flywire' extra") from error
     source_dir = source_dir.resolve()
     output_dir = output_dir.resolve()
-    sources = {name: source_dir / name for name in REQUIRED_FILES}
+    if connection_source not in CONNECTION_SOURCES:
+        raise ValueError(f"unknown connection source: {connection_source}")
+    connection_filename = CONNECTION_SOURCES[connection_source]
+    sources = {name: source_dir / name for name in (*REQUIRED_FILES, connection_filename)}
+    # A rebuild is a new experiment identity, never an in-place replacement of
+    # the anatomy underlying existing checkpoints/calibration.
+    if output_dir.exists() and any(output_dir.iterdir()):
+        raise FileExistsError(f"artifact output directory is not empty: {output_dir}")
     missing = [str(path) for path in sources.values() if not path.exists()]
     if missing:
         raise FileNotFoundError("required FlyWire files are missing:\n" + "\n".join(missing))
@@ -105,7 +116,7 @@ def build(source_dir: Path, output_dir: Path) -> tuple[Path, Path]:
     neurons["idx"] = np.arange(len(neurons), dtype=np.int64)
 
     connections = pd.read_csv(
-        sources["connections_princeton.csv.gz"],
+        sources[connection_filename],
         usecols=["pre_root_id", "post_root_id", "syn_count", "nt_type"],
         dtype={
             "pre_root_id": np.int64,
@@ -158,7 +169,7 @@ def build(source_dir: Path, output_dir: Path) -> tuple[Path, Path]:
         .sum()
         .reset_index()
     )
-    if len(grouped) != EXPECTED_CONNECTION_PAIRS:
+    if connection_source == "threshold5" and len(grouped) != EXPECTED_CONNECTION_PAIRS:
         raise ValueError(
             f"expected {EXPECTED_CONNECTION_PAIRS} neuron pairs, got {len(grouped)}"
         )
@@ -276,6 +287,9 @@ def build(source_dir: Path, output_dir: Path) -> tuple[Path, Path]:
         "data_licence": "CC BY-NC-SA 4.0",
         "source_url": "https://codex.flywire.ai/api/download",
         "source_sha256": hashes,
+        "connection_source": connection_source,
+        "connection_source_file": connection_filename,
+        "source_minimum_pair_synapse_count": 1 if connection_source == "unthresholded" else 5,
         "artifact_sha256": sha256_file(artifact_path),
         "connectivity_sha256": connectivity_sha256(pre_indices, post_indices, signed),
         "population_sha256": population_sha256(population_arrays),
@@ -331,6 +345,8 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--source-dir", type=Path, required=True)
     parser.add_argument("--output-dir", type=Path, required=True)
+    parser.add_argument("--connection-source", choices=tuple(CONNECTION_SOURCES), default="unthresholded",
+                        help="primary V1 uses all source pairs; threshold5 reproduces the historical filtered artifact")
     parser.add_argument(
         "--full",
         action="store_true",
@@ -339,7 +355,7 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     if not args.full:
         parser.error("the full FlyWire build requires explicit --full")
-    artifact, manifest = build(args.source_dir, args.output_dir)
+    artifact, manifest = build(args.source_dir, args.output_dir, connection_source=args.connection_source)
     print(json.dumps({"artifact": str(artifact), "manifest": str(manifest)}, indent=2))
     return 0
 

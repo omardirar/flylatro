@@ -14,7 +14,7 @@ import numpy as np
 from flylatro.env.array_mock import MockArrayBalatroEnv
 from flylatro.env.balatro_sim import BalatroSimAdapter
 from flylatro.fly.flywire_artifact import FlyWireArtifact
-from flylatro.fly.mushroom_body.plasticity import PlasticityConfig, ThreeFactorPlasticity
+from flylatro.fly.mushroom_body.plasticity import PlasticityConfig, ThreeFactorPlasticity, CHOICE_GATED_PLASTICITY_VERSION
 from flylatro.fly.mushroom_body.compartmental import EdgeModulationAssignment
 from flylatro.fly.mushroom_body.state import PlasticEdgeState, TorchPlasticEdgeState
 from flylatro.fly.mushroom_body.topology import PlasticEdgeTopology
@@ -44,6 +44,7 @@ from flylatro.learning.reward_schedule import (
     load_action_schedule,
 )
 from flylatro.learning.trainer import PlasticTrainer, PlasticTrainingConfig
+from flylatro.learning.safety import TrainingSafetyConfig
 from flylatro.seeds import SeedPlan
 
 
@@ -55,11 +56,13 @@ class EnvironmentSettings:
     initial_hands: int = 3
     initial_discards: int = 2
     strict_actions: bool = True
+    allow_skip_blinds: bool = True
 
 
 @dataclass(frozen=True, slots=True)
 class FlySettings:
     backend: str = "synthetic"
+    execution: str = "torch_reference"
     mode: str = "mbon_direct"
     artifact_path: str = "data/flywire/flywire_fafb_v783.npz"
     device: str = "cpu"
@@ -75,6 +78,7 @@ class FlySettings:
     topology: str = "real"
     shuffle_seed: int = 1701
     minimum_synapse_count: int = 1
+    synapse_scale_mv: float = 0.275
 
 
 @dataclass(frozen=True, slots=True)
@@ -90,6 +94,7 @@ class TrainingSettings:
     max_environment_decisions: int = 100
     checkpoint_every_decisions: int = 100
     base_fly_seed: int = 2001
+    episode_history_limit: int = 512
     plasticity_enabled: bool = True
     training_seed_offset: int = 0
     reinforcement_mode: str = "outcome"
@@ -165,6 +170,7 @@ class PlasticExperimentConfig:
     runtime: RuntimeSettings
     calibration: CalibrationSettings = CalibrationSettings()
     protocol: ProtocolBinding = ProtocolBinding()
+    safety: TrainingSafetyConfig = TrainingSafetyConfig()
 
     @classmethod
     def load(cls, path: Path) -> "PlasticExperimentConfig":
@@ -182,6 +188,7 @@ class PlasticExperimentConfig:
             "runtime",
             "calibration",
             "protocol",
+            "safety",
         }
         unknown = raw.keys() - allowed
         if unknown:
@@ -207,6 +214,7 @@ class PlasticExperimentConfig:
             runtime=_section(RuntimeSettings, raw.get("runtime", {})),
             calibration=_section(CalibrationSettings, raw.get("calibration", {})),
             protocol=_section(ProtocolBinding, raw.get("protocol", {})),
+            safety=_section(TrainingSafetyConfig, raw.get("safety", {})),
         )
         config.validate()
         return config
@@ -216,20 +224,38 @@ class PlasticExperimentConfig:
             raise ValueError("environment backend must be mock or balatro_sim")
         if self.environment.num_envs < 1:
             raise ValueError("num_envs must be positive")
+        if not isinstance(self.environment.allow_skip_blinds, bool):
+            raise ValueError("allow_skip_blinds must be boolean")
         if self.fly.backend not in {"synthetic", "flywire"}:
             raise ValueError("fly backend must be synthetic or flywire")
         if self.fly.mode not in {"mbon_direct", "whole_brain"}:
             raise ValueError("fly mode must be mbon_direct or whole_brain")
+        if self.plasticity.version == CHOICE_GATED_PLASTICITY_VERSION and self.fly.mode != "mbon_direct":
+            raise ValueError("choice-gated plasticity requires mbon_direct")
         if self.fly.topology not in {"real", "kc_mbon_shuffled", "whole_brain_shuffled"}:
             raise ValueError("fly topology must be real, kc_mbon_shuffled or whole_brain_shuffled")
         if self.fly.backend == "synthetic" and self.fly.topology != "real":
             raise ValueError("synthetic topology control uses its own fixed test graph")
         if self.fly.motor_pool_width < 2:
-            raise ValueError("scientific motor pools require motor_pool_width >= 2")
+            # A separately versioned action-conditioned artifact can explicitly
+            # use single-MBON options to fit two exclusive layouts in the fixed
+            # candidate universe. The legacy scientific interface stays >=2.
+            path = (resolve_path(self, self.fly.motor_mapping_path)
+                    if self.fly.motor_mapping_path else None)
+            mapping = MotorMapping.load(path) if path is not None and path.is_file() else None
+            if (self.fly.motor_pool_width != 1 or mapping is None
+                    or not mapping.routing.action_conditioned or mapping.pool_width != 1):
+                raise ValueError("scientific motor pools require motor_pool_width >= 2; width one requires an explicit action-conditioned artifact")
         if self.fly.sensory_population_width < 1 or self.fly.duration_ms <= 0:
             raise ValueError("sensory population width and duration must be positive")
         if self.fly.minimum_synapse_count < 1:
             raise ValueError("minimum_synapse_count must be at least one")
+        if not np.isfinite(self.fly.synapse_scale_mv) or self.fly.synapse_scale_mv <= 0:
+            raise ValueError("synapse_scale_mv must be finite and positive")
+        from flylatro.fly.execution import backend_class
+        backend_class(self.fly.execution)
+        if self.fly.backend == "synthetic" and self.fly.execution != "torch_reference":
+            raise ValueError("accelerated execution requires a FlyWire backend")
         if self.fly.backend == "synthetic" and self.fly.minimum_synapse_count != 1:
             raise ValueError("synthetic test topology supports minimum_synapse_count=1 only")
         if self.curriculum.enabled:
@@ -247,6 +273,8 @@ class PlasticExperimentConfig:
                 raise ValueError("curriculum evaluation episodes must be positive")
         if self.training.reinforcement_mode not in {"outcome", "shuffled_schedule"}:
             raise ValueError("unknown reinforcement_mode")
+        if self.training.episode_history_limit < 1:
+            raise ValueError("episode history limit must be positive")
         if (
             self.training.reinforcement_mode == "shuffled_schedule"
             and not self.training.reinforcement_schedule_path
@@ -294,6 +322,7 @@ class PlasticExperimentConfig:
             "runtime": asdict(self.runtime),
             "calibration": asdict(self.calibration),
             "protocol": asdict(self.protocol),
+            "safety": asdict(self.safety),
         }
 
     def require_heavy_opt_in(self, heavy: bool) -> None:
@@ -326,7 +355,9 @@ def synthetic_circuit_spec(
     return SyntheticPlasticCircuitSpec(
         seed=config.fly.synthetic_seed,
         kenyon_count=config.fly.synthetic_kenyon_count,
-        output_count=MOTOR_POOL_COUNT * config.fly.motor_pool_width + 16,
+        # Changing to the explicit single-neuron action-conditioned interface
+        # must not silently shrink the synthetic neural candidate universe.
+        output_count=MOTOR_POOL_COUNT * max(2, config.fly.motor_pool_width) + 16,
     )
 
 
@@ -334,6 +365,12 @@ def synthetic_circuit_spec(
 #: constants so a synthetic report is still provenance-checkable.
 SYNTHETIC_ARTIFACT_IDENTITY = "synthetic-development-only"
 SYNTHETIC_SENSORY_IDENTITY = "synthetic-fixed-projection-v1"
+
+
+def _lif_parameters(config: PlasticExperimentConfig) -> Any:
+    from flylatro.fly.torch_backend import ShiuLIFParameters
+
+    return ShiuLIFParameters(synapse_scale_mv=config.fly.synapse_scale_mv)
 
 
 def fly_dynamics_payload(config: PlasticExperimentConfig) -> dict[str, Any]:
@@ -355,9 +392,11 @@ def fly_dynamics_payload(config: PlasticExperimentConfig) -> dict[str, Any]:
     from flylatro.fly.plastic_backend import PlasticTorchFlyWireBackend
     from flylatro.fly.torch_backend import POISSON_METHOD, ShiuLIFParameters
 
+    from flylatro.fly.execution import backend_class
+
     backend_payload = {
-        "backend_version": PlasticTorchFlyWireBackend.backend_version,
-        "parameters": asdict(ShiuLIFParameters()),
+        "backend_version": backend_class(config.fly.execution).backend_version,
+        "parameters": asdict(_lif_parameters(config)),
         "poisson_method": POISSON_METHOD,
     }
     return {
@@ -554,7 +593,8 @@ def build_plastic_stack(
         artifact_path = Path(config.fly.artifact_path)
         if not artifact_path.is_absolute():
             artifact_path = config.source_path.parent.parent / artifact_path
-        artifact = FlyWireArtifact.load(artifact_path)
+        from flylatro.fly.prepared_cache import load_prepared_artifact
+        artifact = load_prepared_artifact(artifact_path)
         shuffle_seed = config.fly.shuffle_seed if config.fly.topology != "real" else None
         shuffle_scope = (
             "kc_mbon" if config.fly.topology == "kc_mbon_shuffled" else "whole_brain"
@@ -591,10 +631,13 @@ def build_plastic_stack(
         readout = PlasticFlyProcessor.required_readout_indices(
             artifact, topology, output_indices
         )
-        backend = PlasticTorchFlyWireBackend(
+        from flylatro.fly.execution import build_backend
+        backend = build_backend(
+            config.fly.execution,
             artifact,
             topology,
             device=config.fly.device,
+            parameters=_lif_parameters(config),
             readout_indices=readout,
             shuffle_seed=shuffle_seed,
             shuffle_scope=shuffle_scope,
@@ -656,6 +699,8 @@ def build_plastic_stack(
     motor_calibration_status = "persisted-artifact"
     if configured_motor_path is not None and configured_motor_path.exists():
         motor_mapping = MotorMapping.load(configured_motor_path)
+        if motor_mapping.routing.action_conditioned and motor_mapping.pool_width != config.fly.motor_pool_width:
+            raise ValueError("action-conditioned artifact width differs from declared motor_pool_width")
         if motor_mapping.mode != config.fly.mode or not np.array_equal(
             motor_mapping.output_root_ids, processor.output_root_ids
         ):
@@ -751,6 +796,7 @@ def build_plastic_stack(
             plasticity_enabled=config.training.plasticity_enabled,
             checkpoint_every_decisions=config.training.checkpoint_every_decisions,
             base_fly_seed=config.training.base_fly_seed,
+            episode_history_limit=config.training.episode_history_limit,
         ),
         training_seeds=SeedPlan().seeds(
             "training",
@@ -759,6 +805,7 @@ def build_plastic_stack(
         ),
         dopamine_schedule=dopamine_schedule,
         action_schedule=action_schedule,
+        safety=config.safety,
     )
     components = {
         "architecture": "plastic-brain-v1",
@@ -845,6 +892,15 @@ def build_plastic_stack(
             else "independent-parallel-flies-no-weight-sharing"
         ),
     }
+    if not config.environment.allow_skip_blinds:
+        components["action_constraints"] = {"allow_skip_blinds": False}
+    if agent.credit is not None:
+        components["credit_assignment"] = agent.credit.manifest
+    if config.fly.execution != "torch_reference":
+        from flylatro.fly.execution import implementation_identity
+        components["fly_implementation"] = implementation_identity(config.fly.execution)
+        if hasattr(backend, "native_identity"):
+            components["fly_implementation"]["native_build"] = backend.native_identity
     return PlasticTrainingStack(env, agent, trainer, components)
 
 
@@ -893,11 +949,15 @@ def build_plastic_environment(config: PlasticExperimentConfig) -> Any:
         env.set_win_ante(
             config.curriculum.ladder[0] if config.curriculum.enabled else 8
         )
+        # The development environment never exposes SKIP_BLIND. Retain the
+        # declared policy for checkpoint compatibility and experiment identity.
+        env.allow_skip_blinds = settings.allow_skip_blinds
         return env
     return BalatroSimAdapter(
         settings.num_envs,
         strict=settings.strict_actions,
         win_ante=config.curriculum.ladder[0] if config.curriculum.enabled else 8,
+        allow_skip_blinds=settings.allow_skip_blinds,
     )
 
 

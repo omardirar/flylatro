@@ -23,7 +23,7 @@ from flylatro.fly.mushroom_body.plasticity import PlasticityConfig
 from flylatro.fly.mushroom_body.topology import PlasticEdgeTopology
 
 
-REACHABILITY_REPORT_VERSION = "kc-subtype-reachability-v1"
+REACHABILITY_REPORT_VERSION = "kc-subtype-reachability-v2"
 
 
 @dataclass(frozen=True, slots=True)

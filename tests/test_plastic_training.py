@@ -4,6 +4,7 @@ from dataclasses import replace
 from pathlib import Path
 
 import numpy as np
+import pytest
 import subprocess
 import sys
 
@@ -79,6 +80,93 @@ def test_checkpoint_resume_reproduces_future_plasticity_exactly(
         == resumed.agent.plasticity.state.weight_sha256
     )
     assert uninterrupted.trainer.state == resumed.trainer.state
+
+
+@pytest.mark.parametrize("saved_policy,current_policy", [(True, False), (False, True)])
+@pytest.mark.parametrize("exact_resume", [True, False])
+def test_checkpoint_rejects_changed_blind_skip_policy(tmp_path, saved_policy, current_policy, exact_resume):
+    original = smoke_config()
+    saved_config = replace(original, environment=replace(original.environment,
+        allow_skip_blinds=saved_policy))
+    current_config = replace(original, environment=replace(original.environment,
+        allow_skip_blinds=current_policy))
+    saved = build_plastic_stack(saved_config)
+    saved.trainer.train(stop_after_environment_decisions=4)
+    checkpoint = tmp_path / 'skip-policy.pkl'
+    save_plastic_checkpoint(checkpoint, saved.trainer,
+        experiment_config=saved_config.to_dict(), component_metadata=saved.components)
+    current = build_plastic_stack(current_config)
+    with pytest.raises(ValueError, match="blind-skipping policy differs"):
+        load_plastic_checkpoint(checkpoint, current.trainer,
+            expected_components=current.components, require_matching_exposure_budget=exact_resume)
+
+
+def test_legacy_checkpoint_without_skip_setting_retains_allowed_policy(tmp_path):
+    config = smoke_config()
+    saved = build_plastic_stack(config)
+    saved.trainer.train(stop_after_environment_decisions=4)
+    legacy = config.to_dict()
+    legacy['environment'].pop('allow_skip_blinds')
+    checkpoint = tmp_path / 'legacy-skip-policy.pkl'
+    save_plastic_checkpoint(checkpoint, saved.trainer,
+        experiment_config=legacy, component_metadata=saved.components)
+    restored = build_plastic_stack(config)
+    load_plastic_checkpoint(checkpoint, restored.trainer, expected_components=restored.components)
+    assert restored.trainer.state.environment_decisions == 4
+
+
+def test_bounded_episode_history_retains_legacy_lifetime_statistics():
+    from flylatro.telemetry.dashboard import TrainingMonitor
+    stack = build_plastic_stack(smoke_config())
+    stack.trainer.config = replace(stack.trainer.config, episode_history_limit=2)
+    saved = stack.trainer.state_dict()
+    legacy = saved['training_state']
+    for key in ('episode_history_start', 'episode_return_sum', 'best_episode_return', 'best_episode_ante'):
+        legacy.pop(key)
+    legacy.update(environment_decisions=4, vector_steps=4, completed_episodes=4,
+        episode_returns=[10., 3., 2., 1.], episode_antes=[4, 2, 1, 1])
+    stack.trainer.load_state_dict(saved)
+    assert stack.trainer.state.episode_returns == [2., 1.]
+    assert stack.trainer.state.episode_antes == [1, 1]
+    assert stack.trainer.state.episode_history_start == 2
+    assert stack.trainer.state.episode_return_sum == 16.
+    assert stack.trainer.state.best_episode_return == 10.
+    assert stack.trainer.state.best_episode_ante == 4
+    monitor = TrainingMonitor(stack.trainer)
+    assert monitor.flies[0].best_return == 10.
+    assert monitor.flies[0].best_ante == 4
+    state = stack.trainer.state_dict()
+    stack.trainer.load_state_dict(state)
+    assert stack.trainer.state_dict()['training_state'] == state['training_state']
+    stack.trainer.train(stop_after_environment_decisions=8)
+    assert len(stack.trainer.state.episode_returns) <= 2
+
+
+def test_checkpoint_provenance_reuse_keeps_per_save_weights_and_counters(tmp_path, monkeypatch):
+    from flylatro.learning import checkpoints
+    calls = []
+    monkeypatch.setattr(checkpoints, 'git_metadata', lambda: calls.append('git') or {'commit': 'fixed'})
+    monkeypatch.setattr(checkpoints, 'software_metadata', lambda: calls.append('software') or {'python': 'test'})
+    provenance = checkpoints.capture_checkpoint_provenance()
+    assert calls == ['git', 'software']
+    stack = build_plastic_stack(smoke_config())
+    first = tmp_path / 'first.pkl'
+    second = tmp_path / 'second.pkl'
+    for path in (first, second):
+        if path == second:
+            stack.trainer.step()
+            stack.agent.plasticity.state.efficacy[:] = .9
+        checkpoints.save_plastic_checkpoint(path, stack.trainer,
+            experiment_config=smoke_config().to_dict(), component_metadata=stack.components,
+            provenance=provenance)
+    assert calls == ['git', 'software']
+    a = checkpoints.load_plastic_manifest(first)
+    b = checkpoints.load_plastic_manifest(second)
+    assert a['git'] == b['git'] == provenance['git']
+    assert a['software'] == b['software'] == provenance['software']
+    assert a['provenance_captured_at'] == b['provenance_captured_at']
+    assert a['environment_decisions'] == 0 and b['environment_decisions'] == 1
+    assert a['plastic_weight_sha256'] != b['plastic_weight_sha256']
 
 
 def test_same_experience_and_rng_plan_reproduce_learned_weights() -> None:

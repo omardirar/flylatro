@@ -67,6 +67,7 @@ def test_post_motor_representation_uses_the_persisted_final_mapping(
 ) -> None:
     _, motor_path, _, pre_config, post_config = calibrated
     post = tmp_path / "rep-post.json"
+    reachability_path = tmp_path / "reachability-post.json"
     representation_main(
         [
             "--config", str(post_config),
@@ -76,6 +77,7 @@ def test_post_motor_representation_uses_the_persisted_final_mapping(
             "--minimum-action-coverage-fraction", "0.0",
             "--maximum-competing-pool-correlation", "1.0",
             "--output", str(post),
+            "--reachability-output", str(reachability_path),
         ]
     )
     report = json.loads(post.read_text(encoding="utf-8"))
@@ -93,6 +95,23 @@ def test_post_motor_representation_uses_the_persisted_final_mapping(
         == persisted["structure_sha256"]
     )
     assert report["motor_activity_population"] == "mbon"
+    reachability = json.loads(reachability_path.read_text(encoding="utf-8"))
+    selected = {index for pool in persisted["pool_indices"] for index in pool}
+    assert len(selected) < len(persisted["output_root_ids"])
+    assert reachability["motor_coverage"]["motor_outputs"] == len(selected)
+    assert reachability["motor_coverage"]["evaluated"] is True
+    assert reachability["evidence_identity"]["motor_mapping_sha256"] == persisted["structure_sha256"]
+
+    # A different selected mapping cannot inherit an otherwise passing report.
+    stale_reachability = copy.deepcopy(reachability)
+    stale_reachability["evidence_identity"]["motor_mapping_sha256"] = "other-selected-pools"
+    preflight = run_preflight(
+        PlasticExperimentConfig.load(post_config), profile="initial",
+        reachability_report=stale_reachability,
+    )
+    reach_gate = next(gate for gate in preflight["gates"] if gate["name"] == "kc_subtype_reachability")
+    assert reach_gate["status"] == "FAIL"
+    assert "motor_mapping_sha256" in reach_gate["reason"]
 
     # A post-motor report is refused when only a bootstrap mapping exists.
     with pytest.raises(ValueError, match="persisted reward-free motor artifact"):
@@ -227,6 +246,44 @@ def test_predeclared_reinforcement_sensitivity_conditions_exist() -> None:
         {"blind_progress": 0.0, "blind_clear": 1.0, "win": 0.0}, {}
     )
     assert cleared.appetitive > 0
+
+
+def test_checkpoint_representation_measures_loaded_weights_and_is_not_calibration(tmp_path, calibrated, monkeypatch):
+    from flylatro.analysis import representation_cli
+    from flylatro.learning.checkpoints import save_plastic_checkpoint
+
+    _, _, _, _, post_config = calibrated
+    config = PlasticExperimentConfig.load(post_config)
+    stack = build_plastic_stack(config)
+    stack.agent.plasticity.state.efficacy[:] = 0.5
+    checkpoint = tmp_path / "learned.pkl"
+    save_plastic_checkpoint(checkpoint, stack.trainer, experiment_config=config.to_dict(), component_metadata=stack.components)
+    original_hash = stack.agent.plasticity.state.weight_sha256
+    original_record = representation_cli.record_corpus_activity
+    observed = []
+
+    def record(*args, **kwargs):
+        observed.append(kwargs["efficacy"].copy())
+        return original_record(*args, **kwargs)
+
+    monkeypatch.setattr(representation_cli, "build_plastic_stack", lambda *args, **kwargs: stack)
+    monkeypatch.setattr(representation_cli, "record_corpus_activity", record)
+    output, reach = tmp_path / "learned-representation.json", tmp_path / "learned-reachability.json"
+    representation_main(["--config", str(post_config), "--stage", "post", "--checkpoint", str(checkpoint),
+                         "--batch-size", "3", "--output", str(output), "--reachability-output", str(reach)])
+    report = json.loads(output.read_text())
+    assert report["efficacy_policy"] == "frozen-checkpoint-efficacy"
+    assert report["evidence_identity"]["report_kind"] == "representation_checkpoint"
+    assert report["evidence_identity"]["plastic_weight_sha256"] == original_hash
+    assert stack.agent.plasticity.state.weight_sha256 == original_hash
+    np.testing.assert_array_equal(observed[0], 0.5)
+    assert json.loads(reach.read_text())["evidence_identity"]["report_kind"] == "kc_reachability_checkpoint"
+    # Even a self-labelled PASS learned-state report cannot replace calibration.
+    report["gates"]["status"] = "PASS"
+    result = run_preflight(config, profile="initial", representation_post_report=report)
+    gate = next(row for row in result["gates"] if row["name"] == "representation_post")
+    assert gate["status"] == "FAIL"
+    assert "report_kind" in gate["reason"]
 
 
 def test_ad_hoc_reinforcement_retuning_is_refused() -> None:

@@ -76,6 +76,31 @@ def test_finalize_components_refuses_a_diverged_action_schedule() -> None:
     assert filled["reserved_action_legal_observations"] == 3
 
 
+def test_preflight_cannot_reuse_valid_controls_after_learning_rule_change(tmp_path: Path) -> None:
+    from dataclasses import replace
+    from flylatro.analysis.preflight import run_preflight
+    from flylatro.learning.protocol import validate_control_group
+
+    config_path = write_config(tmp_path, overrides={"training": {
+        "max_environment_decisions": 4, "checkpoint_every_decisions": 4}})
+    real, control = tmp_path / "real", tmp_path / "control"
+    assert train_main(["--config", str(config_path), "--run-dir", str(real), "--no-tensorboard"]) == 0
+    assert train_main(["--config", str(config_path), "--run-dir", str(control),
+        "--condition", "no_plasticity", "--action-schedule", str(real / "training-actions.jsonl"),
+        "--no-tensorboard"]) == 0
+    manifests = [json.loads((path / "run-manifest.json").read_text()) for path in (real, control)]
+    assert validate_control_group(manifests)["gates"]["status"] == "PASS"
+    config = PlasticExperimentConfig.load(config_path)
+    original = run_preflight(config, control_manifests=manifests)
+    gate = next(row for row in original["gates"] if row["name"] == "matched_control_readiness")
+    assert gate["status"] == "PASS"
+    changed = replace(config, plasticity=replace(config.plasticity, learning_rate=0.001))
+    result = run_preflight(changed, control_manifests=manifests)
+    gate = next(row for row in result["gates"] if row["name"] == "matched_control_readiness")
+    assert gate["status"] == "FAIL"
+    assert "plasticity_rule_sha256" in gate["evidence"]["identity_mismatches"]
+
+
 def _stack(tmp_path: Path):
     corpus_path = tmp_path / "corpus.npz"
     corpus = build_mock_corpus(corpus_path, seeds=(1, 2), states_per_seed=2)

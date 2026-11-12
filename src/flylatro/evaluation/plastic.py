@@ -9,6 +9,7 @@ from typing import Any, Sequence
 import numpy as np
 
 from flylatro.env.balatro_sim import ArrayBalatroEnv, action_batch_row_to_composite
+from flylatro.env.upstream_contract import GLOBAL_PHASE_OFF, GLOBAL_ROUND
 from flylatro.evaluation.state_hash import hash_observation_row, terminal_hash
 from flylatro.learning.agent import PlasticFlyAgent
 from flylatro.seeds import derive_seed
@@ -24,6 +25,9 @@ class PlasticEpisodeEvaluation:
     episode_return: float
     score: float | None
     balatro_seed: str | None = None
+    blinds_beaten: int = 0
+    skipped_blinds: int = 0
+    highest_played_round: int = 0
 
 
 @dataclass(frozen=True, slots=True)
@@ -54,7 +58,7 @@ class PlasticEvaluationResult:
     transitions: tuple[PlasticEvaluationTransition, ...]
     frozen_weight_sha256: str
 
-    def metrics(self) -> dict[str, float]:
+    def metrics(self) -> dict[str, float | None]:
         scores = [episode.score for episode in self.episodes if episode.score is not None]
         antes = [episode.ante for episode in self.episodes]
         return {
@@ -68,7 +72,12 @@ class PlasticEvaluationResult:
             "evaluation/decision_count": float(
                 sum(episode.decisions for episode in self.episodes)
             ),
-            "evaluation/mean_score": float(np.mean(scores)) if scores else 0.0,
+            "evaluation/mean_score": float(np.mean(scores)) if scores else None,
+            "evaluation/scored_episodes": float(len(scores)),
+            "evaluation/blinds_beaten": float(sum(episode.blinds_beaten for episode in self.episodes)),
+            "evaluation/mean_blinds_beaten": float(np.mean([episode.blinds_beaten for episode in self.episodes])),
+            "evaluation/mean_skipped_blinds": float(np.mean([episode.skipped_blinds for episode in self.episodes])),
+            "evaluation/mean_highest_played_round": float(np.mean([episode.highest_played_round for episode in self.episodes])),
         }
 
 
@@ -93,6 +102,9 @@ def evaluate_plastic_fly(
     active = np.ones(env.num_envs, dtype=np.bool_)
     returns = np.zeros(env.num_envs, dtype=np.float64)
     decisions = np.zeros(env.num_envs, dtype=np.int64)
+    blinds_beaten = np.zeros(env.num_envs, dtype=np.int64)
+    skipped_blinds = np.zeros(env.num_envs, dtype=np.int64)
+    highest_played_round = np.zeros(env.num_envs, dtype=np.int64)
     episodes: list[PlasticEpisodeEvaluation] = []
     transitions: list[PlasticEvaluationTransition] = []
     for vector_step in range(max_vector_steps):
@@ -112,6 +124,9 @@ def evaluate_plastic_fly(
         hashes_before = [
             hash_observation_row(observations, row) for row in range(env.num_envs)
         ]
+        # Copy observable pre-step counters: adapters may mutate their arrays
+        # in place and terminal observations may already describe the next run.
+        before_global = observations["global"].copy()
         step = env.step(output.actions)
         pulses = tuple(
             agent.reinforcement.map(
@@ -132,6 +147,15 @@ def evaluate_plastic_fly(
                     pulse=pulses[row],
                 )
             done = bool(step.dones[row])
+            playing = bool(before_global[row, GLOBAL_PHASE_OFF + 1])
+            if playing:
+                highest_played_round[row] = max(highest_played_round[row],
+                    int(round(float(before_global[row, GLOBAL_ROUND]) * 24)))
+                cleared = (not done and bool(step.observations["global"][row, GLOBAL_PHASE_OFF + 2]))
+                cleared = cleared or (done and bool(step.infos[row].get("episode", {}).get("won", False)))
+                blinds_beaten[row] += cleared
+            if bool(before_global[row, GLOBAL_PHASE_OFF]) and int(output.actions["action_type"][row]) == 3:
+                skipped_blinds[row] += 1
             transitions.append(
                 PlasticEvaluationTransition(
                     seed=int(seeds[row]),
@@ -167,6 +191,9 @@ def evaluate_plastic_fly(
                             float(episode["score"]) if "score" in episode else None
                         ),
                         balatro_seed=run_seeds[row],
+                        blinds_beaten=int(blinds_beaten[row]),
+                        skipped_blinds=int(skipped_blinds[row]),
+                        highest_played_round=int(highest_played_round[row]),
                     )
                 )
                 active[row] = False

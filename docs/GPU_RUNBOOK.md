@@ -7,9 +7,35 @@ on the motor interface actually existing. Running these out of order produces
 evidence that `flylatro-preflight` will refuse, because every report records the
 exact configuration it was measured under.
 
+Source correction (2026-10-09): historical `data/flywire/` uses a threshold-5
+export. It cannot establish primary minimum-count-1 coverage; current preflight
+rejects it for V1. Preserve it for historical checkpoints. The corrected build
+is `data/flywire-source-complete-v783/`. Its 500 ms default-gain representation
+failed; calibration is ongoing under named configurations and unchanged gates.
+Recorded commands/results and the six-hour GPU ledger are in
+`docs/PROGRESS_LOG.md` and `artefacts/lr-sensitivity-20261009/`.
+
 `plastic-real-template.toml` contains a parser/calibration placeholder and
 `flylatro-train` refuses it. Record every command, report, mapping hash,
 hardware description and threshold file in the experiment group.
+
+Historical threshold-5 profile (2026-10-09):
+`configs/plastic-v783-resolution.toml` binds the balanced 96-state real corpus,
+500 ms duration and the v4 calibrated mapping. Pre/post representation,
+reachability, motor and integrated plasticity gates pass with default
+thresholds. `runs/tiny-real-resolution-20261009` contains the 20-decision real
+run; its exact control is `runs/tiny-real-resolution-no-plasticity-20261009`.
+Current source-coverage and report-version gates reject these historical
+artifacts for a new V1 run. They document the original development measurements.
+The original 50 ms calibration reports remain historical failed evidence.
+
+The seed-bound 100-decision pilot uses
+`artefacts/ante1-resolution-pilot-protocol.json` and generated configs under
+`artefacts/ante1-resolution-pilot-arms/`. Its strict report
+`artefacts/preflight-ante1-resolution-pilot.json` is PASS with no warnings;
+readiness is `READY_FOR_ANTE1`. This is one development replicate with an exact
+no-plasticity control, not the complete topology/reward-control experiment.
+Generated configs anchor inherited inputs and evidence paths before relocation.
 
 Set paths only; do not set decision budgets yet:
 
@@ -34,15 +60,22 @@ or mock evidence.
 ```bash
 .venv/bin/python -m flylatro.fly.build_flywire \
   --source-dir "$FLYLATRO_FLYWIRE_SOURCE" \
-  --output-dir data/flywire \
+  --output-dir data/flywire-source-complete-v783 \
+  --connection-source unthresholded \
   --full
 ```
+
+The builder refuses nonempty output directories. The path above is already
+built on this machine; verify/reuse its pinned hashes, or choose a fresh output
+directory for a new build. Set the configuration's `fly.artifact_path` to that
+artifact before generating any source-dependent evidence. Historical reproduction
+uses a fresh directory and explicit `--connection-source threshold5`.
 
 ## 2. Inspect the population census and weak-edge statistics
 
 ```bash
 .venv/bin/flylatro-verify-populations \
-  --artifact data/flywire/flywire_fafb_v783.npz \
+  --artifact data/flywire-source-complete-v783/flywire_fafb_v783.npz \
   --output artefacts/populations-and-data-quality.json \
   --full
 ```
@@ -74,11 +107,43 @@ diverse states and its actions are discarded.
 ```
 
 Inspect `phases_observed`, `phases_missing` and `motor_context_coverage` in the
-printed coverage. Deeper phases (`SHOP`, `PACK`, `ROUND_EVAL`) need longer
-navigation: raise `--maximum-decisions-per-seed` and `--sample-every` until they
-appear, and record which phases the corpus does and does not reach. The corpus
-SHA-256 is part of experimental provenance and is recorded in every downstream
-report.
+manifest. Deeper phases (`SHOP`, `PACK`, `ROUND_EVAL`) need longer navigation:
+increase `--states-per-seed` and/or `--sample-every`, and raise
+`--maximum-decisions-per-seed` if that ceiling would prevent collection. The
+generator stops once the requested states are collected, so raising the ceiling
+alone does not extend navigation. Record which phases and contexts the corpus
+does and does not reach. Its SHA-256 is part of every downstream report.
+
+For rare inventory contexts, opt into
+`--navigation-rule seeded-inventory-context-navigation-v1`. This collection-only
+rule postpones selling a lone Joker or consuming/selling a lone consumable when
+another supported legal action exists. Once multiple targets exist, all legal
+actions are sampled uniformly again. It reads only legality masks, never card
+quality, reward or score; its version is recorded and hashed in the corpus.
+The original uniform navigation remains the default.
+
+Avoid running neural diagnostics over tens of thousands of common states just
+to retain a few rare shop or inventory states. Collect a larger navigation
+corpus first, then freeze a compact subset:
+
+```bash
+.venv/bin/flylatro-select-calibration-corpus \
+  --source artefacts/calibration-corpus-v783-navigation.npz \
+  --output artefacts/calibration-corpus-v783-balanced.npz \
+  --states 96 \
+  --states-per-stratum 12
+```
+
+Selection prioritizes rare phases and relevant/competing legal motor contexts,
+deduplicates observable states, spreads samples over each source trajectory,
+and fills remaining slots from the full source. It preserves exact masks,
+snapshots and run provenance. The source SHA, selection settings and coverage
+policy SHA are included in the selected corpus identity. The selection report
+lists remaining coverage deficiencies and the command returns exit code 2 when
+they exist; it cannot manufacture evidence absent from the source. Existing
+output files are refused. Set `[calibration].corpus_path` to the selected corpus
+before producing any downstream evidence, and reuse that exact subset for every
+calibration stage.
 
 Coverage is formally gated, not merely reported. `flylatro-preflight` evaluates
 the corpus against the versioned `calibration-corpus-coverage-policy-v1`
@@ -111,7 +176,7 @@ from different runs look like one.
 
 ```bash
 .venv/bin/flylatro-create-sensory-mapping \
-  --artifact data/flywire/flywire_fafb_v783.npz \
+  --artifact data/flywire-source-complete-v783/flywire_fafb_v783.npz \
   --mapping-seed 0 \
   --population-width 3 \
   --max-rate-hz 150 \
@@ -218,7 +283,7 @@ obtain enough usable neural diversity fails loudly rather than quietly assigning
 near-identical populations to competing alternatives.
 
 Selection and quality are **context-aware**
-(`reward-free-neural-motor-calibration-v3`). Each routing group is ranked and
+(`reward-free-neural-motor-calibration-v5`). Each routing group is ranked and
 decorrelated in the corpus states where its pools are actually read, using the
 corpus's own legality masks: `selection_evidence_by_group` records how many
 states that was. `quality.by_context` then reports, separately for every motor
@@ -229,7 +294,10 @@ distinct signals and contract-option coverage. A context with fewer than
 `--minimum-context-states` relevant states or fewer than
 `--minimum-competing-context-states` competing states is reported as
 `insufficient_evidence` and fails the `context_evidence_sufficient` gate; it is
-never averaged into a passing number. Because the four contextual slot heads
+never averaged into a passing number. Pearson correlation uses a consistent
+population denominator in selection and diagnostics; v4 motor reports and v3
+representation reports are preserved historical evidence and are refused by
+current preflight. Because the four contextual slot heads
 share one pool group by design, this is the evidence that the shared pools carry
 usable activity in each context in which they are interpreted. Setting either
 threshold to `0` is an explicit opt-out and is only appropriate for a
@@ -240,6 +308,18 @@ artifact is mandatory for real, no-plasticity, both topology controls, shuffled
 reinforcement and sensory-map replicates. Record its `structure_sha256`: that is
 the motor identity every matched condition must share, and the value the
 replicate protocol binds.
+
+Neurons remain distinct between competing pools within a routing group, while
+separate comparison groups may reuse candidates (ADR 0014). Width two therefore
+requires 26 candidates for the largest comparison, rather than 70 globally
+distinct neurons. Candidate eligibility is evaluated in each group's own legal
+contexts. The report records both total memberships and unique selected count;
+all diversity and activity thresholds remain unchanged.
+
+Once the artifact exists, regenerate reachability with `--stage post` and
+`--reachability-output` on the same frozen corpus. This measures the actual
+selected motor neurons and binds their mapping hash. A pre-motor reachability
+report cannot establish selected-output coverage.
 
 ## 9. Confirm the persisted motor normalization
 
@@ -339,10 +419,49 @@ from an older incompatible version is a FAIL, not a silent pass.
 
 Choose this tiny gate explicitly, not from the template:
 
+Interactive `flylatro-train` sessions open the dashboard automatically.
+`--dashboard` also works when output is redirected, using plain periodic
+snapshots; `--no-dashboard` disables display and `--dashboard-refresh 2`
+sets a two-second interval. The display goes to stderr and final JSON remains
+on stdout. The coloured dashboard reports per-fly decisions/runs/wins/game
+overs, current/best Ante, current/highest round and mean round reached over
+tracked completed runs. Each fly's bar chart labels played rounds and skipped
+blinds as distinct solid/patterned segments with exact counts, oldest run at
+the top and newest at the bottom. Skips never count as beaten rounds or inflate
+the played-round average. Unknown legacy skip counts show `?` until fresh runs.
+Bars use zero
+baselines and the same scale across flies; 64 runs are retained, while the
+number of displayed bars adapts to terminal height. Round 0 precedes the
+first selected blind; skipped blinds do not count as played rounds. Real
+training uses the pinned **Red Deck / White Stake** setup, shown with the
+current Ante win target. Each new run gets a new seed.
+
+The action feed names submitted cards and inventory choices, with separate
+coloured game-over/round-beaten/Ante-beaten/run-won milestones. Up/Down or
+mouse wheel browse up to 256 activity entries, PgUp/PgDn jump five, Tab or
+Left/Right select a fly, Home selects oldest, and End or L returns to live.
+History stays still during browsing while the fly continues training. H opens
+metric definitions; Ctrl+C still checkpoints and exits. Hidden cards remain
+hidden, and simulator legalisation may adjust submitted selections.
+
+Training reward means accumulated learning signal; highest blind chips means
+largest observed blind total, rather than a final game score. Throughput, ETA,
+allocation, GPU utilisation/memory/temperature/power and plasticity guards
+are shown separately. `NO_COLOR=1` disables colour; ASCII fallback works on
+non-Unicode terminals. Whole-device
+GPU activity includes other processes. `nvidia-smi` absence is displayed as
+unavailable and does not prevent training. Terminal scores omitted by the
+simulator show `--`; peak chips are observed values, not complete final scores.
+Counters are checkpoint metadata and persist across stages. Current counters
+are saved atomically to `training-dashboard.json`, with per-fly terminal
+events in `training-episodes.jsonl`. Older checkpoints label any missing history;
+round averages and bars start with newly tracked runs if round history is absent.
+
 ```bash
 .venv/bin/flylatro-train \
   --config configs/plastic-real-template.toml \
   --run-dir runs/tiny-real-plastic \
+  --dashboard --dashboard-refresh 2 \
   --condition plastic_real \
   --budget-basis tiny-real-gate \
   --max-environment-decisions 20 \
@@ -626,6 +745,224 @@ complete within measured resource budgets. Supply measured
 `--curriculum-evaluation-episodes` when enabling the multi-level ladder.
 Behavioural improvement is an experimental result, not a software gate.
 
+## Guarded Ante-1 development experiments
+
+Evaluate a previously exposed fly and its untrained control with independent
+choices on identical validation seeds. Training controls replay actions to
+test update semantics; evaluation deliberately does not replay them.
+`--win-ante 1` is essential here because the evaluation default remains Ante 8.
+
+```bash
+.venv/bin/flylatro-evaluate \
+  --config artefacts/ante1-resolution-pilot-arms/mapping-000-replicate-000-plastic_real.toml \
+  --checkpoint runs/ante1-resolution-pilot-20261009/ante1-resolution-pilot-20261009/mapping-000-replicate-000-plastic_real/plastic-checkpoint-final.pkl \
+  --output-dir evaluations/ante1-resolution-trained-32 \
+  --win-ante 1 --episodes 32 --seed-stream validation --progress --heavy
+
+.venv/bin/flylatro-evaluate \
+  --config artefacts/ante1-resolution-pilot-arms/mapping-000-replicate-000-no_plasticity.toml \
+  --checkpoint runs/ante1-resolution-pilot-20261009/ante1-resolution-pilot-20261009/mapping-000-replicate-000-no_plasticity/plastic-checkpoint-final.pkl \
+  --condition no_plasticity \
+  --output-dir evaluations/ante1-resolution-untrained-32 \
+  --win-ante 1 --episodes 32 --seed-stream validation --progress --heavy
+
+.venv/bin/flylatro-compare-evaluations \
+  --trained evaluations/ante1-resolution-trained-32/summary.json \
+  --control evaluations/ante1-resolution-untrained-32/summary.json \
+  --output artefacts/paired-evaluation-ante1-resolution-32-audited.json
+```
+
+These are the recorded 2026-10-09 paths: both checkpoints won 0/32, so no
+win-rate improvement is established. Existing output paths are refused; choose
+fresh paths for another experiment. The comparison checks model identity,
+target, streams, exact seed list and episode rows. PASS means the comparison is
+valid, not that learning helped. Missing episode scores are unavailable, not
+zero scores.
+
+Initial calibration measures unit efficacy. Before increasing exposure, measure
+the **actual learned checkpoint** without further updates:
+
+```bash
+.venv/bin/flylatro-diagnose-representation \
+  --config configs/plastic-v783-resolution.toml --stage post \
+  --checkpoint runs/ante1-resolution-pilot-20261009/ante1-resolution-pilot-20261009/mapping-000-replicate-000-plastic_real/plastic-checkpoint-final.pkl \
+  --repeats 3 --batch-size 8 \
+  --output artefacts/representation-checkpoint-ante1-resolution-100.json \
+  --reachability-output artefacts/kc-reachability-checkpoint-ante1-resolution-100.json \
+  --heavy
+```
+
+The recorded checkpoint passes both reports. Checkpoint reports carry distinct
+`representation_checkpoint`/`kc_reachability_checkpoint` kinds and checkpoint
+and weight hashes. They cannot authorize initial calibration, and a stale
+checkpoint report cannot authorize a later training stage.
+
+Routine training now enables these safety defaults even without an explicit
+section in an older config:
+
+```toml
+[safety]
+enabled = true
+maximum_bound_fraction = 0.10
+maximum_mean_absolute_drift = 0.50
+minimum_kc_active_fraction = 0.01
+minimum_motor_active_fraction = 0.01
+silence_patience_steps = 8
+```
+
+The monitor uses device-reduced finite/bound/drift telemetry and per-learner
+KC/selected-motor activity. It also stops for out-of-range efficacy/eligibility.
+The worst learner governs; a batch average cannot hide a failed fly. Failure
+returns exit code 2 and records `safety-stop.json` plus
+`plastic-checkpoint-safety-stop.pkl`, with no successful final checkpoint.
+The latest safe checkpoint is retained. Do not resume the quarantined state or
+relax thresholds merely to finish the budget. These monitors never change the
+biological update rule, rewards, weights or action choices.
+
+Measured unprofiled throughput supports roughly 25 minutes per 1,000-decision
+arm; six arms plus diagnostics/evaluation can take about three hours or more.
+The historical three-replicate paired protocol is
+`artefacts/ante1-guarded-1000-protocol.json`, with generated configs/plan under
+`artefacts/ante1-guarded-1000-arms/`. Its old-rule/source/report evidence is
+refused by current preflight. The following records its original validation
+command; a new experiment must regenerate every affected input under fresh paths:
+
+```bash
+.venv/bin/flylatro-run-staged-protocol \
+  --plan artefacts/ante1-guarded-1000-arms/protocol-plan.json \
+  --health-report artefacts/representation-checkpoint-ante1-resolution-100.json \
+  --reachability-report artefacts/kc-reachability-checkpoint-ante1-resolution-100.json \
+  --control-manifest runs/ante1-resolution-pilot-20261009/ante1-resolution-pilot-20261009/mapping-000-replicate-000-plastic_real/run-manifest.json \
+  --control-manifest runs/ante1-resolution-pilot-20261009/ante1-resolution-pilot-20261009/mapping-000-replicate-000-no_plasticity/run-manifest.json \
+  --stages 100,250,500,1000 \
+  --output artefacts/ante1-guarded-1000-plan.json --heavy
+```
+
+To execute, use a fresh `--output` path and add `--execute`. The recorded live
+status is `artefacts/ante1-guarded-1000-execution.json`. Every stage preserves
+the declared 1,000-decision budget and seed identity; `--stop-after-decisions`
+is a cumulative stage cap, not a different budget. Each primary checkpoint
+receives full-corpus representation/reachability audits before continuing. Any
+nonzero training or audit exit halts all remaining stages and arms. Completed
+pairs additionally require exact control validation and independent 32-seed
+evaluation. A failed/staged run cannot pass as a completed control.
+
+Recorded execution outcome: the first replicate's 100-decision audits passed,
+but routine training stopped at decision 172 with 11.01% lower-bound occupancy
+against the 10% limit. Its 160-decision checkpoint is preserved, the stopped
+state is quarantined, and all later stages and arms were skipped. The protocol
+did not complete. This is a learning-stability failure, not a CUDA access failure.
+
+## Current source-complete primary and frozen final test
+
+The historical threshold-5 paths above are retained for reproduction. Current
+V1 uses `configs/plastic-v783-source-complete-gain0p225-100ms-lr0p002-primary-base.toml`,
+the separately built unthresholded artifact, LR 0.002, fixed gain 0.225 mV,
+100 ms and the reward-free motor v5 artifact. Initial full-corpus calibration,
+250-decision learned health, exact pilot control and actual GPU resume pass.
+All six strict preflights pass. The three paired primary runs are in progress;
+no final-test outcomes have been observed and no learning claim is established.
+
+The fresh resume probe creates a new checkpoint, rather than resuming a
+quarantined training state. Its prefix-three/future-thirteen window includes
+reward on the first resumed step:
+
+```bash
+.venv/bin/python -m flylatro.analysis.resume_cli \
+  --config configs/plastic-v783-source-complete-gain0p225-100ms-lr0p002-pilot.toml \
+  --checkpoint REPLACE_WITH_NEW_PROBE_CHECKPOINT \
+  --prefix-decisions 3 --future-decisions 13 \
+  --output REPLACE_WITH_NEW_RESUME_REPORT --heavy
+```
+
+The driver `scripts/run_primary_protocol.py` checks the terminal pilot evidence,
+regenerates current benchmarks, validates all six arm configurations and starts
+fail-stop staged execution. Its active status is
+`artefacts/lr-sensitivity-20261009/source-complete-gain0p225-100ms-lr0p002-primary-driver.json`
+and the nested execution status ends in `-1000-execution.json`. Inspect the
+live handle and GPU ledger before considering another invocation; existing
+destinations are refused. GPU commands retain conservative duration accounting
+in `artefacts/lr-sensitivity-20261009/gpu-budget.json`. On 2026-10-09 the user
+removed the six-hour ceiling for existing local hardware; subsequent commands
+read `gpu-duration-authorization.json` and have no duration-budget timeout.
+Original accounting and safety/scientific gates remain intact. The already
+running wrapper retains its captured timeout and is expected to finish within
+it; editing files does not change an existing Python process's timeout.
+
+Current orchestration serializes GPU jobs and refuses an unresolved live
+ledger entry. Separate processes on one GPU require a measured aggregate
+throughput comparison and distinct configurations, seeds, checkpoints and
+outputs before a simultaneous campaign is qualified. Multi-fly batching
+shares fixed anatomy and is the measured acceleration path; a short neural
+benchmark does not yet certify long batched training trajectories. Removing
+the time ceiling does not relax a safety stop or extend a checkpoint's locked
+exposure budget.
+
+Only after all three primary/control pairs complete 1000 decisions, pass their
+actual checkpoint health and exact control validation, and independently
+evaluate all 32 validation seeds, qualify the predeclared frozen batches:
+
+```bash
+.venv/bin/python scripts/run_batch_validation.py \
+  --primary-driver artefacts/lr-sensitivity-20261009/source-complete-gain0p225-100ms-lr0p002-primary-driver.json \
+  --tag source-complete-gain0p225-100ms-lr0p002
+```
+
+This checks every completed primary checkpoint and each distinct frozen
+baseline against sequential validation, using identical seed/decision actions,
+rewards, state hashes and complete episode results. Qualification binds the
+checkpoint, weights, configuration, implementation and evidence files. A
+disagreement rejects batching. Width four replicates one frozen fly for
+independent seeds; it introduces no learning and never replays training actions.
+
+Write the final lock before observing the final 128 seeds per trained fly:
+
+```bash
+.venv/bin/python scripts/run_confirmatory_evaluation.py \
+  --primary-driver artefacts/lr-sensitivity-20261009/source-complete-gain0p225-100ms-lr0p002-primary-driver.json \
+  --tag source-complete-gain0p225-100ms-lr0p002 \
+  --batch-validation artefacts/lr-sensitivity-20261009/source-complete-gain0p225-100ms-lr0p002-batch-validation.json
+```
+
+Inspect the concrete lock and remaining budget. Add `--execute` to this same
+command to run its exact locked evaluation and analysis. A saved lock is reused
+only if every derived identity matches. Omit `--batch-validation` for sequential
+execution if qualification fails. The prospective common-baseline optimization
+requires all three no-plasticity checkpoints to have exact unit weights, zero
+updates and identical independent validation trajectories. It never substitutes
+for any exact training control.
+
+`confirmatory-pairing-correction.json` assigns one of the three trained flies
+to each final seed before outcomes. The primary binary paired comparison uses
+an exact one-sided McNemar/sign-permutation test; the three-fly mean and
+seed-block bootstrap are descriptive, conditional on these trained flies.
+Acceptance requires positive primary and overall means, p < 0.05 and primary
+95% interval lower bound > 0, plus all scientific gates and a reproducible
+genuine held-out win. Zero discordance and one lucky win do not qualify.
+The analysis code and complete fixed model are locked before final execution.
+Negative or inconclusive results remain failures to demonstrate learning;
+do not reduce seeds, retune on final outcomes or label survival as success.
+
+After the locked evaluations finish, reproduce a genuine winning final-test
+episode and optionally record its actual spikes and brain video:
+
+```bash
+.venv/bin/python scripts/produce_heldout_win.py \
+  --lock artefacts/lr-sensitivity-20261009/source-complete-gain0p225-100ms-lr0p002-confirmatory-lock.json \
+  --output-dir artefacts/source-complete-ante1-heldout-win --execute
+```
+
+The deterministic selection uses the first trained replicate and declared
+winning seed. The simulator first verifies the existing candidate, then the
+recorded episode must match its complete original trajectory and frozen
+weights. Ante target and shaping beta come from the bundle. Step rewards and
+the actual terminal win are checked. The package contains checkpoint/config,
+replay hashes and neural Parquet; rendering keeps fixed anatomy and separates
+synthetic reinforcement from real anatomical spiking. A report explicitly
+records no genuine win when none exists. A replayed win remains separate from
+the confirmatory improvement test. Recording uses the same GPU ledger; video
+composition runs on the CPU using the installed SVG decoder.
+
 ## Optional frozen time-resolved showcase
 
 Never enabled during routine training:
@@ -668,3 +1005,74 @@ Stop and investigate rather than relaxing a threshold if:
   or action schedule does not match the protocol arm (regenerate it from the
   plan's own `prerequisite_commands`);
 - `flylatro-validate-controls` cannot find exactly one `plastic_real` reference.
+
+## Exploratory recovery pilots after the 2026-10-09 saturation stop
+
+The unattended four-fly run stopped at 6028 total decisions (1507 per fly),
+with 0 Ante-1 wins in 666 completed games. Fly 4 had 33.6% of its plastic
+synapses at the lower bound. Total negative/positive pulse magnitude was
+399.6/6.67; all four flies showed net weakening and no net strengthening
+relative to initial weights. These observations motivate new engineering
+experiments, rather than changes to the existing confirmatory protocol.
+
+`configs/exploratory-20261010-plan.json` contains executable command argument
+lists for seven matched 1000-decision pilots and 128-episode frozen validation:
+
+| Arm | Learning rate | Failure pulse | Plasticity |
+| --- | ---: | ---: | --- |
+| Original reference | 0.002 | 0.60 | Enabled |
+| Lower learning rate | 0.0005 | 0.60 | Enabled |
+| Weaker failure | 0.002 | 0.01 | Enabled |
+| Combined | 0.0005 | 0.01 | Enabled |
+| Exact-action control | 0.002 | 0.60 | Disabled |
+| Shorter trace | 0.002 | 0.60 | Enabled |
+| Combined with shorter trace | 0.0005 | 0.01 | Enabled |
+
+The first five arms retain eligibility decay 0.9. The last two use 0.5:
+compare shorter trace with original, and combined with shorter trace with
+combined. This reduces the trace half-life from about 6.58 decisions to one
+decision. Eligibility and reinforcement traces already reset after each
+completed game. Shorter traces test within-game credit duration; they may
+also lose useful delayed credit and reduce total update magnitude. They do
+not implement action-specific or compartment-specific credit assignment.
+
+New JSONL and dashboard-snapshot metrics report `net_strengthened_fraction`
+and `net_weakened_fraction` relative to initialization, plus
+`max_learner_near_bound_fraction`: the worst fly's fraction of weights within
+5% of the efficacy range of either bound, including clamped weights. This
+last metric provides advance evidence of saturation; the actual bound and
+drift stop rules remain unchanged. These fields are diagnostics, not proof
+of learning, and do not add trainable parameters.
+
+The named `exploratory-weak-failure-v1` condition is explicitly post-hoc.
+The 60x punishment reduction roughly matches the observed pulse imbalance;
+equal pulse magnitudes do not ensure equal weight changes or correct credit
+assignment. Progress and milestone rewards remain fixed. The lower learning
+rate tests update speed separately; it cannot correct a biased update sign.
+
+Each screening arm uses one fly so its frozen outcome is unambiguous.
+Train the original reference first: the disabled-plasticity control
+consumes its exact action schedule. Configs retain the same training seeds,
+motor exploration, anatomy, Red Deck / White Stake, fixed Ante-1 target, and
+health thresholds. Checkpoints are every 250 decisions. Do not resume a
+safety-stopped checkpoint to force a pilot to complete.
+
+New benchmark/plasticity qualification report paths are empty intentionally;
+old reports are not evidence for new candidate rules. Run short calibration,
+health, representation, and reachability checks before extending exposure.
+Evaluate all arms on the same validation cohort (offset 10000), inspect actual
+blinds beaten and Ante-1 wins, and repeat with matched independent training
+seeds before selecting a candidate. Tuning on this cohort requires a separate
+confirmation cohort afterward; final-test seeds remain locked. Stability,
+reward magnitude, and weight changes alone do not establish improved play.
+
+For a multi-fly checkpoint, the frozen evaluation CLI requires an explicit
+zero-based `--learner-index`. It loads and verifies the full source checkpoint,
+then copies the selected learner's state without averaging weights or modifying
+the source. Reports distinguish the full source checkpoint weight hash from
+the selected learner's frozen weight hash. `--initial-weights` can restore that
+learner's initial efficacies for a separately labelled baseline. Transition
+records remain available; replay bundles are suppressed because the generic
+replayer does not yet reproduce selection or baseline overrides. Unit tests
+pass, but real GPU selection and sequential/batched parity still need checking
+before using this path for independent-seed confirmation.

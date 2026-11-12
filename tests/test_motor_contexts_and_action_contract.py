@@ -157,7 +157,7 @@ def test_calibration_refuses_a_group_with_no_variation_in_its_own_contexts() -> 
     masks["action_type_mask"][30:40, int(UpstreamActionType.LEAVE_SHOP)] = True
     masks["shop_target_mask"][30:40, :4] = True
     values = _activity(varying=(wide_playing,))
-    with pytest.raises(MotorCalibrationError, match="group context_slot exhausted"):
+    with pytest.raises(MotorCalibrationError, match="group context_slot has 0 usable"):
         calibrate_reward_free_motor(
             roots,
             values,

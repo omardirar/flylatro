@@ -6,7 +6,7 @@ from pathlib import Path
 
 import pytest
 
-from flylatro.learning.config import PlasticExperimentConfig
+from flylatro.learning.config import PlasticExperimentConfig, resolve_path
 from flylatro.learning.protocol import (
     CONDITION_SEED_USAGE,
     EXPERIMENT_PROTOCOL_VERSION,
@@ -89,6 +89,12 @@ def test_materialized_arms_are_exact_runnable_configurations(tmp_path: Path) -> 
         heavy=False,
     )
     assert len(plan["arms"]) == len(protocol.arms) == 4
+    preserved = (tmp_path / "arms" / "protocol-plan.json").read_bytes()
+    with pytest.raises(FileExistsError, match="not empty"):
+        materialize_protocol(protocol, base, protocol_path=protocol_path,
+            output_dir=tmp_path / "arms", run_root=str(tmp_path / "runs"),
+            budget_basis="different-budget", checkpoint_every_decisions=4, heavy=False)
+    assert (tmp_path / "arms" / "protocol-plan.json").read_bytes() == preserved
     for entry in plan["arms"]:
         config = PlasticExperimentConfig.load(Path(entry["config"]))
         arm = protocol.arm(entry["arm_id"])
@@ -129,6 +135,41 @@ def test_materialization_is_reproducible(tmp_path: Path) -> None:
     for left, right in zip(first["arms"], second["arms"], strict=True):
         assert Path(left["config"]).read_text() == Path(right["config"]).read_text()
     assert first["protocol_sha256"] == second["protocol_sha256"]
+
+
+def test_nested_materialized_configs_preserve_relative_input_and_control_paths(
+    tmp_path: Path, monkeypatch,
+) -> None:
+    base = PlasticExperimentConfig.load(write_config(
+        tmp_path, name="relative-inputs",
+        overrides={
+            "fly": {"artifact_path": "data/fly.npz", "motor_mapping_path": "artefacts/motor.json"},
+            "calibration": {"corpus_path": "artefacts/corpus.npz", "representation_pre_report": "artefacts/pre.json"},
+        },
+    ))
+    monkeypatch.chdir(tmp_path)
+    protocol = _protocol(replicate_count=1)
+    protocol_path = protocol.save(tmp_path / "protocol.json")
+    plan = materialize_protocol(
+        protocol, base, protocol_path=protocol_path,
+        output_dir=tmp_path / "artefacts" / "nested" / "arms",
+        run_root="runs", budget_basis="unit", checkpoint_every_decisions=8,
+    )
+    for entry in plan["arms"]:
+        arm = PlasticExperimentConfig.load(Path(entry["config"]))
+        for section, keys in (
+            ("fly", ("artifact_path", "motor_mapping_path")),
+            ("calibration", ("corpus_path", "representation_pre_report")),
+        ):
+            for key in keys:
+                original = getattr(getattr(base, section), key)
+                materialized = getattr(getattr(arm, section), key)
+                assert resolve_path(arm, materialized) == resolve_path(base, original)
+        assert resolve_path(arm, arm.protocol.protocol_path) == protocol_path
+        if arm.training.condition == "no_plasticity":
+            source = next(item for item in plan["arms"] if item["condition"] == "plastic_real")
+            assert resolve_path(arm, arm.training.matched_source_run_dir) == Path(source["run_dir"]).resolve()
+            assert resolve_path(arm, arm.training.action_schedule_path) == Path(source["run_dir"]).resolve() / "training-actions.jsonl"
 
 
 def test_a_run_validates_itself_against_its_protocol_arm(tmp_path: Path) -> None:
@@ -192,6 +233,13 @@ def test_control_classes_are_explicit() -> None:
     assert control_class("kc_mbon_shuffled") == "behaviourally_independent_topology_control"
     assert control_class("whole_brain_shuffled") == "behaviourally_independent_topology_control"
     assert control_class("plastic_real") == "reference"
+
+
+@pytest.mark.parametrize("status", ["safety_stopped", "stage_complete", "running"])
+def test_incomplete_or_safety_stopped_runs_are_not_valid_controls(status):
+    report = validate_control_group([_manifest("plastic_real", status=status), _manifest("no_plasticity", status="completed")])
+    assert report["gates"]["status"] == "FAIL"
+    assert "runs_not_safety_stopped" in report["gates"]["failed"]
 
 
 def test_exact_action_controls_must_replay_the_real_trajectory() -> None:

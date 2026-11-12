@@ -24,7 +24,7 @@ class PlasticTorchFlyWireBackend(TorchFlyWireBackend):
 
     Fixed recurrence is one shared sparse matrix.  The plastic contribution is
     gathered and scatter-added per batch row, so independent efficacy vectors
-    run in one simulation without duplicating the 3.7M-edge fixed graph.
+    run in one simulation without duplicating the fixed graph.
     """
 
     backend_version = "flywire-shiu-torch-plastic-kc-mbon-v1"
@@ -44,6 +44,7 @@ class PlasticTorchFlyWireBackend(TorchFlyWireBackend):
         poisson_chunk_steps: int = 32,
         profile_components: bool = False,
     ) -> None:
+        self.plastic_topology = topology
         super().__init__(
             artifact,
             device=device,
@@ -57,22 +58,24 @@ class PlasticTorchFlyWireBackend(TorchFlyWireBackend):
             poisson_chunk_steps=poisson_chunk_steps,
             profile_components=profile_components,
         )
-        self.plastic_topology = topology
         torch = self.torch
-        coalesced = self.weights.coalesce()
-        coo = coalesced.indices()
-        keys = coo[0] * self.neuron_count + coo[1]
-        plastic_keys = torch.as_tensor(
-            topology.post_indices * self.neuron_count + topology.pre_indices,
-            dtype=torch.int64,
-            device=self.device,
-        )
-        positions = torch.searchsorted(keys, plastic_keys)
-        if bool((positions >= len(keys)).any()) or not torch.equal(
-            keys.index_select(0, positions), plastic_keys
-        ):
-            raise ValueError("plastic topology is not a subset of backend edges")
-        self._plastic_positions = positions
+        if not getattr(self, '_prepared_fixed_plastic_separation', False):
+            coalesced = self.weights.coalesce()
+            coo = coalesced.indices()
+            keys = coo[0] * self.neuron_count + coo[1]
+            plastic_keys = torch.as_tensor(
+                topology.post_indices * self.neuron_count + topology.pre_indices,
+                dtype=torch.int64,
+                device=self.device,
+            )
+            positions = torch.searchsorted(keys, plastic_keys)
+            if bool((positions >= len(keys)).any()) or not torch.equal(
+                keys.index_select(0, positions), plastic_keys
+            ):
+                raise ValueError("plastic topology is not a subset of backend edges")
+            self._plastic_positions = positions
+            with torch.no_grad():
+                self.weights.values().index_fill_(0, self._plastic_positions, 0.0)
         self._plastic_anatomical = torch.as_tensor(
             topology.anatomical_weights,
             dtype=torch.float32,
@@ -84,8 +87,6 @@ class PlasticTorchFlyWireBackend(TorchFlyWireBackend):
         self._plastic_post = torch.as_tensor(
             topology.post_indices, dtype=torch.int64, device=self.device
         )
-        with torch.no_grad():
-            self.weights.values().index_fill_(0, self._plastic_positions, 0.0)
         self._efficacy = torch.ones(
             (1, topology.edge_count), dtype=torch.float32, device=self.device
         )
@@ -154,6 +155,36 @@ class PlasticTorchFlyWireBackend(TorchFlyWireBackend):
         return array[0] if one_row else array
 
 
+class DeferredHostReadout(np.lib.mixins.NDArrayOperatorsMixin):
+    """Diagnostic array copied only when a caller requests host activity.
+
+    The device selection owns its values; later neural decisions cannot mutate
+    an earlier readout. NumPy consumers and population recording retain their
+    array interface, while routine training transfers only motor activity and
+    a compact health summary.
+    """
+    def __init__(self, tensor):
+        self.tensor = tensor
+        self._host = None
+
+    def __array__(self, dtype=None, copy=None):
+        if self._host is None:
+            self._host = self.tensor.detach().cpu().numpy()
+        return np.array(self._host, dtype=dtype, copy=copy)
+
+    def __array_ufunc__(self, ufunc, method, *inputs, **kwargs):
+        values = [np.asarray(x) if isinstance(x, DeferredHostReadout) else x for x in inputs]
+        return getattr(ufunc, method)(*values, **kwargs)
+
+    def __getitem__(self, key):
+        return np.asarray(self)[key]
+
+    def __getattr__(self, name):
+        if name.startswith('__'):
+            raise AttributeError(name)
+        return getattr(np.asarray(self), name)
+
+
 @dataclass(frozen=True, slots=True)
 class PlasticFlyDecisionActivity:
     output_activity: NDArray[np.float32]
@@ -171,6 +202,7 @@ class PlasticFlyDecisionActivity:
     stimulation_batch: NDArray[np.int64] | None = None
     stimulation_neuron_ids: NDArray[np.int64] | None = None
     stimulation_rates_hz: NDArray[np.float32] | None = None
+    health_summary: dict[str, float] | None = None
 
 
 class PlasticFlyProcessor:
@@ -227,9 +259,22 @@ class PlasticFlyProcessor:
             dtype=backend.torch.int64,
             device=backend.device,
         )
+        self._edge_pre_readout = backend.torch.as_tensor(
+            self._readout_position[topology.pre_indices], dtype=backend.torch.int64, device=backend.device)
+        self._edge_post_readout = backend.torch.as_tensor(
+            self._readout_position[topology.post_indices], dtype=backend.torch.int64, device=backend.device)
         self._kc_indices = np.unique(topology.pre_indices)
         self._mbon_indices = np.unique(topology.post_indices)
         self._dan_indices = backend.artifact.dan_indices
+        self._population_readout = {
+            name: backend.torch.as_tensor(self._readout_position[indices],
+                dtype=backend.torch.int64, device=backend.device)
+            for name, indices in {
+                'output': self.output_indices, 'kc': self._kc_indices,
+                'mbon': self._mbon_indices, 'dan': self._dan_indices,
+                'descending': backend.artifact.descending_indices,
+            }.items()
+        }
         self.kc_root_ids = backend.artifact.root_ids[self._kc_indices].copy()
         self.kc_indices = self._kc_indices
         self.mbon_indices = self._mbon_indices
@@ -284,27 +329,35 @@ class PlasticFlyProcessor:
         stimulation_batch, stimulation_indices = np.nonzero(stimulus.rates_hz > 0)
         rates_device = activity.spike_counts.to(dtype=self.backend.torch.float32)
         rates_device /= self.duration_ms / 1000.0
-        rates = rates_device.detach().cpu().numpy()
-        def selected(indices: NDArray[np.int64]) -> NDArray[np.float32]:
-            return rates[:, self._readout_position[indices]]
-        def selected_device(indices: NDArray[np.int64]) -> object:
-            positions = self._readout_position_device.index_select(
-                0,
-                self.backend.torch.as_tensor(
-                    indices, dtype=self.backend.torch.int64, device=self.backend.device
-                ),
-            )
-            return rates_device.index_select(1, positions)
+        torch = self.backend.torch
+        populations = {name: rates_device.index_select(1, indices)
+            for name, indices in self._population_readout.items()}
+        kc = populations['kc']
+        finite = torch.isfinite(rates_device).all() & torch.isfinite(activity.final_voltage).all()
+        # Validate the whole fast state on-device, including silent neurons
+        # whose NaN voltage would otherwise produce finite zero spike counts.
+        for index in (0, 1, 3):
+            finite = finite & torch.isfinite(self.backend._state[index]).all()
+        compact = torch.stack((
+            (kc > 0).double().mean(), populations['mbon'].mean(),
+            populations['descending'].mean(), (kc > 0).double().mean(dim=1).min(),
+            finite.float(),
+        )).detach().cpu().tolist()
+        health_summary = dict(zip(('kc_active_fraction', 'mbon_mean_activity',
+            'descending_mean_activity', 'min_learner_kc_active_fraction', 'finite_activity'), compact, strict=True))
+        if not health_summary['finite_activity']:
+            raise ValueError('neural activity and fast state must be finite')
         return PlasticFlyDecisionActivity(
-            output_activity=selected(self.output_indices),
-            edge_pre_activity=selected_device(self.topology.pre_indices),
-            edge_post_activity=selected_device(self.topology.post_indices),
-            kc_activity=selected(self._kc_indices),
-            mbon_activity=selected(self._mbon_indices),
-            dan_activity=selected(self._dan_indices),
-            descending_activity=selected(self.backend.artifact.descending_indices),
+            output_activity=populations['output'].detach().cpu().numpy(),
+            edge_pre_activity=rates_device.index_select(1, self._edge_pre_readout),
+            edge_post_activity=rates_device.index_select(1, self._edge_post_readout),
+            kc_activity=DeferredHostReadout(kc),
+            mbon_activity=DeferredHostReadout(populations['mbon']),
+            dan_activity=DeferredHostReadout(populations['dan']),
+            descending_activity=DeferredHostReadout(populations['descending']),
             duration_ms=self.duration_ms,
             activity_unit="spikes_per_second_hz",
+            health_summary=health_summary,
             event_batch=(activity.event_batch.detach().cpu().numpy().astype(np.int64) if activity.event_batch is not None else None),
             event_neuron_ids=(activity.event_neuron_ids.detach().cpu().numpy().astype(np.int64) if activity.event_neuron_ids is not None else None),
             event_times_ms=(activity.event_times_ms.detach().cpu().numpy().astype(np.float32) if activity.event_times_ms is not None else None),

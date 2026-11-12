@@ -64,17 +64,22 @@ def record_corpus_activity(
     repeats: int = 2,
     batch_size: int = 1,
     limit: int | None = None,
+    efficacy: NDArray[np.floating] | None = None,
 ) -> CorpusActivity:
-    """Run the fixed neural stack over corpus states with initial efficacy.
+    """Run the fixed neural stack over corpus states with frozen efficacy.
 
-    Efficacy is held at its initial value, so this measures representation, not
-    learning, and it observes no reward or outcome of any kind.
+    Initial unit efficacy is the calibration default. A checkpoint diagnostic
+    supplies one frozen edge vector explicitly. Neither path updates learned
+    state or observes game reward/outcome.
     """
 
     if repeats < 1 or batch_size < 1:
         raise ValueError("repeats and batch size must be positive")
     processor = stack.agent.processor
     edges = stack.agent.plasticity.topology.edge_count
+    frozen = np.ones(edges, dtype=np.float32) if efficacy is None else np.asarray(efficacy, dtype=np.float32)
+    if frozen.shape != (edges,) or not np.isfinite(frozen).all():
+        raise ValueError("frozen corpus efficacy must be one finite vector aligned with plastic edges")
     count = len(corpus) if limit is None else min(limit, len(corpus))
     kc: list[NDArray[np.float64]] = []
     mbon: list[NDArray[np.float64]] = []
@@ -92,7 +97,7 @@ def record_corpus_activity(
             activity = processor.process(
                 observations,
                 fly_seeds=fly_seeds,
-                efficacy=np.ones((len(indices), edges), dtype=np.float32),
+                efficacy=np.repeat(frozen[None, :], len(indices), axis=0),
             )
             kc.append(np.asarray(activity.kc_activity, dtype=np.float64))
             mbon.append(np.asarray(activity.mbon_activity, dtype=np.float64))

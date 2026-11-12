@@ -12,6 +12,7 @@ from flylatro.env.upstream_contract import ActionDict, MaskDict, ObsDict
 from flylatro.fly.mushroom_body.plasticity import (
     PlasticityEvent,
     ThreeFactorPlasticity,
+    CHOICE_GATED_PLASTICITY_VERSION,
 )
 from flylatro.fly.plastic_backend import PlasticFlyDecisionActivity
 from flylatro.interface.motor import FixedMotorInterface
@@ -63,6 +64,10 @@ class PlasticFlyAgent:
         self.plasticity = plasticity
         self.motor = motor
         self.reinforcement = reinforcement
+        self.credit = None
+        if plasticity.config.version == CHOICE_GATED_PLASTICITY_VERSION:
+            from flylatro.learning.credit import SelectedMotorCredit
+            self.credit = SelectedMotorCredit(motor, plasticity)
 
     @property
     def trainable_parameter_count(self) -> int:
@@ -96,7 +101,7 @@ class PlasticFlyAgent:
             fly_seeds=fly_seeds,
             efficacy=self.plasticity.state.efficacy,
         )
-        if record_eligibility:
+        if record_eligibility and self.credit is None:
             self.plasticity.record_activity(
                 neural.edge_pre_activity, neural.edge_post_activity
             )
@@ -107,7 +112,16 @@ class PlasticFlyAgent:
             learner_ids=(None if motor_learner_ids is None else np.asarray(motor_learner_ids)),
             decision_ids=(None if motor_decision_ids is None else np.asarray(motor_decision_ids)),
         )
+        if record_eligibility and self.credit is not None:
+            self.record_choice_activity(neural, actions, masks)
         return PlasticDecision(actions=actions, neural=neural)
+
+    def record_choice_activity(self, neural, executed_actions, masks) -> None:
+        """Record the actions actually executed, including matched schedules."""
+        if self.credit is None:
+            raise ValueError("choice activity requires the choice-gated rule")
+        self.plasticity.record_activity(neural.edge_pre_activity, neural.edge_post_activity,
+            edge_credit=self.credit.mask(executed_actions, masks))
 
     def learn(
         self,

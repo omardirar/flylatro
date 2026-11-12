@@ -22,6 +22,7 @@ from flylatro.analysis.evidence import (
     record_corpus_activity,
     write_report,
 )
+from flylatro.analysis.activity_cache import cached_corpus_activity
 from flylatro.analysis.reachability import (
     REACHABILITY_REPORT_VERSION,
     ReachabilityThresholds,
@@ -35,12 +36,16 @@ from flylatro.analysis.representation import (
 )
 from flylatro.interface.motor_contexts import motor_context_windows
 from flylatro.learning.config import PlasticExperimentConfig, build_plastic_stack
+from flylatro.learning.checkpoints import load_plastic_checkpoint, load_plastic_manifest
+from flylatro.fly.mushroom_body.state import state_numpy
 
 
 def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--config", type=Path, required=True)
     parser.add_argument("--stage", choices=("pre", "post"), default="pre")
+    parser.add_argument("--checkpoint", type=Path,
+                        help="diagnose frozen learned efficacy; requires stage post and never supplies calibration evidence")
     parser.add_argument("--calibration-corpus", type=Path)
     parser.add_argument(
         "--states", type=int, help="limit the corpus states used (default: all)"
@@ -53,6 +58,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     )
     parser.add_argument("--batch-size", type=int, default=1)
     parser.add_argument("--activity-seed", type=int, default=12_000_000)
+    parser.add_argument("--activity-cache", type=Path,
+                        help="hash-verified unit-efficacy neural samples; cannot be used for learned checkpoints")
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument(
         "--reachability-output",
@@ -88,6 +95,10 @@ def main(argv: Sequence[str] | None = None) -> int:
     args = parser.parse_args(argv)
     if args.repeats < 2:
         raise ValueError("at least two repeats are required for same-state variability")
+    if args.checkpoint is not None and args.stage != "post":
+        raise ValueError("checkpoint diagnostics require --stage post")
+    if args.checkpoint is not None and args.activity_cache is not None:
+        raise ValueError("unit-efficacy activity caches cannot diagnose learned checkpoints")
     config = PlasticExperimentConfig.load(args.config)
     if args.duration_ms is not None:
         config = replace(config, fly=replace(config.fly, duration_ms=args.duration_ms))
@@ -106,14 +117,40 @@ def main(argv: Sequence[str] | None = None) -> int:
             "post-motor representation requires the persisted reward-free motor "
             "artifact; set [fly].motor_mapping_path to the calibrated file"
         )
-    activity = record_corpus_activity(
-        stack,
-        corpus,
-        seed=args.activity_seed,
-        repeats=args.repeats,
-        batch_size=args.batch_size,
-        limit=args.states,
-    )
+    efficacy = None
+    checkpoint_evidence = None
+    if args.checkpoint is not None:
+        load_plastic_checkpoint(
+            args.checkpoint, stack.trainer, expected_components=stack.components,
+            require_matching_exposure_budget=False,
+        )
+        manifest = load_plastic_manifest(args.checkpoint)
+        efficacy = state_numpy(stack.agent.plasticity.state.efficacy)[0].copy()
+        checkpoint_evidence = {
+            "path": str(args.checkpoint.resolve()),
+            "checkpoint_sha256": manifest["checkpoint_sha256"],
+            "plastic_weight_sha256": manifest["plastic_weight_sha256"],
+            "environment_decisions": manifest["environment_decisions"],
+        }
+        stack.components.update(
+            plastic_weight_sha256=manifest["plastic_weight_sha256"],
+            checkpoint_sha256=manifest["checkpoint_sha256"],
+        )
+    activity_sha256 = None
+    if args.activity_cache is not None:
+        activity, activity_sha256 = cached_corpus_activity(
+            args.activity_cache, stack, corpus,
+            identity=experiment_identity(config, stack.components, report_kind="representation_samples",
+                report_version=REPRESENTATION_REPORT_VERSION, corpus=corpus).to_dict(),
+            seed=args.activity_seed, repeats=args.repeats, batch_size=args.batch_size, limit=args.states,
+        )
+    else:
+        activity = record_corpus_activity(
+            stack, corpus, seed=args.activity_seed, repeats=args.repeats,
+            batch_size=args.batch_size, limit=args.states, efficacy=efficacy,
+        )
+    if checkpoint_evidence is not None and stack.agent.plasticity.state.weight_sha256 != checkpoint_evidence["plastic_weight_sha256"]:
+        raise RuntimeError("checkpoint diagnostics changed frozen plastic weights")
     order = activity.state_labels.tolist()
     report = representation_diagnostics(
         activity.kc,
@@ -153,16 +190,30 @@ def main(argv: Sequence[str] | None = None) -> int:
     report["calibration_corpus_sha256"] = corpus.sha256
     report["corpus_states_used"] = len(set(order))
     report["repeats_per_state"] = args.repeats
+    report["checkpoint"] = checkpoint_evidence
+    report["efficacy_policy"] = "frozen-checkpoint-efficacy" if args.checkpoint else "fixed-initial-unit-efficacy"
+    report["activity_cache_sha256"] = activity_sha256
     identity = experiment_identity(
         config,
         stack.components,
-        report_kind=f"representation_{args.stage}",
+        report_kind="representation_checkpoint" if args.checkpoint else f"representation_{args.stage}",
         report_version=REPRESENTATION_REPORT_VERSION,
         corpus=corpus,
     )
     write_report(args.output, report, identity)
     outputs = {"output": str(args.output), "status": report["gates"]["status"]}
     if args.reachability_output is not None:
+        # Before calibration there is a candidate universe, not a selected motor
+        # interface. After calibration, gate only the neurons actually read by
+        # the persisted pools; unused silent candidates are still represented
+        # in the separate full-plastic-MBON coverage measurement.
+        motor_columns = (
+            np.unique(np.concatenate([
+                np.asarray(pool, dtype=np.int64) for pool in stack.agent.motor.mapping.pool_indices
+            ]))
+            if args.stage == "post"
+            else None
+        )
         reachability = kc_reachability_report(
             kc_activity=activity.kc,
             kc_indices=_kc_indices(stack),
@@ -171,19 +222,25 @@ def main(argv: Sequence[str] | None = None) -> int:
             mbon_indices=_mbon_indices(stack),
             topology=stack.agent.plasticity.topology,
             plasticity=config.plasticity,
-            motor_output_indices=_output_indices(stack),
-            motor_activity=activity.output,
+            motor_output_indices=(
+                _output_indices(stack)[motor_columns] if motor_columns is not None else None
+            ),
+            motor_activity=(
+                activity.output[:, motor_columns] if motor_columns is not None else None
+            ),
             thresholds=ReachabilityThresholds(silence_hz=args.silence_hz),
         )
         reachability["calibration_corpus_sha256"] = corpus.sha256
         reachability["decision_duration_ms"] = config.fly.duration_ms
+        reachability["checkpoint"] = checkpoint_evidence
+        reachability["efficacy_policy"] = report["efficacy_policy"]
         write_report(
             args.reachability_output,
             reachability,
             experiment_identity(
                 config,
                 stack.components,
-                report_kind="kc_reachability",
+                report_kind="kc_reachability_checkpoint" if args.checkpoint else "kc_reachability",
                 report_version=REACHABILITY_REPORT_VERSION,
                 corpus=corpus,
             ),
@@ -191,7 +248,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         outputs["reachability_output"] = str(args.reachability_output)
         outputs["reachability_status"] = reachability["gates"]["status"]
     print(json.dumps(outputs, sort_keys=True))
-    return 0 if report["gates"]["status"] == "PASS" else 2
+    return 0 if report["gates"]["status"] == "PASS" and outputs.get("reachability_status", "PASS") == "PASS" else 2
 
 
 def _kc_indices(stack: object) -> np.ndarray:

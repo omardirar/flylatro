@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import argparse
+from contextlib import ExitStack
 from dataclasses import replace
 from datetime import datetime, timezone
 import json
+import math
 from pathlib import Path
 import resource
 import time
@@ -16,6 +18,7 @@ import numpy as np
 from flylatro.learning.checkpoints import (
     load_plastic_checkpoint,
     save_plastic_checkpoint,
+    capture_checkpoint_provenance,
 )
 from flylatro.learning.config import PlasticExperimentConfig, build_plastic_stack
 from flylatro.learning.curriculum import (
@@ -24,9 +27,13 @@ from flylatro.learning.curriculum import (
 )
 from flylatro.evaluation.plastic import evaluate_plastic_fly
 from flylatro.telemetry.metrics import MetricLogger
+from flylatro.telemetry.buffered import BufferedTextWriter
+from flylatro.learning.interrupts import TrainingInterrupted, decision_boundary_interrupt
 from flylatro.replay.neural import NeuralEventRecorder
 from flylatro.fly.mushroom_body.state import state_numpy
 from flylatro.fly.flywire_artifact import sha256_file
+from flylatro.learning.safety import TrainingSafetyStop
+from flylatro.telemetry.dashboard import TerminalDashboard, TrainingMonitor
 
 
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
@@ -34,8 +41,20 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--config", type=Path, required=True)
     parser.add_argument("--run-dir", type=Path)
     parser.add_argument("--resume", type=Path)
+    from flylatro.fly.execution import EXECUTION_BACKENDS
+    parser.add_argument("--execution", choices=EXECUTION_BACKENDS)
     parser.add_argument("--heavy", action="store_true")
     parser.add_argument("--no-tensorboard", action="store_true")
+    parser.add_argument("--log-buffer-bytes", type=int, default=262144)
+    parser.add_argument("--log-flush-seconds", type=float, default=1.0)
+    dashboard = parser.add_mutually_exclusive_group()
+    dashboard.add_argument("--dashboard", dest="dashboard", action="store_const", const="on",
+        help="show live training statistics (automatic in interactive terminals; plain snapshots when redirected)")
+    dashboard.add_argument("--no-dashboard", dest="dashboard", action="store_const", const="off",
+        help="disable the live terminal display; retain JSONL metrics and monitoring counters")
+    parser.set_defaults(dashboard="auto")
+    parser.add_argument("--dashboard-refresh", type=float, default=1.0, metavar="SECONDS",
+        help="terminal refresh interval, minimum 0.2 seconds (default: 1)")
     parser.add_argument(
         "--condition",
         choices=(
@@ -54,6 +73,8 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument("--action-schedule", type=Path)
     parser.add_argument("--max-environment-decisions", type=int)
+    parser.add_argument("--stop-after-decisions", type=int,
+                        help="stop a stage at this cumulative exposure without changing the declared budget or resume identity")
     parser.add_argument(
         "--budget-basis",
         help="measured benchmark or gate name justifying the exposure budget",
@@ -75,6 +96,10 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
 
 def main(argv: Sequence[str] | None = None) -> int:
     args = parse_args(argv)
+    if not math.isfinite(args.dashboard_refresh) or args.dashboard_refresh < 0.2:
+        raise ValueError("dashboard refresh must be finite and at least 0.2 seconds")
+    if args.log_buffer_bytes < 1 or not math.isfinite(args.log_flush_seconds) or args.log_flush_seconds < 0:
+        raise ValueError("invalid log buffering settings")
     config = PlasticExperimentConfig.load(args.config)
     config = _apply_overrides(config, args)
     if config.fly.backend == "flywire" and "PLACEHOLDER" in config.training.budget_basis:
@@ -86,7 +111,16 @@ def main(argv: Sequence[str] | None = None) -> int:
     if run_dir.exists() and args.resume is None and any(run_dir.iterdir()):
         raise FileExistsError(f"run directory is not empty: {run_dir}")
     run_dir.mkdir(parents=True, exist_ok=True)
+    with TerminalDashboard(mode=args.dashboard, refresh=args.dashboard_refresh,
+        device=config.fly.device, run_name=config.name, run_dir=run_dir,
+        target_decisions=args.stop_after_decisions or config.training.max_environment_decisions) as dashboard:
+        return _run_training(args, config, run_dir, dashboard)
+
+
+def _run_training(args: argparse.Namespace, config: PlasticExperimentConfig,
+                  run_dir: Path, dashboard: TerminalDashboard) -> int:
     stack = build_plastic_stack(config)
+    checkpoint_provenance = capture_checkpoint_provenance()
     stack.trainer.record_detailed_plasticity = args.record_plasticity_events
     curriculum = (
         PlasticAnteCurriculum(
@@ -100,6 +134,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         if config.curriculum.enabled
         else None
     )
+    resumed = None
     if args.resume is not None:
         resumed = load_plastic_checkpoint(
             args.resume,
@@ -109,6 +144,44 @@ def main(argv: Sequence[str] | None = None) -> int:
         if curriculum is not None and resumed.get("curriculum_state"):
             curriculum.load_state_dict(resumed["curriculum_state"])
             stack.env.set_win_ante(curriculum.current_ante)
+    monitor = TrainingMonitor(stack.trainer, resumed.get("monitoring_state") if resumed else None)
+    monitoring_path = run_dir / "training-dashboard.json"
+    last_dashboard_values = {}
+    last_dashboard_at = -math.inf
+
+    def update_dashboard(values: dict, *, status: str = "training") -> None:
+        nonlocal last_dashboard_at
+        last_dashboard_values.update(values)
+        now = time.monotonic()
+        if status == "training" and now - last_dashboard_at < args.dashboard_refresh:
+            return
+        last_dashboard_at = now
+        state = stack.trainer.state
+        snapshot = {"version": "training-dashboard-v1", "updated_at": datetime.now(timezone.utc).isoformat(),
+            "run_name": config.name, "run_dir": str(run_dir), "device": config.fly.device,
+            "status": status, "decisions": state.environment_decisions,
+            "target_decisions": args.stop_after_decisions or config.training.max_environment_decisions,
+            "declared_budget_decisions": config.training.max_environment_decisions,
+            "completed_runs": state.completed_episodes, "wins": state.wins,
+            "game_overs": state.completed_episodes - state.wins,
+            "game_setup": {
+                "deck": "Red Deck" if config.environment.backend == "balatro_sim" else "Mock deck",
+                "stake": "White Stake" if config.environment.backend == "balatro_sim" else "Mock rules",
+                "target_ante": (curriculum.current_ante if curriculum is not None else 8)
+                    if config.environment.backend == "balatro_sim" else None,
+            },
+            "safety_thresholds": {
+                "maximum_mean_absolute_drift": config.safety.maximum_mean_absolute_drift if config.safety.enabled else None,
+                "maximum_bound_fraction": config.safety.maximum_bound_fraction if config.safety.enabled else None,
+            },
+            "monitoring": monitor.state_dict(),
+            "metrics": {key: float(value) if math.isfinite(float(value)) else None for key, value in last_dashboard_values.items()}}
+        dashboard.update(**snapshot)
+        temporary = monitoring_path.with_suffix(".json.tmp")
+        temporary.write_text(json.dumps(snapshot, indent=2, allow_nan=False) + "\n")
+        temporary.replace(monitoring_path)
+
+    update_dashboard({})
     manifest = {
         "created_at": datetime.now(timezone.utc).isoformat(),
         "config": config.to_dict(),
@@ -121,15 +194,24 @@ def main(argv: Sequence[str] | None = None) -> int:
         json.dumps(manifest, indent=2, sort_keys=True) + "\n", encoding="utf-8"
     )
     training_started = time.perf_counter()
+    training_start_decisions = stack.trainer.state.environment_decisions
+    safety_failure = None
+    interrupted = False
+    last_safe_checkpoint = str(args.resume.resolve()) if args.resume is not None and stack.trainer.safety.failure is None else None
     with MetricLogger(
         run_dir,
         run_id=config.name,
         tensorboard=config.runtime.tensorboard and not args.no_tensorboard,
-    ) as metrics:
-        dopamine_stream = (run_dir / "synthetic-reinforcement-events.jsonl").open("a", encoding="utf-8")
-        action_stream = (run_dir / "training-actions.jsonl").open("a", encoding="utf-8")
+        buffer_bytes=args.log_buffer_bytes, flush_seconds=args.log_flush_seconds,
+    ) as metrics, ExitStack() as audit_stack, decision_boundary_interrupt() as interrupt_requested:
+        def audit_writer(name):
+            return audit_stack.enter_context(BufferedTextWriter(run_dir / name,
+                max_bytes=args.log_buffer_bytes, flush_seconds=args.log_flush_seconds))
+        dopamine_stream = audit_writer("synthetic-reinforcement-events.jsonl")
+        action_stream = audit_writer("training-actions.jsonl")
+        episode_stream = audit_writer("training-episodes.jsonl")
         plasticity_stream = (
-            (run_dir / "plasticity-events.jsonl").open("a", encoding="utf-8")
+            audit_writer("plasticity-events.jsonl")
             if args.record_plasticity_events
             else None
         )
@@ -139,11 +221,13 @@ def main(argv: Sequence[str] | None = None) -> int:
             else None
         )
         def on_step(trainer: object, values: dict[str, float]) -> None:
+            nonlocal last_safe_checkpoint
             values = {
                 **values,
                 **_runtime_metrics(
                     training_started,
                     stack.trainer.state.environment_decisions,
+                    initial_decisions=training_start_decisions,
                 ),
             }
             ante_used = (
@@ -153,7 +237,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 if curriculum is not None
                 else 8
             )
-            if curriculum is not None:
+            if curriculum is not None and stack.trainer.safety.failure is None:
                 decision = curriculum.maybe_evaluate(
                     stack.trainer.state.environment_decisions,
                     lambda ante, seeds: _curriculum_win_rate(
@@ -169,6 +253,10 @@ def main(argv: Sequence[str] | None = None) -> int:
                     }
                     stack.env.set_win_ante(decision.current_ante)
             metrics.log(stack.trainer.state.environment_decisions, values)
+            for episode in monitor.update(stack.trainer):
+                episode_stream.write(json.dumps(episode, sort_keys=True, allow_nan=False) + "\n")
+            episode_stream.maybe_flush()
+            update_dashboard(values, status="safety stopped" if stack.trainer.safety.failure else "training")
             if stack.trainer.last_learning is not None:
                 dopamine_stream.write(
                     json.dumps(
@@ -187,7 +275,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                     )
                     + "\n"
                 )
-                dopamine_stream.flush()
+                dopamine_stream.maybe_flush()
                 if plasticity_stream is not None:
                     topology = stack.agent.plasticity.topology
                     efficacy = state_numpy(stack.agent.plasticity.state.efficacy)
@@ -251,7 +339,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                                         activities=[magnitude],
                                         event_kind="synthetic_reinforcement",
                                     )
-                    plasticity_stream.flush()
+                    plasticity_stream.maybe_flush()
             if stack.trainer.last_executed_actions is not None:
                 action_stream.write(
                     json.dumps(
@@ -273,27 +361,42 @@ def main(argv: Sequence[str] | None = None) -> int:
                     )
                     + "\n"
                 )
-                action_stream.flush()
+                action_stream.maybe_flush()
             decisions = stack.trainer.state.environment_decisions
             cadence = config.training.checkpoint_every_decisions
-            if decisions % cadence == 0:
+            if decisions % cadence == 0 and stack.trainer.safety.failure is None:
+                metrics.flush()
+                for stream in (dopamine_stream, action_stream, episode_stream, plasticity_stream):
+                    if stream is not None:
+                        stream.flush()
+                checkpoint_path = run_dir / f"plastic-checkpoint-{decisions:012d}.pkl"
                 save_plastic_checkpoint(
-                    run_dir / f"plastic-checkpoint-{decisions:012d}.pkl",
+                    checkpoint_path,
                     stack.trainer,
                     experiment_config=config.to_dict(),
                     component_metadata=stack.components,
+                    provenance=checkpoint_provenance,
                     curriculum_state=(
                         curriculum.state_dict() if curriculum is not None else None
                     ),
+                    monitoring_state=monitor.state_dict(),
                 )
+                last_safe_checkpoint = str(checkpoint_path)
+            if interrupt_requested.is_set():
+                raise TrainingInterrupted()
 
         try:
-            stack.trainer.train(on_step=on_step)
+            stack.trainer.train(on_step=on_step, stop_after_environment_decisions=args.stop_after_decisions)
+        except TrainingInterrupted:
+            interrupted = True
+        except TrainingSafetyStop as error:
+            safety_failure = {
+                **error.report, "last_safe_checkpoint": last_safe_checkpoint,
+                "environment_decisions": stack.trainer.state.environment_decisions,
+                "requested_environment_decisions": config.training.max_environment_decisions,
+            }
+            (run_dir / "safety-stop.json").write_text(json.dumps(safety_failure, indent=2, sort_keys=True) + "\n")
         finally:
-            dopamine_stream.close()
-            action_stream.close()
-            if plasticity_stream is not None:
-                plasticity_stream.close()
             if plasticity_parquet is not None:
                 plasticity_parquet.close()
     generated_action_hash = sha256_file(run_dir / "training-actions.jsonl")
@@ -307,30 +410,53 @@ def main(argv: Sequence[str] | None = None) -> int:
     # One canonical completed identity is written to every final product, so a
     # manifest, a summary and a checkpoint can never disagree merely because
     # one of them was serialized first.
-    completed_components = finalize_components(
-        stack.components,
-        executed_action_schedule_sha256=generated_action_hash,
-        synthetic_reinforcement_event_log_sha256=reinforcement_event_hash,
-        reserved_action_legal_observations=stack.agent.motor.reserved_action_legal_count,
-        completed_at=completed_at,
-    )
+    budget_complete = stack.trainer.state.environment_decisions == config.training.max_environment_decisions
+    if safety_failure is None and budget_complete:
+        completed_components = finalize_components(
+            stack.components,
+            executed_action_schedule_sha256=generated_action_hash,
+            synthetic_reinforcement_event_log_sha256=reinforcement_event_hash,
+            reserved_action_legal_observations=stack.agent.motor.reserved_action_legal_count,
+            completed_at=completed_at,
+        )
+    else:
+        # A partial matched schedule must not be relabelled as completed or
+        # overwrite its source schedule identity. Preserve it for forensics.
+        completed_components = {
+            **stack.components, "executed_action_schedule_sha256": generated_action_hash,
+            "synthetic_reinforcement_event_log_sha256": reinforcement_event_hash,
+        }
     manifest["components"] = completed_components
-    manifest["completed_at"] = completed_at
+    status = "safety_stopped" if safety_failure is not None else "interrupted" if interrupted else "completed" if budget_complete else "stage_complete"
+    manifest["status"] = status
+    manifest["completed_at" if status == "completed" else "stopped_at"] = completed_at
+    manifest["observed_environment_decisions"] = stack.trainer.state.environment_decisions
+    manifest["safety_stop"] = safety_failure
     (run_dir / "run-manifest.json").write_text(
         json.dumps(manifest, indent=2, sort_keys=True) + "\n", encoding="utf-8"
     )
-    final_path = run_dir / "plastic-checkpoint-final.pkl"
+    checkpoint_name = (
+        "plastic-checkpoint-safety-stop.pkl" if safety_failure is not None else
+        "plastic-checkpoint-interrupted.pkl" if interrupted else
+        "plastic-checkpoint-final.pkl" if budget_complete else
+        f"plastic-checkpoint-stage-{stack.trainer.state.environment_decisions:012d}.pkl"
+    )
+    final_path = run_dir / checkpoint_name
     save_plastic_checkpoint(
         final_path,
         stack.trainer,
         experiment_config=config.to_dict(),
         component_metadata=completed_components,
+        provenance=checkpoint_provenance,
         curriculum_state=(curriculum.state_dict() if curriculum is not None else None),
+        monitoring_state=monitor.state_dict(),
     )
     summary = {
+        "status": status,
+        "safety_stop": safety_failure,
         "run_dir": str(run_dir),
         "checkpoint": str(final_path),
-        "completed_at": completed_at,
+        "completed_at" if status == "completed" else "stopped_at": completed_at,
         "environment_decisions": stack.trainer.state.environment_decisions,
         "episodes": stack.trainer.state.completed_episodes,
         "plasticity_events": stack.trainer.state.plasticity_events,
@@ -338,14 +464,18 @@ def main(argv: Sequence[str] | None = None) -> int:
         "plastic_weight_audit": stack.agent.plasticity.weight_audit(),
         "external_trainable_parameter_count": 0,
         "runtime": _runtime_metrics(
-            training_started, stack.trainer.state.environment_decisions
+            training_started, stack.trainer.state.environment_decisions,
+            initial_decisions=training_start_decisions,
         ),
         "components": completed_components,
         "record_plasticity_events": args.record_plasticity_events,
+        "monitoring": monitor.state_dict(),
     }
     (run_dir / "run-summary.json").write_text(
         json.dumps(summary, indent=2, sort_keys=True) + "\n", encoding="utf-8"
     )
+    update_dashboard(summary["runtime"], status=status.replace("_", " "))
+    dashboard.close()
     print(
         json.dumps(
             {
@@ -359,12 +489,14 @@ def main(argv: Sequence[str] | None = None) -> int:
                     "plastic_weight_sha256",
                     "external_trainable_parameter_count",
                     "runtime",
+                    "status",
+                    "safety_stop",
                 )
             },
             sort_keys=True,
         )
     )
-    return 0
+    return 2 if safety_failure is not None else 130 if interrupted else 0
 
 
 COMPLETED_COMPONENT_IDENTITY_VERSION = "completed-run-component-identity-v1"
@@ -433,6 +565,8 @@ def _apply_overrides(
     config: PlasticExperimentConfig, args: argparse.Namespace
 ) -> PlasticExperimentConfig:
     fly = config.fly
+    if getattr(args, "execution", None) is not None:
+        fly = replace(fly, execution=args.execution)
     training = config.training
     curriculum = config.curriculum
     if args.sensory_mapping_seed is not None:
@@ -527,11 +661,13 @@ def _curriculum_win_rate(
     return wins / len(seeds)
 
 
-def _runtime_metrics(started: float, decisions: int) -> dict[str, float]:
+def _runtime_metrics(started: float, decisions: int, *, initial_decisions: int = 0) -> dict[str, float]:
     elapsed = max(time.perf_counter() - started, 1e-12)
+    invocation_decisions = decisions - initial_decisions
     metrics = {
         "runtime/wall_seconds": elapsed,
-        "runtime/environment_decisions_per_second": decisions / elapsed,
+        "runtime/environment_decisions_this_invocation": float(invocation_decisions),
+        "runtime/environment_decisions_per_second": invocation_decisions / elapsed,
         "runtime/process_peak_rss_mb": resource.getrusage(
             resource.RUSAGE_SELF
         ).ru_maxrss

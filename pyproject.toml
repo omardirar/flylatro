@@ -30,6 +30,11 @@ recording = [
   "pyarrow>=17,<24",
 ]
 benchmark = []
+native = [
+  "torch>=2.4,<3",
+  "ninja>=1.11",
+]
+# CUDA compiler/toolkit must match the chosen Torch wheel; see migration guide.
 balatro = [
   "balatro-sim @ git+https://github.com/jahankazimi078/balatroagent.git@38ae214317009952db4d22a98dc0765cef79370a#subdirectory=sim/py",
 ]
@@ -38,6 +43,7 @@ balatro = [
 flylatro-smoke = "flylatro.cli:main"
 flylatro-train = "flylatro.learning.cli:main"
 flylatro-evaluate = "flylatro.evaluation.plastic_cli:main"
+flylatro-compare-evaluations = "flylatro.evaluation.compare:main"
 flylatro-legacy-ppo-train = "flylatro.training.cli:main"
 flylatro-legacy-ppo-evaluate = "flylatro.evaluation.cli:main"
 bench-balatro = "flylatro.benchmarks.cli:balatro_main"
@@ -54,10 +60,19 @@ flylatro-video-command = "flylatro.visualization.video_cli:main"
 flylatro-analyze-synapses = "flylatro.analysis.cli:main"
 flylatro-verify-populations = "flylatro.analysis.populations_cli:main"
 flylatro-diagnose-representation = "flylatro.analysis.representation_cli:main"
+flylatro-diagnose-card-selection = "flylatro.analysis.card_selection_cli:main"
+flylatro-diagnose-card-information = "flylatro.analysis.card_information_cli:main"
+flylatro-compare-card-windows = "flylatro.analysis.card_window_pilot:main"
+flylatro-test-motor-normalization = "flylatro.analysis.motor_normalization_cli:main"
+flylatro-probe-card-identity = "flylatro.analysis.card_decoding_cli:main"
+flylatro-audit-card-credit = "flylatro.analysis.card_credit_cli:main"
+flylatro-pilot-separated-motor = "flylatro.learning.separated_pilot:main"
 flylatro-build-calibration-corpus = "flylatro.analysis.corpus_cli:main"
+flylatro-select-calibration-corpus = "flylatro.analysis.corpus_selection_cli:main"
 flylatro-diagnose-specificity = "flylatro.analysis.specificity_cli:main"
 flylatro-validate-controls = "flylatro.analysis.control_validation_cli:main"
 flylatro-materialize-protocol = "flylatro.learning.protocol_materialize_cli:main"
+flylatro-run-staged-protocol = "flylatro.learning.staged_cli:main"
 flylatro-readiness = "flylatro.analysis.readiness_cli:main"
 flylatro-shuffle-reward = "flylatro.learning.reward_schedule_cli:main"
 flylatro-create-sensory-mapping = "flylatro.analysis.sensory_cli:main"
@@ -73,3 +88,6 @@ where = ["src"]
 addopts = "-ra"
 pythonpath = ["src", "tests"]
 testpaths = ["tests"]
+
+[tool.setuptools.package-data]
+"flylatro.fly" = ["native/*.cu", "native/*.cpp"]

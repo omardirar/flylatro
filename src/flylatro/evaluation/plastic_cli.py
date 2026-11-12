@@ -9,11 +9,14 @@ import json
 import hashlib
 from pathlib import Path
 import shutil
+import time
 from typing import Sequence
+
+import numpy as np
 
 from flylatro.evaluation.plastic import PlasticEvaluationResult, evaluate_plastic_fly
 from flylatro.learning.checkpoints import load_plastic_checkpoint, load_plastic_manifest
-from flylatro.learning.config import PlasticExperimentConfig, build_plastic_stack
+from flylatro.learning.config import PlasticExperimentConfig, build_plastic_environment, build_plastic_stack
 from flylatro.seeds import SeedPlan
 from flylatro.replay.bundle import ReplayBundleWriter, ReplayIdentity
 from flylatro.fly.flywire_artifact import sha256_file
@@ -23,8 +26,17 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--config", type=Path, required=True)
     parser.add_argument("--checkpoint", type=Path, required=True)
+    parser.add_argument("--learner-index", type=int,
+        help="explicitly select one zero-based trained learner from a multi-fly checkpoint; other flies are not averaged or shared")
+    parser.add_argument("--initial-weights", action="store_true",
+        help="evaluate verified checkpoint initial efficacies as an unchanged-weight baseline; do not replay training actions")
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--episodes", type=int, default=8)
+    parser.add_argument("--batch-size", type=int, default=1,
+        help="parallel held-out seed lanes using copies of the same frozen checkpoint")
+    parser.add_argument("--win-ante", type=int, choices=range(1, 9), default=8,
+                        help="Ante whose completion counts as a win (default: 8)")
+    parser.add_argument("--progress", action="store_true", help="print each completed held-out episode")
     parser.add_argument(
         "--seed-stream",
         choices=("validation", "curriculum", "final_test", "showcase"),
@@ -65,32 +77,48 @@ def main(argv: Sequence[str] | None = None) -> int:
     args = parse_args(argv)
     if args.episodes < 1:
         raise ValueError("episodes must be positive")
+    if args.batch_size < 1:
+        raise ValueError("batch size must be positive")
     if args.episodes > 100 and not args.heavy:
         raise ValueError("more than 100 evaluation episodes requires --heavy")
     if args.seed_stream == "final_test" and not args.unlock_final_test:
         raise ValueError("final-test seeds require --unlock-final-test")
     if args.record_neural and args.episodes != 1:
         raise ValueError("detailed neural recording requires exactly one episode")
-    if args.record_spikes and (not args.record_neural or args.seed_stream != "showcase"):
-        raise ValueError("--record-spikes requires --record-neural and seed-stream=showcase")
+    if args.record_spikes and (not args.record_neural or args.seed_stream not in {"showcase", "final_test"}):
+        raise ValueError("--record-spikes requires --record-neural and showcase or unlocked final-test seeds")
+    if args.output_dir.exists():
+        raise FileExistsError(f"evaluation output already exists: {args.output_dir}")
     config = PlasticExperimentConfig.load(args.config)
     config = _apply_evaluation_condition(config, args)
     config.require_heavy_opt_in(args.heavy)
-    if config.environment.num_envs != 1:
+    if args.learner_index is not None and not 0 <= args.learner_index < config.environment.num_envs:
+        raise ValueError("learner index is outside the checkpoint configuration")
+    if config.environment.num_envs != 1 and args.learner_index is None:
         raise ValueError(
-            "primary frozen evaluation currently requires the recommended one-fly config"
+            "multi-fly frozen evaluation requires an explicit --learner-index"
         )
     stack = build_plastic_stack(config)
     if args.record_spikes:
         if config.fly.backend != "flywire":
             raise ValueError("time-resolved showcase spikes require the real FlyWire backend")
         stack.agent.processor.backend.record_events = True
-    load_plastic_checkpoint(
+    checkpoint = load_plastic_checkpoint(
         args.checkpoint,
         stack.trainer,
         expected_components=stack.components,
+        require_matching_exposure_budget=False,
     )
-    stack.env.set_win_ante(8)
+    source_weight_sha256 = stack.agent.plasticity.state.weight_sha256
+    if args.learner_index is not None:
+        stack.agent.plasticity.state = _select_frozen_learner(stack.agent.plasticity.state, args.learner_index)
+        stack.env = _frozen_environment(config, 1, args.win_ante, stack.env._beta)
+    if args.initial_weights:
+        _restore_initial_efficacy(stack.agent.plasticity.state)
+    # This describes the training exposure that produced the frozen weights,
+    # not the unused training budget in the evaluation configuration.
+    stack.components["exposure_budget_decisions"] = checkpoint["components"]["exposure_budget_decisions"]
+    stack.env.set_win_ante(args.win_ante)
     checkpoint_manifest = load_plastic_manifest(args.checkpoint)
     args.output_dir.mkdir(parents=True, exist_ok=False)
     seeds = SeedPlan().seeds(
@@ -103,17 +131,23 @@ def main(argv: Sequence[str] | None = None) -> int:
         from flylatro.replay.neural import NeuralEventRecorder
 
         neural_recorder = NeuralEventRecorder(neural_path)
-    for seed in seeds:
-        result = evaluate_plastic_fly(
-            stack.env,
-            stack.agent,
-            (seed,),
-            max_vector_steps=args.max_vector_steps,
-            neural_recorder=neural_recorder,
-        )
-        results.append(result)
-    if neural_recorder is not None:
-        neural_recorder.close()
+    evaluation_started = time.perf_counter()
+    try:
+        with (args.output_dir / "episodes.jsonl").open("w", encoding="utf-8") as episode_stream:
+            for start in range(0, len(seeds), args.batch_size):
+                batch_seeds = seeds[start:start + args.batch_size]
+                result = _evaluate_seed_batch(stack, config, batch_seeds, win_ante=args.win_ante,
+                    max_vector_steps=args.max_vector_steps, neural_recorder=neural_recorder)
+                results.append(result)
+                for episode in result.episodes:
+                    episode_stream.write(json.dumps(asdict(episode), sort_keys=True) + "\n")
+                episode_stream.flush()
+                if args.progress:
+                    print(json.dumps({"completed_episodes": start + len(batch_seeds), "requested_episodes": args.episodes,
+                                      "seeds": list(batch_seeds), "wins": sum(episode.won for episode in result.episodes)}), flush=True)
+    finally:
+        if neural_recorder is not None:
+            neural_recorder.close()
     combined = PlasticEvaluationResult(
         episodes=tuple(episode for result in results for episode in result.episodes),
         transitions=tuple(
@@ -121,16 +155,33 @@ def main(argv: Sequence[str] | None = None) -> int:
         ),
         frozen_weight_sha256=results[0].frozen_weight_sha256,
     )
+    evaluation_wall_seconds = time.perf_counter() - evaluation_started
     summary = {
+        "version": "frozen-plastic-evaluation-v2",
         "created_at": datetime.now(timezone.utc).isoformat(),
         "architecture": "plastic-brain-v1",
         "learning_disabled": True,
+        "evaluation_weight_source": "initial-efficacy-from-verified-checkpoint" if args.initial_weights else "trained-checkpoint",
+        "source_checkpoint_weight_sha256": source_weight_sha256,
+        "source_checkpoint_learners": config.environment.num_envs,
+        "selected_learner_index": args.learner_index,
+        "evaluated_learner_semantics": "one explicitly selected frozen learner" if args.learner_index is not None else "one frozen checkpoint learner",
         "plastic_weight_sha256": combined.frozen_weight_sha256,
         "checkpoint_manifest": checkpoint_manifest,
         "config_sha256": config.sha256,
         "seed_stream": args.seed_stream,
+        "evaluation_batch_size": args.batch_size,
+        "evaluation_replica_semantics": "independent held-out seeds; fixed copies of one frozen trained fly; no learning or training-trajectory replay",
+        "seeds": list(seeds),
+        "win_ante": args.win_ante,
+        "action_policy": "independent-fixed-motor-choices-no-training-action-replay",
+        "training_action_schedule_replayed": False,
+        "episodes": [asdict(episode) for episode in combined.episodes],
         "seed_range": [seeds[0], seeds[-1]],
         "metrics": combined.metrics(),
+        "runtime": {"evaluation_wall_seconds": evaluation_wall_seconds,
+            "completed_environment_decisions": sum(episode.decisions for episode in combined.episodes),
+            "completed_environment_decisions_per_second": sum(episode.decisions for episode in combined.episodes) / evaluation_wall_seconds},
         "components": stack.components,
         "neural_recording": str(neural_path) if args.record_neural else None,
         "neural_recording_mode": (
@@ -152,6 +203,11 @@ def main(argv: Sequence[str] | None = None) -> int:
     candidates = args.output_dir / "replay-candidates"
     candidates.mkdir()
     for episode in combined.episodes:
+        # Baseline overrides and selected learner rows cannot be replayed
+        # by loading the full source checkpoint alone. Preserve transitions,
+        # but do not publish bundles the generic replayer cannot reproduce.
+        if args.initial_weights or args.learner_index is not None:
+            continue
         if not episode.won:
             continue
         candidate = candidates / f"seed-{episode.seed}"
@@ -193,6 +249,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             metadata={
                 "episode": asdict(episode),
                 "learning_disabled": True,
+                "win_ante": args.win_ante,
+                "shaping_beta": float(stack.env._beta),
                 "neural_duration_ms": float(stack.agent.processor.duration_ms),
                 "neural_recording_mode": summary["neural_recording_mode"],
                 "reinforcement_semantics": summary["reinforcement_semantics"],
@@ -214,6 +272,68 @@ def _hash_component(value: object) -> str:
     if len(text) == 64 and all(char in "0123456789abcdef" for char in text.lower()):
         return text
     return hashlib.sha256(text.encode()).hexdigest()
+
+
+def _restore_initial_efficacy(state: object) -> None:
+    """Set an explicitly labelled baseline before frozen evaluation begins."""
+    if getattr(state, "is_torch", False):
+        import torch
+        with torch.no_grad():
+            state.efficacy.copy_(state.initial_efficacy)
+    else:
+        np.copyto(state.efficacy, state.initial_efficacy)
+    # Fast traces never influence frozen action selection, but baseline state
+    # should have no residual learning credit from the source checkpoint.
+    state.reset_fast_traces(eligibility=True)
+
+
+def _select_frozen_learner(state: object, index: int) -> object:
+    """Copy one verified learner row without changing the source checkpoint."""
+    if not 0 <= index < state.learners:
+        raise ValueError("learner index is outside the plastic state")
+    arrays = {key: value[index:index + 1].copy() for key, value in state.state_dict().items()}
+    state_type = type(state)
+    return state_type.from_state_dict(arrays, device=str(state.device)) if getattr(state, 'is_torch', False) else state_type.from_state_dict(arrays)
+
+
+def _frozen_environment(config: PlasticExperimentConfig, width: int, win_ante: int, beta: float):
+    replica = replace(config, environment=replace(config.environment, num_envs=width))
+    env = build_plastic_environment(replica)
+    env.set_win_ante(win_ante)
+    env.set_shaping_beta(beta)
+    return env
+
+
+def _evaluate_seed_batch(stack: object, config: PlasticExperimentConfig, seeds: Sequence[int], *,
+                         win_ante: int, max_vector_steps: int, neural_recorder: object | None) -> PlasticEvaluationResult:
+    if len(seeds) == 1:
+        return evaluate_plastic_fly(stack.env, stack.agent, seeds,
+            max_vector_steps=max_vector_steps, neural_recorder=neural_recorder)
+    if neural_recorder is not None:
+        raise ValueError("neural showcase recording requires one seed lane")
+    from flylatro.fly.mushroom_body.state import state_numpy
+
+    original = stack.agent.plasticity.state
+    original_hash = original.weight_sha256
+    arrays = {key: np.repeat(value, len(seeds), axis=0) for key, value in original.state_dict().items()}
+    state_type = type(original)
+    cloned = state_type.from_state_dict(arrays, device=str(original.device)) if getattr(original, "is_torch", False) else state_type.from_state_dict(arrays)
+    if not np.array_equal(state_numpy(cloned.efficacy), arrays["efficacy"]):
+        raise ValueError("frozen evaluation replicas differ from their checkpoint")
+    env = _frozen_environment(config, len(seeds), win_ante, stack.env._beta)
+    stack.agent.plasticity.state = cloned
+    try:
+        result = evaluate_plastic_fly(env, stack.agent, seeds, max_vector_steps=max_vector_steps)
+        # evaluate_plastic_fly checks complete cloned weights and fast traces.
+        # The public learned-weight identity remains the original checkpoint's
+        # one efficacy vector, rather than a concatenated replica-batch hash.
+        if original.weight_sha256 != original_hash:
+            raise ValueError("source checkpoint mutated during frozen evaluation")
+        order = {int(seed): index for index, seed in enumerate(seeds)}
+        return replace(result, episodes=tuple(sorted(result.episodes, key=lambda episode: order[episode.seed])),
+            frozen_weight_sha256=original_hash)
+    finally:
+        stack.agent.plasticity.state = original
 
 
 def _apply_evaluation_condition(

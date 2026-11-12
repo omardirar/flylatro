@@ -48,6 +48,8 @@ from flylatro.seeds import derive_seed
 
 CALIBRATION_CORPUS_VERSION = "reward-free-calibration-state-corpus-v2"
 SCRIPTED_NAVIGATION_RULE = "seeded-uniform-legal-navigation-v1"
+INVENTORY_NAVIGATION_RULE = "seeded-inventory-context-navigation-v1"
+NAVIGATION_RULES = (SCRIPTED_NAVIGATION_RULE, INVENTORY_NAVIGATION_RULE)
 
 #: Corpus versions this build can still read.  ``v1`` corpora carry neither
 #: per-state run provenance nor snapshot hashes, so they are accepted for
@@ -100,12 +102,20 @@ FORBIDDEN_CORPUS_FIELDS: tuple[str, ...] = (
 )
 
 
-def scripted_navigation_actions(masks: MaskDict, rng: np.random.Generator) -> ActionDict:
+def scripted_navigation_actions(
+    masks: MaskDict,
+    rng: np.random.Generator,
+    *,
+    navigation_rule: str = SCRIPTED_NAVIGATION_RULE,
+) -> ActionDict:
     """Reach diverse observable states with fixed, seeded legal navigation.
 
     This is explicitly *not* a policy, a heuristic or a demonstration.  It never
     reads observations, reward, score, or any measure of action quality; it only
-    samples uniformly from the environment's own legality mask.
+    samples from the environment's own legality mask. The inventory-context
+    variant postpones consuming or selling a lone inventory item when another
+    supported action is available, so navigation can reach competing inventory
+    targets. This collection-only rule never reads card identities or outcomes.
 
     The action it builds must satisfy the pinned simulator's strict referee:
     exactly the pointer field the chosen action type consumes is filled, every
@@ -113,6 +123,8 @@ def scripted_navigation_actions(masks: MaskDict, rng: np.random.Generator) -> Ac
     padding whenever the type consumes no cards.
     """
 
+    if navigation_rule not in NAVIGATION_RULES:
+        raise ValueError(f"unknown calibration navigation rule: {navigation_rule}")
     batch = masks["action_type_mask"].shape[0]
     actions = empty_action_batch(batch)
     actions["n_cards"][:] = 0
@@ -122,6 +134,18 @@ def scripted_navigation_actions(masks: MaskDict, rng: np.random.Generator) -> Ac
         legal = np.flatnonzero(np.asarray(masks["action_type_mask"][row]) & supported)
         if not legal.size:
             raise ValueError("no supported legal action type for corpus navigation")
+        if navigation_rule == INVENTORY_NAVIGATION_RULE:
+            deferred: list[int] = []
+            if np.count_nonzero(masks["joker_target_mask"][row]) <= 1:
+                deferred.append(int(UpstreamActionType.SELL_JOKER))
+            if np.count_nonzero(masks["consumable_target_mask"][row]) <= 1:
+                deferred.extend((
+                    int(UpstreamActionType.SELL_CONSUMABLE),
+                    int(UpstreamActionType.USE_CONSUMABLE),
+                ))
+            remaining = legal[~np.isin(legal, deferred)]
+            if remaining.size:
+                legal = remaining
         action_type = int(rng.choice(legal))
         actions["action_type"][row] = action_type
         cards = np.flatnonzero(masks["card_select_mask"][row])
@@ -486,6 +510,7 @@ def build_calibration_corpus(
     navigation_seed: int,
     maximum_decisions_per_seed: int | None = None,
     store_snapshots: bool = False,
+    navigation_rule: str = SCRIPTED_NAVIGATION_RULE,
 ) -> CalibrationCorpus:
     """Deterministically collect observable states with scripted navigation.
 
@@ -500,6 +525,8 @@ def build_calibration_corpus(
 
     if env.num_envs != 1:
         raise ValueError("corpus generation uses one sequential environment")
+    if navigation_rule not in NAVIGATION_RULES:
+        raise ValueError(f"unknown calibration navigation rule: {navigation_rule}")
     if states_per_seed < 1 or sample_every < 1 or not environment_seeds:
         raise ValueError("corpus generation needs positive seeds and state counts")
     budget = maximum_decisions_per_seed or states_per_seed * sample_every * 4
@@ -553,7 +580,7 @@ def build_calibration_corpus(
                     snapshots.append(bytes(snapshot))
             if collected >= states_per_seed:
                 break
-            actions = scripted_navigation_actions(masks, rng)
+            actions = scripted_navigation_actions(masks, rng, navigation_rule=navigation_rule)
             step = env.step(actions)
             observations, masks = step.observations, step.masks
             # Auto-reset started a new run behind the same root seed.
@@ -572,7 +599,7 @@ def build_calibration_corpus(
             "deterministic scripted legal navigation from fixed simulator seeds; "
             "navigation actions are discarded and are never training labels"
         ),
-        navigation_rule=SCRIPTED_NAVIGATION_RULE,
+        navigation_rule=navigation_rule,
         navigation_seed=int(navigation_seed),
         environment_seeds=tuple(int(seed) for seed in environment_seeds),
         sample_every=int(sample_every),

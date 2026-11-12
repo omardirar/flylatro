@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import json
 from typing import Any
 
 from flylatro.env.balatro_sim import ArrayBalatroEnv, composite_actions_to_batch
@@ -42,6 +43,14 @@ def verify_replay(
             "replay simulator version does not match the environment: "
             f"{bundle.identity.simulator_version} != {env.simulator_version}"
         )
+    metadata = bundle.manifest.get("metadata", {})
+    if "win_ante" in metadata:
+        target = metadata["win_ante"]
+        if type(target) is not int or not 1 <= target <= 8:
+            raise ValueError("replay win_ante must be an integer in [1, 8]")
+        env.set_win_ante(target)
+    if "shaping_beta" in metadata:
+        env.set_shaping_beta(float(metadata["shaping_beta"]))
     reset_seed = bundle.identity.simulator_seed
     if reset_seed is None:
         reset_seed = int(bundle.identity.balatro_seed)
@@ -54,6 +63,7 @@ def verify_replay(
                 f"{bundle.identity.balatro_seed}, got {actual_seed}"
             )
     divergences: list[ReplayDivergence] = []
+    terminal_episode = None
     for decision in bundle.decisions:
         decision_id = int(decision["decision_id"])
         _check(
@@ -75,6 +85,12 @@ def verify_replay(
             divergences, decision_id, "after",
             str(decision["state_hash_after"]), actual_after, stop_on_divergence,
         )
+        _check(divergences, decision_id, "reward", str(float(decision["reward"])),
+               str(float(step.rewards[0])), stop_on_divergence)
+        if "reward_components" in decision:
+            _check(divergences, decision_id, "reward_components",
+                json.dumps(decision["reward_components"], sort_keys=True),
+                json.dumps(step.infos[0].get("reward_components", {}), sort_keys=True), stop_on_divergence)
         observations = step.observations
         if bool(step.dones[0]) != bool(decision["done"]):
             _check(
@@ -83,6 +99,14 @@ def verify_replay(
             )
         if step.dones[0] and decision_id != len(bundle.decisions) - 1:
             raise ValueError("replay contains decisions after terminal state")
+        if step.dones[0]:
+            terminal_episode = step.infos[0].get("episode", {})
+    expected_episode = metadata.get("episode", {})
+    if "won" in expected_episode:
+        if terminal_episode is None:
+            raise ValueError("replay declaring an episode outcome lacks a terminal step")
+        _check(divergences, len(bundle.decisions) - 1, "won", str(bool(expected_episode["won"])),
+               str(bool(terminal_episode.get("won", False))), stop_on_divergence)
     return tuple(divergences)
 
 

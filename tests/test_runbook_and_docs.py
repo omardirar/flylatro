@@ -27,6 +27,7 @@ PYPROJECT = pathlib.Path("pyproject.toml")
 
 REPO_COMMANDS = {
     "flylatro-build-calibration-corpus": "flylatro.analysis.corpus_cli",
+    "flylatro-select-calibration-corpus": "flylatro.analysis.corpus_selection_cli",
     "flylatro-create-sensory-mapping": "flylatro.analysis.sensory_cli",
     "flylatro-diagnose-representation": "flylatro.analysis.representation_cli",
     "flylatro-calibrate-motor": "flylatro.analysis.motor_calibration_cli",
@@ -40,6 +41,8 @@ REPO_COMMANDS = {
     "flylatro-verify-populations": "flylatro.analysis.populations_cli",
     "flylatro-train": "flylatro.learning.cli",
     "flylatro-evaluate": "flylatro.evaluation.plastic_cli",
+    "flylatro-compare-evaluations": "flylatro.evaluation.compare",
+    "flylatro-run-staged-protocol": "flylatro.learning.staged_cli",
     "flylatro-analyze-synapses": "flylatro.analysis.cli",
     "flylatro-shuffle-reward": "flylatro.learning.reward_schedule_cli",
     "bench-fly": "flylatro.benchmarks.cli:fly_main",
@@ -65,7 +68,13 @@ def _commands() -> list[list[str]]:
 
 def _module_target(parts: list[str]) -> str:
     if parts[0].endswith(("python", "python3")):
-        return parts[parts.index("-m") + 1]
+        if "-m" in parts:
+            return parts[parts.index("-m") + 1]
+        script = pathlib.Path(parts[1])
+        assert script.parent == pathlib.Path("scripts") and script.suffix == ".py" and script.is_file(), (
+            f"runbook script is not a checked-in local Python command: {script}"
+        )
+        return str(script)
     name = parts[0].rsplit("/", 1)[-1]
     target = REPO_COMMANDS.get(name)
     assert target is not None, (
@@ -76,7 +85,9 @@ def _module_target(parts: list[str]) -> str:
 
 
 def _help(target: str) -> str:
-    if ":" in target:
+    if target.startswith("scripts/"):
+        command = [sys.executable, target, "--help"]
+    elif ":" in target:
         module, function = target.split(":", 1)
         # Several console scripts share one module, so ask the exact entry point.
         command = [

@@ -164,6 +164,25 @@ def test_reward_free_calibration_is_deterministic_and_persists(tmp_path: Path) -
     )
 
 
+def test_existing_motor_revalidation_preserves_pools_normalization_and_hash():
+    from flylatro.interface.motor_calibration import validate_reward_free_motor
+    roots = np.arange(MOTOR_POOL_COUNT * 4, dtype=np.int64)
+    activity = _activity(len(roots))
+    limits = MotorCalibrationThresholds(minimum_context_states=0, minimum_competing_context_states=0)
+    result = calibrate_reward_free_motor(roots, activity, mode='mbon_direct', thresholds=limits)
+    before = result.mapping.sha256
+    checked = validate_reward_free_motor(result.mapping, activity, thresholds=limits)
+    assert checked.mapping is result.mapping
+    assert checked.report['gates'] == result.report['gates']
+    assert checked.report['calibration']['existing_mapping_revalidated']
+    silent = validate_reward_free_motor(result.mapping, np.zeros_like(activity), thresholds=limits)
+    assert silent.status == 'FAIL'
+    assert 'pools_not_silent' in silent.report['gates']['failed']
+    assert result.mapping.sha256 == before
+    with pytest.raises(MotorCalibrationError, match='align'):
+        validate_reward_free_motor(result.mapping, activity[:, :-1], thresholds=limits)
+
+
 def test_calibration_reports_diversity_and_refuses_insufficient_candidates() -> None:
     roots = np.arange(MOTOR_POOL_COUNT * 2, dtype=np.int64)
     activity = _activity(len(roots), seed=11)
@@ -198,6 +217,57 @@ def test_calibration_fails_when_a_head_has_no_usable_diversity() -> None:
     )
     assert result.status == "FAIL"
     assert "group_signal_diversity" in result.report["gates"]["failed"]
+
+
+def test_independent_comparisons_reuse_candidates_without_sharing_competing_neurons() -> None:
+    # 26 responsive neurons can support the largest 13-option comparison,
+    # although the four independent groups have 70 total neuron memberships.
+    roots = np.arange(26, dtype=np.int64)
+    result = calibrate_reward_free_motor(
+        roots, _activity(26), mode="mbon_direct", pool_width=2,
+    )
+    assert result.report["calibration"]["required_outputs"] == 26
+    assert result.report["calibration"]["unique_selected_count"] == 26
+    assert result.report["calibration"]["selected_count"] == 70
+    mapping = result.mapping
+    for group in mapping.routing.group_names:
+        members = [
+            neuron
+            for pool in mapping.routing.group_pool_ids(group)
+            for neuron in mapping.pool_indices[pool]
+        ]
+        assert len(members) == len(set(members))
+    action_neurons = {n for pool in mapping.routing.group_pool_ids("action_type") for n in mapping.pool_indices[pool]}
+    card_neurons = {n for pool in mapping.routing.group_pool_ids("card_slot") for n in mapping.pool_indices[pool]}
+    assert action_neurons & card_neurons
+
+
+def test_pool_correlation_matches_pearson_estimator() -> None:
+    from flylatro.interface.motor_calibration import _correlation_matrix
+
+    values = np.array([[1, 2, 4], [2, 4, 3], [4, 3, 2], [3, 1, 1]], dtype=float)
+    from flylatro.analysis.representation import _correlation
+
+    expected = np.corrcoef(values, rowvar=False)
+    np.testing.assert_allclose(_correlation_matrix(values), expected, atol=1e-15)
+    np.testing.assert_allclose(_correlation(values), expected, atol=1e-15)
+
+
+def test_pool_refinement_preserves_disjointness_and_removes_averaging_common_mode() -> None:
+    from flylatro.interface.motor_calibration import _refine_pairs
+
+    rng = np.random.default_rng(42)
+    common = rng.normal(size=(96, 1))
+    signs = np.asarray([1.0] * 26 + [-1.0] * 26)
+    activity = 50.0 + 10.0 * common * signs + rng.normal(size=(96, 52))
+    initial = [(i, i + 13) for i in range(13)]
+    result = _refine_pairs(activity, list(range(52)), initial, minimum_effective_fraction=0.5)
+    again = _refine_pairs(activity, list(range(52)), initial, minimum_effective_fraction=0.5)
+    assert result == again
+    assert len(set(index for pair in result for index in pair)) == 26
+    pooled = np.stack([activity[:, list(pair)].mean(axis=1) for pair in result], axis=1)
+    correlation = np.corrcoef(pooled, rowvar=False)
+    assert 13 / np.sum(correlation**2) >= 0.5
 
 
 def test_decode_uses_calibrated_normalization_before_comparing() -> None:

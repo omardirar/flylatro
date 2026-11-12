@@ -728,6 +728,7 @@ def validate_control_group(manifests: Sequence[Mapping[str, Any]]) -> dict[str, 
         arms.append(arm)
     checks = {
         "single_plastic_real_reference": True,
+        "runs_not_safety_stopped": all(manifest.get("status") in {None, "completed"} for manifest in manifests),
         "common_fields_match": not any(
             field in differences for field in COMMON_MATCHED_FIELDS
         ),
