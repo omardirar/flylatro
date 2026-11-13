@@ -3,6 +3,17 @@
 Research and diagnostic exploration, 6 November 2026. No training rule or
 historical checkpoint was changed. [Completed run](SINGLE_SEED_RESULTS.md).
 
+## Follow-up status
+
+This page preserves the initial exploration/credit proposal. Subsequent
+[exchange-credit training](EXCHANGE_CREDIT_PILOT.md) and
+[causal update-direction tests](EXCHANGE_DIRECTION_RESULTS.md) did not qualify
+that mechanism for long training. The later [relational-input pilot](RELATIONAL_SENSORY_PILOT.md)
+and [sensory-control study](SENSORY_CONTROL_RESULTS.md) also failed to establish
+a useful learning advantage. The current [roadmap](LEARNING_ROADMAP.md)
+prioritises functional sensory/output control and a direct KC-afferent bypass
+test. The exhaustive subset calculation below remains a conditional diagnostic.
+
 ## Main recommendation
 
 Investigate exploration and credit assignment together. Prioritise a sampler

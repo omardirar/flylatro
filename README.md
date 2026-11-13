@@ -6,18 +6,32 @@ behaviour. The authoritative design is [PLAN.MD](PLAN.MD), implementation
 evidence is tracked in [docs/V1_STATUS.md](docs/V1_STATUS.md), and dedicated
 machine commands live in [docs/GPU_RUNBOOK.md](docs/GPU_RUNBOOK.md).
 
-Upcoming learning experiments are tracked in the
-[learning roadmap](docs/LEARNING_ROADMAP.md), with runnable
-[card-learning diagnostics and pilots](docs/CARD_LEARNING_EXPERIMENTS.md).
-The [PLAY/DISCARD interface fix](docs/PLAY_DISCARD_INTERFACE.md) provides a new
-mapping with separate card/count preferences and learning credit; old
-checkpoints retain their original shared interpretation.
+## Current status
 
-The experimental [local-only teacher curriculum](docs/LOCAL_TEACHER_CURRICULUM.md)
-adds versioned local synaptic rules, visible-state demonstrations, checkpoint
-resume and teacher-free first-blind card-play evaluation. Two bounded candidates
-completed without a reliable native gameplay gain; neither changes primary V1
-or qualifies longer training.
+The GPU execution and checkpoint path is qualified, but reliable Balatro
+learning remains unproven. The latest completed studies are dated 6 November
+2026; this overview was updated 12 November 2026.
+
+| Completed work | Result | Evidence |
+| --- | --- | --- |
+| Native CUDA execution | About 28 decisions/s for one fly and 56 aggregate for eight on the measured RTX 4080; the reference backend remains the default | [Performance report](docs/PERFORMANCE_REPORT.md) |
+| Repaired native long run | Stopped at 509,922 decisions per plastic learner on the configured saturation guard; fresh evaluation found some first-blind progress and no Ante-1 wins | [Long-run review](docs/REPAIRED_LONG_RESULTS.md) |
+| Repeated-game capacity experiment | Six learners completed one million decisions each; no saved greedy evaluation won Ante 1 or cleared the repeated game's first blind | [Single-seed results](docs/SINGLE_SEED_RESULTS.md) |
+| Local teacher curricula | Two bounded candidates failed to establish reliable native gameplay improvement | [Curriculum and results](docs/LOCAL_TEACHER_CURRICULUM.md) |
+| Exchange credit, relational inputs and sensory controls | No follow-up qualified a new long-training candidate; the latest cue-association control did not improve | [Learning roadmap](docs/LEARNING_ROADMAP.md) |
+
+Long exposure mainly strengthened the preference to play five cards. Useful
+card membership selection and discard strategy remain unresolved. The current
+research priority is a controlled test of whether sensory input and local
+KC→MBON changes can reliably steer the intended card outputs. The proposed
+direct KC-afferent bypass control has not been reported as completed.
+
+Start with the [documentation index](docs/README.md) for setup, experiment
+methods, results and historical records. [PLAN.MD](PLAN.MD) defines primary V1;
+experimental interfaces and local rules retain separate identities and do not
+replace its model or historical checkpoints.
+
+## Model and learning boundary
 
 The primary V1 path is:
 
@@ -67,52 +81,11 @@ python -m venv .venv
   --output /tmp/flylatro-plastic-smoke/synaptic-analysis.json
 ```
 
-Training opens a colourful, responsive terminal dashboard automatically. It
-shows each fly's decisions, runs, wins/game overs, current/highest/average round,
-Ante, blind chips and training reward. A bar chart compares rounds reached in
-recent completed runs, labelling played rounds and skipped blinds separately.
-Solid bars show played rounds, patterned bars show skips, and both have exact
-counts. Bars start at zero, share the same scale across flies, and run from oldest at the top to
-newest at the bottom. The average uses all tracked completed runs; performance
-history retains 64 runs while the visible bars adapt to available screen space.
-Round 0 means no blind has been selected yet. Round/highest/average statistics
-use played rounds; skips add to the separate bar segment without counting as
-rounds beaten. Missing legacy skip counts show `?`; fresh runs track them fully.
-Real training stays fixed to **Red Deck / White Stake**, with the
-current Ante win target and fresh run seeds shown in the header.
-
-Each fly has an action feed with named cards, Jokers and purchases. Game over,
-round beaten, Ante beaten and run won appear as separate coloured milestones
-and add no decisions. Up/Down or the mouse wheel scroll through up to 256
-recent activity entries; PgUp/PgDn jump five entries, Tab or Left/Right select
-a fly, Home goes to the oldest entry, and End or L returns to the live feed.
-Browsing holds the selected history steady while training and counters continue.
-Press H for metric definitions and controls. Ctrl+C still checkpoints and exits.
-The feed describes submitted choices; simulator card/consumable legalisation
-can adjust what takes effect. Hidden card identities remain hidden.
-
-Training reward is the accumulated learning signal; highest blind chips is
-the largest observed blind total. Neither is a final game score. Throughput,
-elapsed time, ETA, plasticity guards and GPU utilisation/memory/temperature/power
-are shown separately. GPU readings cover the whole device; Torch allocation
-is shown separately for this process.
-
-The display follows [Nielsen's usability guidance](https://www.nngroup.com/articles/ten-usability-heuristics/)
-for visible status, familiar labels, consistency and accessible help, and
-[ONS chart guidance](https://service-manual.ons.gov.uk/data-visualisation/guidance/axes-and-gridlines)
-for zero baselines and consistent scales. Gameplay, hardware and learning
-limits are grouped separately; status and milestone text remains readable
-without colour. Performance line charts and speed sparklines are omitted.
-Use `--dashboard-refresh 2` to refresh every two seconds, `--no-dashboard` for
-quiet terminal output, or `--dashboard` to force periodic plain snapshots in a
-redirected log. Final JSON stays on stdout; the display uses stderr. Set
-`NO_COLOR=1` to disable colours; non-Unicode terminals use ASCII.
-Final scores unavailable from the pinned simulator are shown as `--`;
-observed chip peaks are labelled separately. Monitoring counters survive new
-checkpoint resumes and are recorded in `training-dashboard.json` and
-`training-episodes.jsonl`. Older checkpoints retain available aggregate
-history and label missing per-fly/score/round history. Round averages and graphs
-begin with newly tracked runs when resuming a checkpoint without round history.
+Training opens an interactive terminal dashboard with per-fly progress, action
+history, learning health and GPU readings. Press H for help; Ctrl+C checkpoints
+and exits. Use `--no-dashboard` for quiet output or `--dashboard-refresh 2` for
+a two-second refresh. See the [dashboard guide](docs/TRAINING_DASHBOARD.md) for
+controls, metric definitions, resumed history and logging behaviour.
 
 Real Balatro, a v783 artifact, CUDA, more than eight independent flies, or more
 than 1,000 training decisions require `--heavy`. Full artifact construction
@@ -146,43 +119,22 @@ preserve the original declared budget, so checkpoints resume exactly.
 Exact training resume also refuses a changed safety policy; frozen diagnostics
 can load older checkpoints without changing their learned state.
 
-On 2026-10-09, `configs/plastic-v783-resolution.toml` passed all initial real
-calibration gates on the RTX 4080 at 500 ms, without lowering thresholds. A
-20-decision real training run changed 9,135 KC->MBON synapses, saved a checkpoint
-and passed its exact matched no-plasticity control. A subsequent seed-bound
-100-decision Ante-1 pilot passed strict preflight and its matched control,
-changing 9,760 synapses without hitting efficacy bounds. This is a working GPU
-training path, not evidence of improved Balatro performance. Frozen Ante-1
-evaluation on 32 identical held-out seeds found zero wins for both the trained
-100-decision fly and its untrained control. The learned checkpoint passed
-full-corpus representation and reachability checks. See
-[the measured status](docs/V1_STATUS.md) and
-[the motor allocation decision](docs/adr/0014-group-local-motor-populations.md).
-The guarded longer run then halted automatically at decision 172: 11.01% of
-efficacies reached their lower bound, above the 10% safety limit. Its
-160-decision checkpoint is retained; later stages/replicates were not run.
-GPU access is working, but long-exposure stability is not established.
+## Calibration and experiment history
 
-The continuation corrected the offline bound audit and completed independent
-250-decision LR 0.002/0.005 pilots with passing neural audits and no bounds.
-The 0.002 pilot's exact control passes. Neither pilot won Ante 1; lower drift
-does not establish learning.
+Primary V1 uses the source-complete v783 artifact: 139,255 neurons and 67,504
+plastic KC→MBON pairs. The historical threshold-5 export omitted 40,567 weak
+pairs and remains available for reproducing its original checkpoints. The
+source-complete reward-free calibration selected fixed gain 0.225 mV and a
+100 ms decision window, with versioned motor and representation reports.
 
-A source audit found that the historical artifact omitted 40,567 weak KC->MBON
-pairs. Primary minimum-count-1 V1 now requires the separately built unthresholded
-artifact under `data/flywire-source-complete-v783/`; existing artifacts and
-checkpoints are preserved. Its initial 500 ms representation fails unchanged
-high-rate and state-separation gates. Prospectively ordered reward-free
-calibration selects fixed gain 0.225 mV / 100 ms, passing the unchanged gates
-with motor v5 and representation v4. A new LR 0.002 pilot completes 250
-decisions safely, passes full learned-checkpoint health, its exact control and
-a real GPU full-trainer resume audit. All six strict primary/control preflights
-pass. The first 1000-decision primary and matched control finish training;
-the primary passes neural health and wins 0/32 validation episodes. The user
-stopped the driver during control evaluation; remaining pairs are unrun.
-This does not establish Ante-1 learning. Current evidence and frozen final-test
-declarations are tracked in [the progress log](docs/PROGRESS_LOG.md)
-and [ADR 0015](docs/adr/0015-source-coverage-and-fixed-gain.md).
+Early source-complete pilots passed bounded neural-health, control and resume
+checks without establishing Ante-1 learning. Later performance qualification,
+long runs and card-learning studies are linked above. Their different rules,
+interfaces and evaluation conditions must be compared using each study's own
+methods and controls. See [implementation status](docs/V1_STATUS.md),
+[the progress log](docs/PROGRESS_LOG.md), and
+[ADR 0015](docs/adr/0015-source-coverage-and-fixed-gain.md) for the development
+history and provenance requirements.
 
 ## Primary commands
 

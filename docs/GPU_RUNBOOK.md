@@ -11,9 +11,31 @@ Source correction (2026-10-09): historical `data/flywire/` uses a threshold-5
 export. It cannot establish primary minimum-count-1 coverage; current preflight
 rejects it for V1. Preserve it for historical checkpoints. The corrected build
 is `data/flywire-source-complete-v783/`. Its 500 ms default-gain representation
-failed; calibration is ongoing under named configurations and unchanged gates.
-Recorded commands/results and the six-hour GPU ledger are in
-`docs/PROGRESS_LOG.md` and `artefacts/lr-sensitivity-20261009/`.
+failed. The completed reward-free follow-up selected fixed gain 0.225 mV /
+100 ms with versioned passing calibration reports; see
+[ADR 0015](adr/0015-source-coverage-and-fixed-gain.md). The original six-hour
+ledger is historical; subsequent user-authorized unlimited duration superseded
+that ceiling while retaining exposure accounting and safety checks.
+Recorded commands/results are in [the progress log](PROGRESS_LOG.md) and
+`artefacts/lr-sensitivity-20261009/`.
+
+## Reading this runbook
+
+This is the primary V1 calibration and experiment procedure. The
+[documentation index](README.md) links later experimental methods and completed
+results, including the [repaired long run](REPAIRED_LONG_RESULTS.md) and
+[six-million-decision single-seed experiment](SINGLE_SEED_RESULTS.md).
+Neither establishes reliable Ante-1 competence or replaces the primary gates.
+The historical examples below retain their original model/report identities;
+a readiness PASS applies only to the exact configuration and evidence checked.
+
+For optional native CUDA execution, use the
+[build and compatibility guide](PERFORMANCE_MIGRATION_GUIDE.md) and
+[measured performance report](PERFORMANCE_REPORT.md). `torch_reference` remains
+the default. Select an execution backend explicitly and regenerate the required
+evidence for its identity; exact resume rejects incompatible backend identities.
+Generated mappings, datasets and evidence paths are local inputs, not supplied
+by a fresh checkout. Use the dependency order below to create them.
 
 `plastic-real-template.toml` contains a parser/calibration placeholder and
 `flylatro-train` refuses it. Record every command, report, mapping hash,
@@ -29,7 +51,7 @@ Current source-coverage and report-version gates reject these historical
 artifacts for a new V1 run. They document the original development measurements.
 The original 50 ms calibration reports remain historical failed evidence.
 
-The seed-bound 100-decision pilot uses
+The historical seed-bound 100-decision pilot uses
 `artefacts/ante1-resolution-pilot-protocol.json` and generated configs under
 `artefacts/ante1-resolution-pilot-arms/`. Its strict report
 `artefacts/preflight-ante1-resolution-pilot.json` is PASS with no warnings;

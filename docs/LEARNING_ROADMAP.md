@@ -1,9 +1,27 @@
 # Learning roadmap
 
-Updated 6 November 2026. [PLAN.MD](../PLAN.MD) remains the scientific authority.
+Overview updated 12 November 2026; completed research through 6 November.
+[PLAN.MD](../PLAN.MD) remains the scientific authority.
 This roadmap orders exploratory work; it does not promote experimental rules,
 interfaces, curricula or checkpoints into the primary model. Implementation
 and commands: [Card learning experiments](CARD_LEARNING_EXPERIMENTS.md).
+
+## Current priority
+
+First establish functional sensory-to-output control and a repeatable local
+positive-learning control. The latest anatomical ALPN cue study did not improve
+choice accuracy, and a larger dose did not produce reliable directional control.
+The next proposed test compares direct KC-afferent stimulation with ALPN cues
+to isolate upstream routing from KC→MBON/readout controllability. It has not
+been reported as completed. See [the sensory-control results](SENSORY_CONTROL_RESULTS.md).
+
+Require functional calibration on separate confirmation seeds before proposing
+another full-game long run. The studies below explain how this priority evolved;
+their earlier “next” suggestions are historical and some have since been tested.
+No new long-training candidate is qualified. The [documentation index](README.md)
+provides methods and results by task.
+
+## Long-exposure and stability evidence
 
 The repaired native long experiment stopped at 509,922 decisions per plastic
 learner after crossing the configured saturation limit. Partial progress
@@ -26,7 +44,7 @@ tested last-hand cases. Preserve the new benchmark. Next isolate timing from
 discard selection and address the existing PLAY bottleneck; this is not a
 qualified long-training improvement.
 
-## Starting evidence
+## Completed diagnostics and earlier hypotheses
 
 The [anatomical sensory-control study](SENSORY_CONTROL_RESULTS.md) is complete.
 Twelve actors attempted a synthetic cue association for 1k trials; neither

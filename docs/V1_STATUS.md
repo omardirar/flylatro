@@ -5,7 +5,40 @@ Statuses are deliberately limited to `LOCALLY VALIDATED`,
 gates establish software semantics and measured calibration, not that real
 FlyWire dynamics learn Balatro.
 
-Current source-coverage audit: the historical artifact used a threshold-5
+## Current research status
+
+Overview updated 12 November 2026 from completed studies through 6 November.
+The primary model's calibration history is recorded below. Later experimental
+rules and interfaces have separate identities and do not replace primary V1.
+
+- Native CUDA execution, independent learners and exact native resume are
+  qualified for the recorded workloads. The reference remains the default;
+  see [measured performance and limits](PERFORMANCE_REPORT.md).
+- The [repaired native long run](REPAIRED_LONG_RESULTS.md) stopped at 509,922
+  decisions per plastic learner on the saturation guard. Fresh frozen
+  evaluation found partial first-blind progress and no Ante-1 wins.
+- The [single-seed experiment](SINGLE_SEED_RESULTS.md) completed six million
+  decisions across six learners. No saved greedy evaluation cleared the
+  repeated game's first blind or won Ante 1. Card membership remained close
+  to same-count random selection.
+- [Local teacher curricula](LOCAL_TEACHER_CURRICULUM.md),
+  [exchange credit](EXCHANGE_CREDIT_PILOT.md),
+  [relational inputs](RELATIONAL_SENSORY_PILOT.md) and
+  [anatomical sensory controls](SENSORY_CONTROL_RESULTS.md) have not qualified
+  a new long-training candidate. The next proposed diagnostic is direct
+  KC-afferent stimulation to isolate sensory routing from output control.
+
+Reliable autonomous Ante-1 learning remains unproven. The
+[documentation index](README.md) links methods and results; the
+[learning roadmap](LEARNING_ROADMAP.md) orders further research.
+
+## Primary calibration and implementation evidence
+
+The table records specific software properties and measured studies. A
+`LOCALLY VALIDATED` entry does not imply gameplay competence. Historical test
+counts and benchmark timings apply to their recorded source and workload.
+
+Source-coverage audit (October 2026): the historical artifact used a threshold-5
 export and omitted 40,567 weak KC->MBON pairs. Its earlier readiness PASS
 does not prove PLAN.MD's minimum-count-1 anatomy requirement. The separately
 built source-complete artifact has 67,504 plastic pairs; its initial 500 ms
@@ -54,10 +87,10 @@ See `docs/PROGRESS_LOG.md` and ADR 0015. Two historical-graph LR pilots complete
 | Predeclared reinforcement sensitivity | LOCALLY VALIDATED | `primary-progress`, `reduced-progress` and `terminal-or-clear-only` are named, hashed and refuse ad-hoc retuning; configs shipped. Controlled comparison is a later experiment |
 | Compartmental extension path | LOCALLY VALIDATED | `three-factor-global-v1` remains primary; `EdgeModulationAssignment` supports channel/sign/compartment and refuses incomplete `compartmental-dan-v2` assignments |
 | Per-learner exploration RNG | LOCALLY VALIDATED | Derived motor seed + learner ID + decision ID makes insertion/reordering invariant |
-| Device-resident plastic hot path | LOCALLY VALIDATED | Routine CUDA steps keep efficacy/eligibility/reinforcement on device; transfer regression passes. Source-complete real pilot measures 0.767 decisions/s with 67,504 plastic pairs; corrected profiled benchmark records actual component timing |
+| Device-resident plastic hot path | LOCALLY VALIDATED | Routine CUDA steps keep efficacy/eligibility/reinforcement on device; native execution retains device-resident learning and compact health transfers. Current qualified workload measurements are in [the performance report](PERFORMANCE_REPORT.md); the earlier 0.767 decisions/s pilot used the reference path |
 | Lightweight vs detailed plastic events | LOCALLY VALIDATED | `PlasticityEvent` is scalar by default; `PlasticityEventDetail` (hashes, changed edge IDs, per-edge deltas) is opt-in; weight hashing is checkpoint/audit-time |
-| Batched independent flies | LOCALLY VALIDATED | Four-row current-model CUDA benchmark measures 1.424 decisions/s, 545.04 MiB and 2.12x sequential comparison speedup with exact measured activity. Complete frozen validation trajectory qualification remains required before final-seed batching |
-| Benchmark component attribution | LOCALLY VALIDATED | Corrected v3 sums timers across measured decisions: recurrence 85.91%, fixed 80.49%, plastic 4.38%, LIF 9.24%, Poisson 3.03%; single-row 0.668 decisions/s and 477.54 MiB. Preflight binds full model identity |
+| Batched independent flies | LOCALLY VALIDATED | Four independent native closed-loop learners match separate learners; frozen reference/native transitions agree at widths 1/2/4/8/16 in the recorded qualification. Eight-fly CLI throughput is 55.592 aggregate decisions/s for the measured workload; see [qualification limits](PERFORMANCE_REPORT.md) |
+| Benchmark component attribution | LOCALLY VALIDATED | Reference and native component profiles are retained separately from throughput runs; the [performance report](PERFORMANCE_REPORT.md) documents dispatch, plastic reduction, recurrence, LIF and random-generation costs. Preflight binds full model identity |
 | Streaming neural/plastic recording | LOCALLY VALIDATED | One Parquet row group per decision, dictionary roles/kinds, sparse edge detail and bounded recorder memory have tests |
 | Selective visualization reads | LOCALLY VALIDATED | Row-group statistics select requested decisions; fixed transform/background retained |
 | Optional time-resolved showcase | NEEDS HEAVY VALIDATION | Frozen real evaluation can opt into input stimulation and actual backend spike events; full recording/render intentionally not run locally |
@@ -76,7 +109,7 @@ See `docs/PROGRESS_LOG.md` and ADR 0015. Two historical-graph LR pilots complete
 | Run readiness pathway | LOCALLY VALIDATED | `flylatro-readiness` reports `READY_FOR_ARTIFACT_BUILD` / `READY_FOR_CALIBRATION` / `READY_FOR_TINY_REAL_RUN` / `READY_FOR_ANTE1` with blocking reasons and never claims Ante-1 readiness from synthetic evidence |
 | GPU runbook and budgets | LOCALLY VALIDATED | Corrected dependency order and executable commands with explicit stop conditions. User-authorized unlimited local GPU duration supersedes the original six-hour ceiling; measured accounting and safety guards remain |
 | Source licence and dependency lock | LOCALLY VALIDATED | MIT `LICENSE` with an explicit non-redistribution note; `uv.lock` pins the resolved graph including the pinned simulator revision; ADR 0013 records the decision |
-| Fast regression suite | LOCALLY VALIDATED | 488 lightweight tests pass locally in 31.55 s; bound parity, source coverage, corrected Pearson correlation, confirmatory inference, real-state resume semantics, frozen batch qualification, Ante-target replay, unlimited-duration authorization, dashboard histories/round metrics/navigation and terminal restoration included; compileall and git diff checks pass |
+| Fast regression suite | LOCALLY VALIDATED | Historical pre-migration snapshot: 488 lightweight tests passed in 31.55 s; bound parity, source coverage, corrected Pearson correlation, confirmatory inference, real-state resume semantics, frozen batch qualification, Ante-target replay, unlimited-duration authorization, dashboard histories/round metrics/navigation and terminal restoration included; compileall and git diff checks pass |
 
 ## Historical threshold-5 calibration measured on 2026-10-09
 
@@ -219,26 +252,27 @@ mapping checks remain strict; exact resume still checks the exposure budget.
 
 ## Current verification boundary
 
-No complete 1,000-decision real protocol, large real evaluation, long spike
-recording or final video was run here. The guarded real attempt halted at 172
-decisions on efficacy saturation. The real calibration measurements above are limited
-to their frozen corpus and recorded neural durations. The following are still
-**not** empirical claims:
+Real GPU calibration, native performance qualification and long experimental
+training have now been run. Their evidence supports bounded execution,
+checkpoint and calibration claims, with partial first-blind improvements in
+some experiments. It does not establish reliable frozen Ante-1 competence or
+complete the primary scientific control protocol.
 
-- that the calibrated state separation and motor diversity generalize beyond
-  the frozen corpus or persist after significant plasticity;
-- that a 500 ms neural window is optimal, or that shorter windows suffice;
-- that MBON-direct results imply downstream descending-mode readiness;
-- that the default learning/reference rates avoid bounds over long real exposures
-  (the guarded attempt instead exceeded the safety threshold at 172 decisions);
-- that `three-factor-global-v1` is sufficiently action-specific;
-- that batched execution improves throughput or fits desired GPU memory;
-- that Poisson generation is or is not the dominant runtime component;
-- that Ante-1 behaviour improves relative to matched controls.
+The following remain outside the demonstrated boundary:
 
-Those are the dedicated-machine gates in `docs/GPU_RUNBOOK.md`. A failed long
-experiment is scientifically interpretable only after the strict `ante1`
-preflight has no scientific/readiness FAIL.
+- generalisation of calibration beyond its corpus and model identity, or
+  preservation of those properties after arbitrary long plastic exposure;
+- downstream descending-mode readiness inferred from MBON-direct results;
+- long-exposure stability for every rule: the repaired native long run stopped
+  on saturation, while the separately normalised single-seed run completed;
+- reliable membership learning, useful autonomous discard strategy, or a
+  consistent local update that steers the desired card output;
+- improved final-test Ante-1 performance under the declared primary protocol;
+- a rendered real time-resolved showcase or final video.
+
+See [the GPU runbook](GPU_RUNBOOK.md) for primary gates and
+[the learning roadmap](LEARNING_ROADMAP.md) for experimental follow-ups.
+Execution qualification and a scientific learning result are separate claims.
 
 Two gate failures remain known in the synthetic development double:
 
